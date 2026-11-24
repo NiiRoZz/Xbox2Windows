@@ -363,6 +363,7 @@ def controls():
     alu_controls()
     f32_controls()
     scalar_alu_controls()
+    mbcnt_controls()
 
 
 def grid_controls():
@@ -1290,6 +1291,114 @@ SCALAR_WORD = ("min(((((((params[0].y + 0xfffffff0u) - 0x00010000u) & 0xffffffe0
                " >> (0x00000003u & 31u)), ")
 
 SCALAR_CASES = [("read_scalar", READ_SCALAR, 32, READ_BINDING)]
+
+# v_mbcnt_lo/hi_u32_b32 in one 64-thread group, two wave32 waves. Each thread stores three words: the lane index
+# (mbcnt_lo of -1 plus 0), the bits of a sparse literal mask below its lane plus 7, and mbcnt_hi of -1 on top of
+# the lane index, which a wave32 lane leaves unchanged.
+MBCNT = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "v_mbcnt_lo_u32_b32 v4, -1, 0",
+    "v_mbcnt_lo_u32_b32 v5, 0x5a5a5a5a, 7",
+    "v_mbcnt_hi_u32_b32 v6, -1, v4",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dwordx3 v[4:6], v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+MBCNT_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=12, wave_size=32)
+MBCNT_MASK = 0x5a5a5a5a
+MBCNT_LANE = "(1u << (gindex & 31u)) - 1u"
+
+
+def mbcnt_words(*, lane=lambda flat: flat % 32, mask=MBCNT_MASK, base=7):
+    """Independent reference for one MBCNT group: per thread, the bits of -1 and of the mask below its lane."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        below = (1 << lane(flat)) - 1
+        count = bin(0xffffffff & below).count("1")
+        words[3 * flat:3 * flat + 3] = [count, bin(mask & below).count("1") + base, count]
+    return words
+
+
+def mbcnt_controls():
+    """Lane counts: exact output, the wave statement, and one rejection per operand outside the subset."""
+    lines = aot.lower(MBCNT, 64, **MBCNT_BINDING).splitlines()
+    assert lines[2].endswith(", uint gindex : SV_GroupIndex) {"), lines
+    assert lines[3] == (f"    outputData.Store3(tid.x * 12u + 0u, uint3((countbits(0xffffffffu & ({MBCNT_LANE})) + 0x00000000u), "
+                        f"(countbits(0x5a5a5a5au & ({MBCNT_LANE})) + 0x00000007u), "
+                        f"(countbits(0xffffffffu & ({MBCNT_LANE})) + 0x00000000u)));"), lines
+    # More than 32 threads may form a wave64: the lane index needs the caller's wave32 statement.
+    unstated = dict(MBCNT_BINDING)
+    del unstated["wave_size"]
+    rejects("Unverified lane count operand or wave size", aot.lower, MBCNT, 64, **unstated)
+    rejects("Unsupported wave size statement", aot.lower, MBCNT, 64, **MBCNT_BINDING | dict(wave_size=64))
+    # One group of 32 threads is one wave of either size: no statement needed.
+    single = variant(MBCNT, ("s10, 6, v0", "s10, 5, v0"))
+    assert "countbits(0xffffffffu" in aot.lower(single, 32, **unstated)
+    # The mask must be uniform: a VGPR, a scalar still loading and an unknown scalar are refused.
+    rejects("Unsupported compute instruction", aot.lower,
+            variant(MBCNT, ("v4, -1, 0", "v4, v0, 0")), 64, **MBCNT_BINDING)
+    rejects("Unverified lane count operand", aot.lower,
+            variant(MBCNT, ("v4, -1, 0", "v4, s12, 0")), 64, **MBCNT_BINDING)
+    rejects("Unverified lane count operand", aot.lower,
+            variant(MBCNT, ("v4, -1, 0", "v4, s30, 0")), 64, **MBCNT_BINDING)
+    rejects("Unverified lane count operand", aot.lower,
+            variant(MBCNT, ("v5, 0x5a5a5a5a, 7", "v5, 0x5a5a5a5a, v40")), 64, **MBCNT_BINDING)
+
+
+def mbcnt_binary(directory, assembler, objcopy, library):
+    """The assembled MBCNT program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, MBCNT), library, offsets=True))
+    assert [line for line in decoded if line.startswith("v_mbcnt")] == [
+        line for line in MBCNT if line.startswith("v_mbcnt")], decoded
+    assert aot.lower(decoded, 64, **MBCNT_BINDING) == aot.lower(MBCNT, 64, **MBCNT_BINDING)
+
+
+def mbcnt_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("mbcnt.hlsl", "mbcnt.cso", "mbcnt.case")]
+    source = aot.lower(MBCNT, 64, **MBCNT_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = mbcnt_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    # Reference controls: a lane that keeps counting into the second wave first differs at thread 32, a wrong
+    # mask in thread 1's second word (thread 0 counts no bits), a lost base in thread 0's second word, and a
+    # word past the group in the first untouched word.
+    off = list(expected)
+    off[192] ^= 1
+    for label, reference, word in (("flat index as lane", mbcnt_words(lane=lambda flat: flat), 96),
+                                   ("inverted mask", mbcnt_words(mask=MBCNT_MASK ^ 0xffffffff), 4),
+                                   ("base dropped", mbcnt_words(base=0), 1),
+                                   ("untouched word", off, 192)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"mbcnt: reference '{label}' escaped detection\n{bad.stderr}")
+    # Translation controls: a lane that stops at 31 instead of wrapping into the second wave, bits counted from
+    # the wrong side, a lost base, and mbcnt_hi adding a full low half must fail on the device. (A lane taken
+    # modulo 64 is no control: HLSL masks a 32-bit shift count to five bits, so it equals the modulo-32 lane.)
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    hi_term = f"(countbits(0xffffffffu & ({MBCNT_LANE})) + 0x00000000u)));"
+    for label, mutated in (("lane saturates at 31", source.replace("gindex & 31u", "min(gindex, 31u)")),
+                           ("bits above the lane", source.replace(f"({MBCNT_LANE})", "~((2u << (gindex & 31u)) - 1u)")),
+                           ("base dropped", source.replace("+ 0x00000007u", "+ 0x00000000u")),
+                           ("hi adds the low half", source.replace(hi_term, hi_term.replace("0x00000000u)))",
+                                                                                            "32u)))")))):
+        if mutated == source:
+            raise AssertionError(f"mbcnt: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"mbcnt: mutation '{label}' escaped detection")
+    return 0
 
 
 def scalar_alu_controls():
@@ -3519,6 +3628,7 @@ def binary(directory, assembler, objcopy, library):
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_d16_cases(), "buffer_load_")
     mtbuf_store_binary(directory, assembler, objcopy, library)
     scalar_alu_binary(directory, assembler, objcopy, library)
+    mbcnt_binary(directory, assembler, objcopy, library)
     mubuf_subword_store_controls()
     gfx1030_binary(directory, assembler, objcopy, library, mubuf_subword_store_cases(), "buffer_store_")
     ds_controls()
@@ -6269,6 +6379,7 @@ if __name__ == "__main__":
                  "draw-lds-arithmetic": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_ARITHMETIC_CASES),
                  "draw-lds-replacement": lambda d, *a: ds_draw(d, *a, private=True, cases=LDS_REPLACEMENT_CASES),
                  "draw-f32": lambda d, *a: draw(d, *a, cases=F32_CASES),
+                 "draw-mbcnt": mbcnt_draw,
                  "draw-mtbuf-store": mtbuf_store_draw,
                  "draw-mubuf-subword-store": mubuf_subword_store_draw,
                  "draw-guard-read": lambda d, *a: draw(d, *a, cases=GUARD_CASES + READ_CASES + ALU_CASES + SCALAR_CASES),

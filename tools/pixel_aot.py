@@ -112,7 +112,7 @@ def _check_two_exits(code, llvm, *, cpu, features):
                             "s_setprio", "s_sleep", "s_movk_i32", "s_cmovk_i32", "s_mulk_i32",
                             "s_flbit_i32_b32", "s_abs_i32", "s_cmov_b32", "s_bitset0_b32", "s_bitset1_b32",
                             "s_bitreplicate_b64_b32", "s_bitset0_b64", "s_bitset1_b64",
-                            "s_setreg_imm32_b32")):
+                            "s_setreg_imm32_b32", "s_setreg_b32", "s_getreg_b32")):
             raise ValueError(f"Unverified multi-exit control flow: {op}")
         pending.append(following[pc])
     # A direct branch may skip alignment NOPs. Keep them in the original span.
@@ -592,10 +592,16 @@ HINT_LIMITS = {"s_clause": 0x3f, "s_setprio": 3, "s_sleep": 0x7f, "s_incperfleve
 # sleeping in s_sleep. None changes a register, memory or the exported result.
 OPERANDLESS_HINTS = ("s_icache_inv", "s_ttracedata", "s_wakeup")
 
-# s_setreg_imm32_b32 is accepted for two targets only.
+# s_setreg_imm32_b32 and s_setreg_b32 are accepted for two targets only; s_getreg_b32 reads back the first only.
 # MODE[3:2] is the rounding mode shared by binary16 and binary64 results (LLVM SIDefines.h, FP_ROUND_MODE_DP):
 # 0 is round to nearest even, which the binary16 lowerings assume and shader entry is taken to hold, and 3 is
-# round toward zero. The directed modes 1 and 2 are refused.
+# round toward zero. The directed modes 1 and 2 are refused. s_setreg_b32 writes the low `size` bits of an SGPR into
+# the field (LLVM 15 SIISelLowering.cpp:4354-4417 builds SetMask = WidthMask << Offset and takes ImmVal & 0xf for the
+# four-bit round field); it is accepted only when the SGPR holds a known integer that is exactly 0 or 3, the same
+# values as the immediate form, so a value with higher bits set is refused rather than truncated.
+# s_getreg_b32 of the field returns the field right-aligned with every other bit zero (SIISelLowering.cpp:3553-3572
+# reads the one-bit TRAPSTS.MEM_VIOL field and compares the whole register with zero). The entry value of MODE is only
+# assumed, so the read is accepted once the program has itself written the field, and the result is that known value.
 HALF_ROUNDING = {"0": "nearest even", "3": "toward zero"}
 # Under round toward zero no rounding binary16 or binary64 form has a lowering. These two do not depend on the
 # mode: the widening is exact and the pack always truncates.
@@ -607,9 +613,9 @@ HALF_ROUNDING_EXEMPT = ("v_cvt_f32_f16", "v_cvt_pkrtz_f16_f32")
 # The lowering itself never reads MODE; the declaration only scopes the claim to preserved denormals.
 HALF_DENORM_PRESERVE = "preserve"
 # FLAT_SCR_LO and FLAT_SCR_HI hold the scratch base address. Only scratch_* and flat_* memory instructions and
-# s_getreg_b32 can observe it. scratch_* and s_getreg_b32 are not lowered, and the one lowered flat form,
-# flat_load_dword, reads only through the title ranges below (no private aperture), so a whole-register write
-# changes no result.
+# s_getreg_b32 can observe it. scratch_* and s_getreg_b32 of these registers are not lowered, and the one lowered flat
+# form, flat_load_dword, reads only through the title ranges below (no private aperture), so a whole-register write
+# (an immediate or any SGPR value) changes no result.
 FLAT_SCRATCH = ("HW_REG_FLAT_SCR_LO", "HW_REG_FLAT_SCR_HI")
 
 # flat_load_dword and global_load_dword with `off` read one DWORD at a 64-bit title address: the address pair
@@ -3085,6 +3091,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     scc = None
     helpers = set()
     half_rounding = HALF_ROUNDING["0"]
+    mode_rounding = None  # MODE[3:2] as this program last wrote it; None while only the assumed entry value exists
     mask = "entry"
     wqm_width = None
     samples = 0
@@ -3310,6 +3317,45 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if value not in HALF_ROUNDING:
                 raise ValueError(f"Unsupported binary16 rounding mode: {line}")
             half_rounding = HALF_ROUNDING[value]
+            mode_rounding = int(value)
+            continue
+        # The register forms. The source SGPR is read, so it must be bound, resolved and defined on every path; the
+        # shared check at the end of the loop is skipped by `continue`, hence the explicit test here. Neither form can
+        # run in a masked region (they are not in REGION_SALU), so the tracked state is straight-line.
+        if line == "s_setreg_b32" or line.startswith("s_setreg_b32 "):
+            if not (m := match(r"s_setreg_b32 hwreg\((\w+)(?:, (\d+), (\d+))?\), (s\d+)")):
+                raise ValueError(f"Malformed s_setreg_b32 operands: {line}")
+            register, offset, size, source = m.groups()
+            sgpr_name(source)
+            whole_scratch = register in FLAT_SCRATCH and offset is None
+            if not whole_scratch and (register, offset, size) != ("HW_REG_MODE", "2", "2"):
+                raise ValueError(f"Unsupported hardware register write: {line}")
+            if source in pending:
+                raise ValueError("Unresolved scalar memory dependency")
+            value = scalar[source]
+            if source in scalar_conditional:
+                raise ValueError(f"Read of a register defined only on the masked path {i}: {line}")
+            if not whole_scratch:
+                if type(value) is not int:
+                    raise ValueError(f"Unsupported binary16 rounding mode, the SGPR is not a known integer: {line}")
+                if str(value) not in HALF_ROUNDING:
+                    raise ValueError(f"Unsupported binary16 rounding mode: {line}")
+                half_rounding = HALF_ROUNDING[str(value)]
+                mode_rounding = value
+            continue
+        if line == "s_getreg_b32" or line.startswith("s_getreg_b32 "):
+            if not (m := match(r"s_getreg_b32 (s\d+), hwreg\((\w+)(?:, (\d+), (\d+))?\)")):
+                raise ValueError(f"Malformed s_getreg_b32 operands: {line}")
+            dst, register, offset, size = m.groups()
+            sgpr_name(dst)
+            if (register, offset, size) != ("HW_REG_MODE", "2", "2"):
+                raise ValueError(f"Unsupported hardware register read: {line}")
+            if mode_rounding is None:
+                raise ValueError(f"MODE rounding is read before the program writes it: {line}")
+            if dst in pending:
+                raise ValueError("Write overlaps an outstanding scalar load")
+            scalar[dst] = mode_rounding
+            scalar_mask[dst] = mode_rounding
             continue
         if (half_rounding != HALF_ROUNDING["0"] and re.match(r"v_\w*_f(?:16|64)", line)
                 and not line.startswith(HALF_ROUNDING_EXEMPT)):

@@ -255,7 +255,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
           image_srv_descriptor=None, constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
           image_uav_mip=None, image_float_domain=None, cpu="gfx1013", lds_bytes=0,
-          lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None, rsrc2=None):
+          lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None, rsrc2=None, wave_size=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     rsrc2 is the program's COMPUTE_PGM_RSRC2. When given, it places the group IDs
@@ -270,6 +270,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     gfx1013 uses RGBA32 FLOAT for full-mask image_store or image_load_mip. When
     both are used, image_srv_descriptor supplies the separate t0 descriptor.
     mubuf_d16_xyz_mode opts into a caller-verified W-preserving RGBA16 store.
+    wave_size is the caller's statement that the program runs as wave32 (32). A lane index is only
+    derived for a group of more than 32 threads under that statement.
     image_descriptor is the table byte offset of the 8-dword image descriptor. image_format is
     the caller's statement of the image format inside it. The image binds to t0 for loads or u0
     for writes, where image_uav_mip selects the writable subresource and replaces descriptor_offset.
@@ -361,6 +363,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if output_format is not None and (output_format not in MUBUF_OUTPUT_FORMATS or cpu != "gfx1030"
                                       or stride is None):
         raise ValueError("Unsupported formatted output binding")
+    if wave_size not in (None, 32):
+        raise ValueError("Unsupported wave size statement")
     if mubuf_d16_xyz_mode is not None and (mubuf_d16_xyz_mode != "preserve-w"
                                            or output_format != MUBUF_D16_OUTPUT_FORMATS[4] or cpu != "gfx1030"):
         raise ValueError("D16 XYZ mode requires a gfx1030 RGBA16 UINT output binding")
@@ -595,6 +599,24 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             for word, reg in enumerate(regs, offset // 4):
                 scalar[reg] = ("constant_word", word)
             pending.update(regs)
+        elif m := re.fullmatch(rf"v_mbcnt_(lo|hi)_u32_b32 v(\d+), {SALU_SOURCE}, {ALU_SOURCE}", line):
+            # D = popcount(S0 & lanes below this one, in the low or high half of the mask) + S1. A wave32 lane
+            # has no bit in the high half, so v_mbcnt_hi adds nothing. gfx10 numbers lanes by the flat local
+            # thread index (SV_GroupIndex) modulo the wave size, which is fixed only by the program, not by the
+            # desktop wave width: a group of at most 32 threads is one wave of either size, a larger group needs
+            # the wave32 statement. The mask must be uniform (a scalar word); exec is not read.
+            half, dst = m[1], int(m[2])
+            mask, base = (alu_word(token, scalar, vector, pending) for token in m.groups()[2:])
+            if (dst > 255 or mask is None or base is None
+                    or (dims[0] * dims[1] * dims[2] > 32 and wave_size != 32)):
+                raise ValueError("Unverified lane count operand or wave size")
+            if half == "hi":
+                vector[dst] = base
+            else:
+                expression = f"(countbits({hlsl_word(mask)} & ((1u << (gindex & 31u)) - 1u)) + {hlsl_word(base)})"
+                if len(expression) > ALU_EXPRESSION_LIMIT:
+                    raise ValueError("ALU expression too large")
+                vector[dst] = ("alu", expression)
         elif m := re.fullmatch(r"v_mov_b32(?:_e32|_e64)? v(\d+), (s\d+|v\d+|-?\d+|0x[0-9a-f]+)", line):
             dst, src = int(m[1]), m[2]
             if dst > 255:
@@ -1779,6 +1801,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         cbuffer += "".join(f"groupshared uint {slot}[{dims[0]}];\n" for slot in shared)
         if shared:
             local = ", uint3 local : SV_GroupThreadID"
+    if "gindex" in body:
+        local += ", uint gindex : SV_GroupIndex"
     # Helpers are selected from the final body, so a float ALU result used only by a DS step still gets its definition.
     cbuffer += "".join(text for name, text in F32_HELPERS.items() if f"f32_{name}(" in body)
     uav_texel_type = image_atomic_type or ("float4" if rgba32_float_image else "uint4")
@@ -1827,6 +1851,8 @@ def main():
                              "R32_SINT for signed min/max UAVs, R32_FLOAT for finite-normal atomics)")
     parser.add_argument("--image-float-domain", choices=("finite-normal",),
                         help="Required for R32_FLOAT atomics. All accessed texels and operands are finite normals.")
+    parser.add_argument("--wave-size", type=int, choices=(32,),
+                        help="Caller's statement that the program runs as wave32, for lane indices in larger groups")
     args = parser.parse_args()
     if (args.descriptor_offset is None) == (args.image_uav_mip is None):
         parser.error("Choose either --descriptor-offset or --image-uav-mip")
@@ -1849,7 +1875,7 @@ def main():
                    cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
                    mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, image_srv_descriptor=args.image_srv_descriptor,
-                   rsrc2=args.rsrc2)
+                   rsrc2=args.rsrc2, wave_size=args.wave_size)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),

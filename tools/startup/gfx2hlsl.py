@@ -72,6 +72,16 @@ def decode(code):
                 raise Unsupported('image_load_mip tfe')
             if word1 & (1 << 30):
                 raise Unsupported('image_load_mip a16')
+        if name == 'v_cndmask_b32_e64':
+            # The printed -1 is ambiguous: it can be plain inline -1 or inline 1 with NEG.
+            # Preserve plain immediates and refuse NEG on immediate data operands by encoding.
+            word1, = struct.unpack_from('<I', code, off + 4)
+            for i in range(2):
+                if not word1 & (1 << (29 + i)):
+                    continue
+                source = (word1 >> (9 * i)) & 0x1ff
+                if 128 <= source <= 208 or 240 <= source <= 248 or source == 255:
+                    raise Unsupported('v_cndmask_b32_e64 NEG on an immediate')
         out.append((off, n, name, asm))
         off += n
     last = max((i for i, x in enumerate(out) if x[2] == 's_endpgm'), default=len(out) - 1)
@@ -216,6 +226,15 @@ class Stage:
             return '0x%08xu' % (int(tok, 0) & 0xffffffff)
         except ValueError:
             raise Unsupported('operand %r' % tok)
+
+    def u_src(self, tok):
+        """uint expression for an integer-context source that the disassembler may print negated."""
+        # In an integer instruction the `-` modifier is the source's sign bit flipped: the same bit
+        # pattern a float negation produces. Only handlers that model it ask for this; other integer
+        # sources keep using u(), so an unexpected negation stays a refusal rather than a silent flip.
+        if tok.startswith('-') and not re.match(r'-[\d.]', tok):
+            return '(%s ^ 0x80000000u)' % self.u(tok[1:])
+        return self.u(tok)
 
     def f(self, tok):
         """float expression, with the inline neg/abs operand modifiers."""
@@ -883,8 +902,13 @@ class Stage:
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
 
     def op_v_cndmask_b32(self, ops, mods):
+        # The select takes no output modifier: a clamp or mul on it would change the value, so a
+        # modifier that reaches here is refused rather than dropped from the emitted text.
+        if mods:
+            raise Unsupported('v_cndmask_b32 with %s' % mods)
         mask = self.u(ops[3]) if len(ops) > 3 else 'vcc'
-        self.set_v(reg_range(ops[0])[1], '(%s & 1) ? %s : %s' % (mask, self.u(ops[2]), self.u(ops[1])))
+        self.set_v(reg_range(ops[0])[1],
+                   '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
 
     def op_v_interp_p1_f32(self, ops, mods):
         self.note_attr(ops[2], 'linear')
@@ -973,6 +997,14 @@ class Stage:
         target, vals, flags = m.group(1), [v.strip() for v in m.group(2).split(',')], m.group(3).split()
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
+        if target == 'mrtz':
+            if (self.kind != 'ps' or self.has_branches or self.blocks or not self.exec_known or 'depth' in self.exports
+                    or 'compr' in flags or len(vals) != 4 or not re.fullmatch(r'v\d+', vals[0])
+                    or vals[1:] != ['off', 'off', 'off']):
+                raise Unsupported('MRTZ requires one uncompressed depth export in a straight-line pixel shader with entry EXEC')
+            self.exports['depth'] = True
+            self.emit('o.depth = %s;' % self.f(vals[0]))
+            return None
         name = {'pos0': 'pos'}.get(target, target)
         if not re.fullmatch(r'pos|param\d+|mrt[0-7]', name):
             raise Unsupported('export target %s' % target)
@@ -1056,10 +1088,11 @@ VEC_F = {
     'v_add_f32': (2, '{0} + {1}'), 'v_sub_f32': (2, '{0} - {1}'), 'v_subrev_f32': (2, '{1} - {0}'),
     'v_mul_f32': (2, '{0} * {1}'), 'v_mul_legacy_f32': (2, 'mul_legacy({0}, {1})'),
     'v_min_f32': (2, 'min({0}, {1})'), 'v_max_f32': (2, 'max({0}, {1})'),
-    'v_fmac_f32': (2, '{0} * {1} + {2}'), 'v_mac_f32': (2, '{0} * {1} + {2}'),
-    'v_fma_f32': (3, '{0} * {1} + {2}'), 'v_mad_f32': (3, '{0} * {1} + {2}'), 'v_mad_legacy_f32': (3, 'mul_legacy({0}, {1}) + {2}'),
+    'v_fmac_f32': (2, '{0} * {1} + {2}'), 'v_mac_f32': (2, 'mad32({0}, {1}, {2}, false)'),
+    'v_fma_f32': (3, '{0} * {1} + {2}'), 'v_mad_f32': (3, 'mad32({0}, {1}, {2}, false)'),
+    'v_mad_legacy_f32': (3, 'mad32({0}, {1}, {2}, true)'),
     'v_fmamk_f32': (3, '{0} * {1} + {2}'), 'v_fmaak_f32': (3, '{0} * {1} + {2}'),
-    'v_madmk_f32': (3, '{0} * {1} + {2}'), 'v_madak_f32': (3, '{0} * {1} + {2}'),
+    'v_madmk_f32': (3, 'mad32({0}, {1}, {2}, false)'), 'v_madak_f32': (3, 'mad32({0}, {1}, {2}, false)'),
     'v_rcp_f32': (1, '1.0 / {0}'), 'v_rcp_iflag_f32': (1, '1.0 / {0}'), 'v_rsq_f32': (1, 'rsqrt({0})'), 'v_sqrt_f32': (1, 'sqrt({0})'),
     'v_exp_f32': (1, 'exp2({0})'), 'v_log_f32': (1, 'log2({0})'), 'v_floor_f32': (1, 'floor({0})'), 'v_ceil_f32': (1, 'ceil({0})'),
     'v_trunc_f32': (1, 'trunc({0})'), 'v_fract_f32': (1, 'frac({0})'), 'v_rndne_f32': (1, 'round({0})'),
@@ -1237,6 +1270,20 @@ class Pipeline:
     def common(self):
         out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)',
                'float mul_legacy(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
+               # Match pixel_aot: round the product before adding and flush denormals to signed zero.
+               'float ftz32(float value) {',
+               '    uint bits = asuint(value);',
+               # Select the mask as an integer so FXC preserves the sign of a flushed zero.
+               '    uint mask = (bits & 0x7fffffffu) < 0x00800000u ? 0x80000000u : 0xffffffffu;',
+               '    return asfloat(bits & mask);',
+               '}',
+               'float mad32(float a, float b, float c, bool legacy) {',
+               '    a = ftz32(a);',
+               '    b = ftz32(b);',
+               '    precise float product = ftz32(legacy ? mul_legacy(a, b) : a * b);',
+               '    precise float sum = product + ftz32(c);',
+               '    return ftz32(sum);',
+               '}',
                'float med3(float a, float b, float c) { return max(min(a, b), min(max(a, b), c)); }',
                'uint ldu(ByteAddressBuffer b, uint a) { uint k = (a & 3) * 8, lo = b.Load(a & ~3u); if (k == 0) return lo; '
                'return (lo >> k) | (b.Load((a & ~3u) + 4) << (32 - k)); }',
@@ -1285,11 +1332,14 @@ class Pipeline:
     def hlsl_ps(self):
         s = self.ps
         targets = sorted(int(k[3:]) for k in s.exports if k.startswith('mrt'))
+        depth = 'depth' in s.exports
         out = self.common() + ['struct PSIn {'] + self.interface(True) + ['};']
-        if not targets:  # depth-only: no output struct, so the pipeline declares no SV_Target
+        if not targets and not depth:
             out += ['void main(PSIn i) {'] + s.declarations() + s.body() + ['}']
             return '\n'.join(out) + '\n'
         out.append('struct PSOut {')
+        if depth:
+            out.append('    float depth : SV_Depth;')
         for t in targets:
             kind = self.mrt_kind(t)
             out.append('    %s mrt%d : SV_Target%d;' % ({'int': 'int4', 'uint': 'uint4'}.get(kind, 'float4'), t, t))
@@ -1326,7 +1376,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob):
     """Hash the startup translation revision and the three blobs in runtime order."""
-    return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-3'))))
+    return fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-4'))))
 
 
 DEFAULT_FXC = r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe'

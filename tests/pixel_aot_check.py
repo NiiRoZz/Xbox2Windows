@@ -8114,7 +8114,7 @@ def check_mode_register_controls():
     # The scratch base stays unobservable: s_getreg_b32 is not lowered, and flat_load_dword reads
     # only through the title ranges, so the writes translate like s_nop 0 before it.
     expect_value_error(translate, with_constants([*FLAT_SCRATCH_WRITES, "s_getreg_b32 s48, hwreg(HW_REG_FLAT_SCR_LO)"]),
-                       "Unsupported instruction")
+                       "Unsupported hardware register read")
     expect_value_error(translate, with_constants([*FLAT_SCRATCH_WRITES, "flat_load_dword v12, v[12:13]"]),
                        "Title memory is not bound")
     assert (translate_title(FLAT_SCRATCH_WRITES + title_program())
@@ -8125,9 +8125,11 @@ def check_mode_register_controls():
     for value in ("1", "2", "4", "7", "-1", "0x103"):
         expect_value_error(translate, [f"s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), {value}"] + plain,
                            "Unsupported binary16 rounding mode")
-    # The register forms of the same access stay unsupported.
-    expect_value_error(translate, ["s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48"] + plain, "Unsupported instruction")
-    expect_value_error(translate, ["s_getreg_b32 s48, hwreg(HW_REG_MODE, 2, 2)"] + plain, "Unsupported instruction")
+    # The register forms are lowered for the same targets (check_sopk_hwreg_controls). Without a bound SGPR, or a
+    # prior write of the field, they are still refused.
+    expect_value_error(translate, ["s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48"] + plain, "Unbound scalar operand s48")
+    expect_value_error(translate, ["s_getreg_b32 s48, hwreg(HW_REG_MODE, 2, 2)"] + plain,
+                       "MODE rounding is read before the program writes it")
     # Like the hints, nothing may sit between the color export and s_endpgm.
     must_reject(translate, plain[:-1] + [HALF_RNE, plain[-1]])
     must_reject(translate, plain[:-1] + [FLAT_SCRATCH_WRITES[0], plain[-1]])
@@ -8147,6 +8149,253 @@ def check_mode_register_controls():
         expect_value_error(translate, with_constants([HALF_RTZ, operation]), "under round toward zero")
     # The exact widening and the pack that always truncates do not depend on the mode.
     assert translate([HALF_RTZ] + with_constants(HALF_BODY)) == translate(["s_nop 0"] + with_constants(HALF_BODY))
+
+
+# s_setreg_b32 and s_getreg_b32 (SOPK) take the same targets as s_setreg_imm32_b32. The source SGPR of a MODE[3:2]
+# write must hold a known integer that is exactly 0 or 3; a whole FLAT_SCR_LO or FLAT_SCR_HI write takes any bound
+# SGPR. A read of MODE[3:2] is lowered once the program has written the field, and returns it right-aligned.
+# s48 carries the value written, s49 to s55 the values read back. The body writes round toward zero by register,
+# reads it, writes round to nearest even, reads it, writes round toward zero by immediate and reads that, writes
+# both scratch base halves from SGPRs, mixes the read values with constant-buffer words and restores nearest even.
+SOPK_SET = "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48"
+SOPK_GET = "s_getreg_b32 s49, hwreg(HW_REG_MODE, 2, 2)"
+SOPK_HWREG_BODY = [
+    "s_mov_b32 s48, 3",
+    "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48",
+    "s_getreg_b32 s49, hwreg(HW_REG_MODE, 2, 2)",
+    "s_mov_b32 s50, 0",
+    "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s50",
+    "s_getreg_b32 s51, hwreg(HW_REG_MODE, 2, 2)",
+    "s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), 3",
+    "s_getreg_b32 s52, hwreg(HW_REG_MODE, 2, 2)",
+    "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s44",
+    "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI), s49",
+    "s_add_u32 s53, s52, s45",
+    "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s51",
+    "s_getreg_b32 s54, hwreg(HW_REG_MODE, 2, 2)",
+    "s_add_u32 s55, s54, s46",
+    "v_mov_b32_e32 v12, s49",
+    "v_mov_b32_e32 v13, s51",
+    "v_mov_b32_e32 v14, s53",
+    "v_mov_b32_e32 v15, s55",
+]
+# Constant words 0 to 2 (s44 to s46) per run: the scratch base, an addend for the third and one for the fourth channel.
+SOPK_HWREG_SETS = ((0x11111111, 0x00000010, 0x00abcdef), (0xffffffff, 0xfffffffe, 0x00000000))
+SOPK_NOT_READ = "MODE rounding is read before the program writes it"
+
+
+def sopk_hwreg_expected(words):
+    """Channels: the read after RTZ (3), after RNE (0), 3 plus s45 after the immediate RTZ, 0 plus s46."""
+    return (3, 0, (3 + words[1]) & 0xffffffff, words[2])
+
+
+def sopk_mov(value):
+    return f"s_mov_b32 s48, {value}"
+
+
+def sopk_read(*before):
+    """Run before, read MODE[3:2] into s49 and export it in channel 0."""
+    return uncompressed_export([*before, SOPK_GET, "v_mov_b32_e32 v12, s49"])
+
+
+def sopk_constant(value, *before):
+    """The same program with the read replaced by a move of the value it must return."""
+    return uncompressed_export([*before, f"s_mov_b32 s49, {value}", "v_mov_b32_e32 v12, s49"])
+
+
+def check_sopk_hwreg_controls():
+    """s_setreg_b32 and s_getreg_b32 of MODE[3:2] and the scratch base: the accepted forms and every refusal."""
+    plain = with_constants(NARROW_BODY)
+    # Writing by SGPR is the immediate write: nearest even is a no-op, round toward zero is refused under every
+    # rounding binary16 or binary64 form, the last write wins and restoring nearest even lowers like no write.
+    assert (translate([sopk_mov(0), SOPK_SET] + plain) == translate([sopk_mov(0), "s_nop 0"] + plain)
+            == translate([sopk_mov(0), HALF_RNE] + plain))
+    assert translate([sopk_mov(3), SOPK_SET, sopk_mov(0), SOPK_SET] + plain) == translate(
+        [sopk_mov(3), "s_nop 0", sopk_mov(0), "s_nop 0"] + plain)
+    assert translate([sopk_mov(3), SOPK_SET, HALF_RNE] + plain) == translate([sopk_mov(3), "s_nop 0", "s_nop 0"] + plain)
+    expect_value_error(translate, [sopk_mov(3), SOPK_SET] + plain, "under round toward zero: v_cvt_f16_f32_e32")
+    expect_value_error(translate, [sopk_mov(0), SOPK_SET, sopk_mov(3), SOPK_SET] + plain,
+                       "under round toward zero: v_cvt_f16_f32_e32")
+    packed = with_constants(VOP3P_BODY)
+    expect_value_error(translate, [sopk_mov(3), SOPK_SET] + packed, "under round toward zero: v_pk_add_f16")
+    assert translate([sopk_mov(3), SOPK_SET, sopk_mov(0), SOPK_SET] + packed) == translate(
+        [sopk_mov(3), "s_nop 0", sopk_mov(0), "s_nop 0"] + packed)
+    expect_value_error(translate, with_constants([sopk_mov(3), SOPK_SET, "v_cvt_f32_f64_e32 v12, v[12:13]"]),
+                       "under round toward zero: v_cvt_f32_f64_e32")
+    # The exact widening and the truncating pack do not depend on the mode.
+    assert translate([sopk_mov(3), SOPK_SET] + with_constants(HALF_BODY)) == translate(
+        [sopk_mov(3), "s_nop 0"] + with_constants(HALF_BODY))
+    # Only a known integer of exactly 0 or 3 is a rounding mode. The directed modes and every value with higher bits
+    # set are refused (the hardware would take the low two bits, which the translator does not rely on).
+    for value in ("1", "2", "4", "7", "0x103", "0xfffffffc", "0xffffffff", "0x80000003", "0x7fffffff"):
+        expect_value_error(translate, [sopk_mov(value), SOPK_SET] + plain, "Unsupported binary16 rounding mode")
+    # An SGPR that is not a known integer is refused, whatever it may hold at run time.
+    expect_value_error(translate, with_constants(["s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s44"] + NARROW_BODY),
+                       "the SGPR is not a known integer")
+    expect_value_error(translate, [sopk_mov("s20"), SOPK_SET] + plain, "the SGPR is not a known integer")
+    expect_value_error(translate, [SOPK_SET] + plain, "Unbound scalar operand s48")
+    expect_value_error(translate, [sopk_mov(0), "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s60"] + plain,
+                       "Unbound scalar operand s60")
+    # The scratch base takes the whole register from any bound SGPR and lowers to nothing, like the immediate form.
+    for register in ("LO", "HI"):
+        write = f"s_setreg_b32 hwreg(HW_REG_FLAT_SCR_{register}), s44"
+        assert translate(with_constants([write] + NARROW_BODY)) == translate(with_constants(["s_nop 0"] + NARROW_BODY))
+        for value in ("0", "0x400", "0xdeadbeef", "5"):
+            assert translate([sopk_mov(value), write.replace("s44", "s48")] + plain) == translate(
+                [sopk_mov(value), "s_nop 0"] + plain)
+        expect_value_error(translate, [write.replace("s44", "s60")] + plain, "Unbound scalar operand s60")
+    # Every other register, field and spelling of the write is refused, and the target is checked before the value.
+    for write in ("hwreg(HW_REG_FLAT_SCR_LO, 0, 16)", "hwreg(HW_REG_FLAT_SCR_HI, 16, 16)",
+                  "hwreg(HW_REG_FLAT_SCR_LO, 0, 32)", "hwreg(HW_REG_FLAT_SCR_HI, 4, 8)",
+                  "hwreg(HW_REG_MODE, 0, 2)", "hwreg(HW_REG_MODE, 2, 1)", "hwreg(HW_REG_MODE, 3, 2)",
+                  "hwreg(HW_REG_MODE, 6, 2)", "hwreg(HW_REG_MODE, 0, 4)", "hwreg(HW_REG_MODE, 4, 4)",
+                  "hwreg(HW_REG_MODE, 02, 2)", "hwreg(HW_REG_MODE)", "hwreg(HW_REG_STATUS, 2, 2)",
+                  "hwreg(HW_REG_STATUS)", "hwreg(HW_REG_TRAPSTS, 2, 2)", "hwreg(HW_REG_LDS_ALLOC)",
+                  "hwreg(HW_REG_SHADER_CYCLES)", "hwreg(HW_REG_GPR_ALLOC)", "hwreg(HW_REG_IB_STS)"):
+        for value in ("0", "3"):
+            expect_value_error(translate, [sopk_mov(value), f"s_setreg_b32 {write}, s48"] + plain,
+                               "Unsupported hardware register write")
+    # Malformed operands: an immediate, a special register, a pair, a vector register, a missing or extra operand,
+    # swapped operands and a raw simm16.
+    for operands in ("hwreg(HW_REG_MODE, 2, 2), 3", "hwreg(HW_REG_MODE, 2, 2), vcc_lo", "hwreg(HW_REG_MODE, 2, 2), m0",
+                     "hwreg(HW_REG_MODE, 2, 2), null", "hwreg(HW_REG_MODE, 2, 2), s[48:49]",
+                     "hwreg(HW_REG_MODE, 2, 2), exec_lo", "hwreg(HW_REG_MODE, 2, 2), v0", "hwreg(HW_REG_MODE, 2, 2)",
+                     "hwreg(HW_REG_MODE, 2, 2), s48, s49", "s48, hwreg(HW_REG_MODE, 2, 2)",
+                     "hwreg(HW_REG_MODE, 2), s48", "hwreg(HW_REG_FLAT_SCR_LO), 0", "hwreg(HW_REG_FLAT_SCR_LO), v0",
+                     "0x881, s48", ""):
+        expect_value_error(translate, [sopk_mov(0), f"s_setreg_b32 {operands}".rstrip()] + plain,
+                           "Malformed s_setreg_b32 operands")
+    expect_value_error(translate, [sopk_mov(0), "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s106"] + plain,
+                       "Scalar register out of range")
+    # The read returns a known integer: it translates like a move of that value, so the field is right-aligned
+    # (3, not 3 << 2) and every other bit is zero. Any other value gives a different translation.
+    for first, written in ((3, 3), (0, 0)):
+        for setter in (SOPK_SET, f"s_setreg_imm32_b32 hwreg(HW_REG_MODE, 2, 2), {first}"):
+            program = sopk_read(sopk_mov(first), setter)
+            assert translate_int(program) == translate_int(sopk_constant(written, sopk_mov(first), "s_nop 0")), (first, setter)
+            for wrong in (3 - written, 1, 2, 4, 12, 0xc, 0x80000003, 0xffffffff):
+                if wrong != written:
+                    assert translate_int(program) != translate_int(sopk_constant(wrong, sopk_mov(first), "s_nop 0")), wrong
+    # The last write wins, also across the immediate form, and a read changes no state.
+    last = uncompressed_export([sopk_mov(3), SOPK_SET, SOPK_GET, HALF_RNE, "s_getreg_b32 s50, hwreg(HW_REG_MODE, 2, 2)",
+                                "s_getreg_b32 s51, hwreg(HW_REG_MODE, 2, 2)", "v_mov_b32_e32 v12, s49",
+                                "v_mov_b32_e32 v13, s50", "v_mov_b32_e32 v14, s51"])
+    assert translate_int(last) == translate_int(uncompressed_export(
+        [sopk_mov(3), "s_nop 0", "s_mov_b32 s49, 3", "s_nop 0", "s_mov_b32 s50, 0", "s_mov_b32 s51, 0",
+         "v_mov_b32_e32 v12, s49", "v_mov_b32_e32 v13, s50", "v_mov_b32_e32 v14, s51"]))
+    # A value read back is a known integer and can be written again.
+    expect_value_error(translate, [sopk_mov(3), SOPK_SET, SOPK_GET, sopk_mov(0), SOPK_SET,
+                                   "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s49"] + plain,
+                       "under round toward zero: v_cvt_f16_f32_e32")
+    assert translate([sopk_mov(0), SOPK_SET, SOPK_GET, sopk_mov(3), SOPK_SET,
+                      "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s49"] + plain) == translate(
+        [sopk_mov(0), "s_nop 0", "s_mov_b32 s49, 0", sopk_mov(3), "s_nop 0", "s_nop 0"] + plain)
+    # The first read needs a write of the field: the entry value is only assumed. A write of the scratch base, a read
+    # that precedes the write and a write that follows the read do not count.
+    expect_value_error(translate, [SOPK_GET] + plain, SOPK_NOT_READ)
+    expect_value_error(translate, [sopk_mov(0), "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s48", SOPK_GET] + plain, SOPK_NOT_READ)
+    expect_value_error(translate, ["s_setreg_imm32_b32 hwreg(HW_REG_FLAT_SCR_HI), 0", SOPK_GET] + plain, SOPK_NOT_READ)
+    expect_value_error(translate, [SOPK_GET, sopk_mov(0), SOPK_SET] + plain, SOPK_NOT_READ)
+    # Every other register or field is refused for reading, with and without an earlier write of MODE[3:2].
+    for read in ("hwreg(HW_REG_MODE, 0, 2)", "hwreg(HW_REG_MODE, 2, 1)", "hwreg(HW_REG_MODE, 3, 2)",
+                 "hwreg(HW_REG_MODE, 6, 2)", "hwreg(HW_REG_MODE, 0, 4)", "hwreg(HW_REG_MODE)",
+                 "hwreg(HW_REG_FLAT_SCR_LO)", "hwreg(HW_REG_FLAT_SCR_HI)", "hwreg(HW_REG_FLAT_SCR_LO, 0, 16)",
+                 "hwreg(HW_REG_STATUS)", "hwreg(HW_REG_STATUS, 2, 2)", "hwreg(HW_REG_TRAPSTS)", "hwreg(HW_REG_LDS_ALLOC)",
+                 "hwreg(HW_REG_SHADER_CYCLES)", "hwreg(HW_REG_GPR_ALLOC)", "hwreg(HW_REG_IB_STS)",
+                 "hwreg(HW_REG_MODE, 02, 2)"):
+        for before in ([], [sopk_mov(3), SOPK_SET]):
+            expect_value_error(translate, [*before, f"s_getreg_b32 s49, {read}"] + plain, "Unsupported hardware register read")
+    for operands in ("vcc_lo, hwreg(HW_REG_MODE, 2, 2)", "m0, hwreg(HW_REG_MODE, 2, 2)", "null, hwreg(HW_REG_MODE, 2, 2)",
+                     "s[48:49], hwreg(HW_REG_MODE, 2, 2)", "exec_lo, hwreg(HW_REG_MODE, 2, 2)",
+                     "v0, hwreg(HW_REG_MODE, 2, 2)", "hwreg(HW_REG_MODE, 2, 2), s49", "hwreg(HW_REG_MODE, 2, 2)",
+                     "s49", "s49, 0x881", "s49, 5", "s49, hwreg(HW_REG_MODE, 2, 2), s50",
+                     "s49 hwreg(HW_REG_MODE, 2, 2)", ""):
+        expect_value_error(translate, [sopk_mov(3), SOPK_SET, f"s_getreg_b32 {operands}".rstrip()] + plain,
+                           "Malformed s_getreg_b32 operands")
+    expect_value_error(translate, [sopk_mov(3), SOPK_SET, "s_getreg_b32 s106, hwreg(HW_REG_MODE, 2, 2)"] + plain,
+                       "Scalar register out of range")
+    # Neither form may sit between the color export and s_endpgm, in a masked region or in a uniform skip block.
+    for line in (SOPK_SET, SOPK_GET):
+        must_reject(translate, [sopk_mov(3), SOPK_SET] + plain[:-1] + [line, plain[-1]])
+        for opener in REGION_WAIT_OPENERS:
+            expect_value_error(translate, region_scalar_alu_program(opener=opener, body=(line,)),
+                               "Instruction cannot run in a masked region")
+        expect_value_error(translate, scc_skip(body=(*SCC_SKIP_BODY, line), before=[sopk_mov(3), SOPK_SET]),
+                           "Instruction cannot run in a uniform skip block")
+    # A write ahead of a skip is on every path, so a read after its join is the same value on all of them.
+    for value in (0, 3):
+        skip = scc_skip(before=[sopk_mov(value), SOPK_SET], after=(SOPK_GET, "v_mov_b32_e32 v15, s49"))
+        assert translate_int(skip) == translate_int(scc_skip(
+            before=[sopk_mov(value), "s_nop 0"], after=(f"s_mov_b32 s49, {value}", "v_mov_b32_e32 v15, s49")))
+
+
+def check_sopk_hwreg_draw(directory, compiler, renderer, backend):
+    """Read MODE[3:2] back after SGPR and immediate writes and export the values through the lossless integer
+    target, mixed with constant-buffer words. Each deviation of the lowering (a field read left in place, a stale
+    read, an immediate write that is not seen, a write that is not applied) must report a pixel_mismatch."""
+    source = directory / "sopk_hwreg.hlsl"
+    shader = directory / "sopk_hwreg.cso"
+    source.write_text(translate_int(uncompressed_export(SOPK_HWREG_BODY)), encoding="ascii")
+    compile_shader(compiler, source, shader)
+    cases = []
+    for index, words in enumerate(SOPK_HWREG_SETS):
+        constants = bytearray(256)
+        struct.pack_into("<4I", constants, 12, *words, 0)
+        expected = sopk_hwreg_expected(words)
+        # The field left in place (3 << 2), the first write ignored, the restore not seen, the immediate write not
+        # seen (0 plus s45) and the last read stale (3 plus s46).
+        wrongs = ((0, 12), (0, 0), (1, 3), (2, words[1]), (3, (words[2] + 3) & 0xffffffff))
+        for channel, value in wrongs:
+            assert value != expected[channel]
+            wrong = list(expected)
+            wrong[channel] = value
+            path = directory / f"sopk_hwreg-{index}-{channel}-{len(cases)}.case"
+            write_case(path, bytes(constants), tuple(as_float(word) for word in wrong), integer_rt=True)
+            cases.append((path, "mismatch"))
+        path = directory / f"sopk_hwreg-{index}.case"
+        write_case(path, bytes(constants), tuple(as_float(word) for word in expected), integer_rt=True)
+        cases.append((path, "pass"))
+    run_pixel_batch(renderer, backend, shader, cases)
+
+
+def check_sopk_hwreg_binary(directory, assembler, objcopy, library):
+    """LLVM 15 gfx1013 encodings and spellings of the register forms: SIMM16 is the id in bits 5:0, the offset in 10:6
+    and the width minus one in 15:11 (MODE[3:2] is 0x0881); a full-width field prints as the bare register and a
+    numeric id prints by name. Only the printed spelling is lowered. An immediate, and a pair, do not assemble."""
+    source, obj, binary = directory / "sopk_hwreg.s", directory / "sopk_hwreg.o", directory / "sopk_hwreg.bin"
+
+    def assemble(line):
+        source.write_text(line + chr(10) + "s_endpgm" + chr(10), encoding="ascii")
+        subprocess.run([assembler, "-triple=amdgcn--amdpal", "-mcpu=gfx1013", "-filetype=obj", source, "-o", obj], check=True,
+                       capture_output=True)
+        subprocess.run([objcopy, "-O", "binary", "--only-section=.text", obj, binary], check=True)
+        code = binary.read_bytes()
+        return code[:-4].hex(), disassemble(code, library)[0]
+
+    for line, encoded, text in (
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s0", "810880b9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s0"),
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48", "8108b0b9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s48"),
+            ("s_setreg_b32 hwreg(1, 2, 2), s0", "810880b9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s0"),
+            ("s_getreg_b32 s0, hwreg(HW_REG_MODE, 2, 2)", "810800b9", "s_getreg_b32 s0, hwreg(HW_REG_MODE, 2, 2)"),
+            ("s_getreg_b32 s48, hwreg(HW_REG_MODE, 2, 2)", "810830b9", "s_getreg_b32 s48, hwreg(HW_REG_MODE, 2, 2)"),
+            ("s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s5", "14f885b9", "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_LO), s5"),
+            ("s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI, 0, 32), s5", "15f885b9", "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI), s5"),
+            ("s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI, 4, 8), s5", "153985b9", "s_setreg_b32 hwreg(HW_REG_FLAT_SCR_HI, 4, 8), s5"),
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 0, 32), s0", "01f880b9", "s_setreg_b32 hwreg(HW_REG_MODE), s0"),
+            ("s_getreg_b32 s1, hwreg(HW_REG_FLAT_SCR_LO)", "14f801b9", "s_getreg_b32 s1, hwreg(HW_REG_FLAT_SCR_LO)"),
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), vcc_lo", "8108eab9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), vcc_lo"),
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), m0", "8108fcb9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), m0"),
+            ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), null", "8108fdb9", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), null"),
+            ("s_getreg_b32 vcc_lo, hwreg(HW_REG_MODE, 2, 2)", "81086ab9", "s_getreg_b32 vcc_lo, hwreg(HW_REG_MODE, 2, 2)"),
+            ("s_getreg_b32 m0, hwreg(HW_REG_MODE, 2, 2)", "81087cb9", "s_getreg_b32 m0, hwreg(HW_REG_MODE, 2, 2)")):
+        assert assemble(line) == (encoded, text), (line, assemble(line))
+    for line in ("s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), 3", "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s[0:1]",
+                 "s_setreg_b32 hwreg(HW_REG_MODE, 2, 2), s106"):
+        try:
+            assemble(line)
+        except subprocess.CalledProcessError:
+            continue
+        raise AssertionError(f"LLVM 15 assembled {line}")
 
 
 HINT_NAMES = ("s_clause", "s_setprio", "s_sleep", "s_inst_prefetch", "s_incperflevel", "s_decperflevel",
@@ -13211,7 +13460,7 @@ def check_f16_arith_controls(*, run_reference=True):
     for write, message in (("s_denorm_mode 15", "Unsupported instruction"), ("s_round_mode 3", "Unsupported instruction"),
                            ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 6, 2), 3", "Unsupported hardware register write"),
                            ("s_setreg_imm32_b32 hwreg(HW_REG_MODE, 4, 4), 15", "Unsupported hardware register write"),
-                           ("s_setreg_b32 hwreg(HW_REG_MODE, 6, 2), s48", "Unsupported instruction")):
+                           ("s_setreg_b32 hwreg(HW_REG_MODE, 6, 2), s48", "Unsupported hardware register write")):
         for lines in ([write, *prefix, "v_add_f16 v24, v18, v19"], [*prefix, "v_add_f16 v24, v18, v19", write]):
             expect_value_error(translate_f16, uncompressed_export(lines), message)
     # Readers. The audited ones read a binary16 result; every other reader of the tag refuses it.
@@ -16727,6 +16976,7 @@ _CONTROL_SUBCHECKS = (
     "check_bit_controls",
     "check_scheduling_hints",
     "check_mode_register_controls",
+    "check_sopk_hwreg_controls",
     "check_constant_descriptor_bounds",
     "check_scalar_constant_reads",
     "check_three_constant_buffers",
@@ -17240,6 +17490,7 @@ def check_binary(directory, assembler, objcopy, library):
     check_f16_fmac_ldexp_binary(directory, assembler, objcopy, library)
     check_f16_cvt_int16_binary(directory, assembler, objcopy, library)
     check_f16_to_int16_binary(directory, assembler, objcopy, library)
+    check_sopk_hwreg_binary(directory, assembler, objcopy, library)
     fixtures = [(assembly(False), translate), (assembly(True), translate), (curve(), translate), (shaping(), translate), (select(), translate), (absolute_value(), translate),
                 (rounding(), translate), (arithmetic(), translate), (with_scalar_constant_reads(), translate), (with_scalar_pair_reads(), translate),
                 (with_three_constant_buffers(), translate_three_buffers), (smem_pointer_loads(), translate_smem_pointers),
@@ -17314,6 +17565,7 @@ def check_binary(directory, assembler, objcopy, library):
     fixtures.append((with_constants(FMA_MIX_BODY), translate))
     fixtures.append((with_constants(NARROW_BODY), translate))
     fixtures.append((mode_program(), translate))
+    fixtures.append((uncompressed_export(SOPK_HWREG_BODY), translate_int))
     fixtures.append((dual_program(swap_weights=True), translate_dual))
     fixtures.extend((with_constants(body), translate) for body, *_ in E64_ARITH)
     fixtures.append((with_constants(APPROX_E64_BODY), translate))
@@ -22721,7 +22973,7 @@ def main():
                     "draw-title-loads", "draw-ds-swizzle", "draw-exec-regions", "draw-cmpx-regions", "draw-cmpx-e64", "draw-scc-skip",
                     "draw-region-body", "draw-region-waits", "draw-region-scalar-alu", "draw-region-scalar-load", "draw-div-fmas",
                     "draw-cmp64", "draw-cmp-f64", "draw-shift64",
-                    "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers",
+                    "draw-f16-arith", "draw-f16-round", "draw-f16-fmac-ldexp", "draw-f16-cvt-int16", "draw-f16-to-int16", "draw-flat-scratch", "draw-smem-pointers", "draw-sopk-hwreg",
                     "draw-dpp-cvt", "draw-dpp-movrel", "draw-dpp-f16", "draw-dpp-extra", "draw-pk-fmac"):
             try:
                 draw = {"draw-blend-scalar": check_blend_and_scalar_draws,
@@ -22775,6 +23027,7 @@ def main():
                         "draw-shift64": check_shift64_draw,
                         "draw-pk-fmac": check_pk_fmac_draw,
                         "draw-flat-scratch": check_flat_scratch_draws,
+                        "draw-sopk-hwreg": check_sopk_hwreg_draw,
                         "draw-smem-pointers": check_smem_pointer_draw,
                         "draw-dpp-f16": check_dpp_f16_draw}[mode]
                 return draw(directory, *args)

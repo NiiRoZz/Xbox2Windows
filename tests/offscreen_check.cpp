@@ -1240,9 +1240,14 @@ constexpr CapabilityGate kGateSm60CompareSampler{
 constexpr CapabilityGate kGateSm60SamplerIndexControl{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: sampler index control requires SM 6.0",
-    CapsDiagnostic::none};constexpr CapabilityGate kGateSm60RawUavDump{
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm60RawUavDump{
     D3D_SHADER_MODEL_6_0, false, false, 0,
     "skip: raw UAV dump requires SM 6.0",
+    CapsDiagnostic::none};
+constexpr CapabilityGate kGateSm62RawUavDump{
+    D3D_SHADER_MODEL_6_2, false, false, 0,
+    "skip: denormal-preserving raw UAV dump requires SM 6.2",
     CapsDiagnostic::none};
 constexpr CapabilityGate kGateAddressWindow{
     D3D_SHADER_MODEL_6_0, true, false, 0,
@@ -1305,6 +1310,7 @@ const OperationSpec kOperations[] = {
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
+    {"--raw-uav-dump-sm62", 7, 7, nullptr, kGateSm62RawUavDump, run_raw_uav_dump},
     {"--spirv-address-window", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window},
     {"--spirv-address-window-atomic", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_atomic},
     {"--spirv-address-window-signed", 4, 4, nullptr, kGateAddressWindow, run_spirv_address_window_signed},
