@@ -27,6 +27,10 @@ It covers what the draw cannot observe: the logged descriptor offset (4 bytes in
 a byte-for-byte copy of the descriptor, and refusal of a null list or one that is not whole
 records. The control expects the first blend patch to win and must fail.
 
+## Stencil reference
+
+Command-list slot 24 (`OMSetStencilRef`, the desktop slot) passes its reference to the desktop list, as slots 21 to 23 do for viewports, scissors and the blend factor, so a translated draw whose pipeline enables the stencil test compares against it. A closed list ignores the call. The slot number is the desktop one and has not been seen in a title log; `startup_stream_depth_{warp,hardware}` checks the references 0x5A, 0x5B, 0 and 0xFF against a stencil cleared to the matching value.
+
 ## Default viewport and scissor
 
 A desktop command list that never sets a viewport or scissor rectangle draws no pixel. A translated
@@ -63,6 +67,12 @@ B4G4R4A4_UNORM, the wrapper uses an R8G8B8A8_UNORM null descriptor if that forma
 requested view. This applies only to Texture2D views with no resource or counter. Run
 `ctest --preset dev --no-tests=error -R '^startup_null_views_' -V` against your build
 directory to exercise both slots on hardware and WARP. On Windows 11 build 26300.9974 two adapters on one machine split. An RTX 5080 Laptop (32.0.15.8142) lacks the typed UAV and render-target support the rule keys on and reports `slot 19 format 86 -> 28; slot 20 format 115 -> 28`; an Intel Arc 140T (32.0.101.8132) has it, like in-box WARP 10.0.26100.9818, and both report `slot 19 format 86 -> 86; slot 20 format 115 -> 115`. Physical versus WARP is therefore not the discriminator; select the adapter with `XBOX2WINDOWS_ADAPTER=intel` or `XBOX2WINDOWS_ADAPTER=nvidia` and read the two lines.
+Because WARP keeps both formats, `startup_null_texture_view` checks the rule without a GPU: fake
+adapters answer the format queries, and the check covers a packed format with or without its use,
+one with only the other slot's use, R8G8B8A8 with one use or none, failed queries, and the other
+dimensions, formats, resources and counters that are left alone. A rewrite must keep every other
+field of the description. `startup_null_texture_view_unchecked_fallback_control` rewrites without
+asking about R8G8B8A8 and must fail.
 
 ## 16-bit packed targets
 
@@ -151,6 +161,18 @@ one address between two draws of a frame, such as a dynamic constant buffer, gav
 data. The comparison uses the kept bytes because the ring is write-combined memory that is slow to read.
 `startup_frame_copy_{warp,hardware}` rewrites a constant buffer between two draws and checks both halves.
 
+## Root signature changes and dropped root constants
+
+Command-list slot 34 (`SetGraphicsRootSignature`) clears the translated draw's cached descriptor tables, root
+addresses and root constants when the signature changes. Setting the same signature again preserves these arguments.
+An unset constant reads as zero in the translated draw. Slot 40
+(`SetGraphicsRoot32BitConstants`) keeps 16 parameters of 8 words. A call with a parameter of 16 or more or an offset of
+8 or more is dropped, and one whose count passes the eighth word is truncated; each logs one line
+(`root constants dropped` or `root constants truncated`, with the parameter, offset and count) for the first four such
+calls in the process. `startup_root_reset_{warp,hardware}` draws a 1D texture through a bound table and writes a
+root constant into the blue channel. It checks the original bindings, the same signature, a switched signature and
+six out-of-range calls. The switched case clears both inputs to the shader.
+
 ## Null bindings in translated draws
 
 The `x2w-render totals` line reports `null bindings N`, then the same count split by cause as
@@ -181,6 +203,56 @@ desktop list and does not set the vertex-fetch bit of `srv_bound`. The slot numb
 the console shift, not yet seen in a title log; `startup_root_cbv_{warp,hardware}` checks the handler with a bound, an
 unbound, a null-overwrite and a wrong-type call. Rebinding the same root signature keeps
 the address. Switching to a different signature invalidates the stored root addresses.
+
+## Heap-indexed root signatures
+
+Device slot 16 records whether a title root signature was created with
+`D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED` (`0x400`), `SAMPLER_HEAP_DIRECTLY_INDEXED` (`0x800`)
+or both. Command-list slot 32 only tracks the heaps a title sets and never forwards them, so setting such a root
+signature on the desktop list made the debug layer report message ID 1419 for each flag. Slot 34 now keeps
+tracking the title's parameters, root addresses and constants for every root signature, but sets only an unflagged
+one on the desktop list, as before; a flagged one is deferred (`root signature ... with heap flags 0x... not set on
+the desktop list`, first three). Root SRVs (slot 44) are not forwarded under a deferred root. Translated draws use
+their own root signature (no flags) and are unaffected.
+
+A real draw under a deferred root is decided by `src/startup_stubs/heap_indexed_root.h`: it may bind only when the
+list holds a mirror of every heap the root indexes, covering the indices the draw reads, and every root constant,
+descriptor table and root descriptor can be set again. A one-entry sampler heap covers only index 0 and never stands
+in for the view heap. The stand-in has no mirrored heap and cannot restore that state, so it refuses every real draw
+under a flagged root, counts it by reason and logs `real draw refused: root signature heap flags 0x..., <reason>`
+(first three per reason, then every 1000th). The `x2w-render totals` line reports `heap-indexed roots deferred N
+(real draws refused: view heap, sampler heap, both heaps, state)`. On current main no source-built path reaches a
+real draw (`compile_translation` returns no shader), so the refusal itself is checked only by the device-free
+`startup_heap_indexed_root` matrix. `startup_root_heap_{warp,hardware}` runs the root CBV draw with the debug layer
+on, for each flag alone, both and neither: a plain desktop list with the same root signature and no heaps must
+produce one ID 1419 per flag first (otherwise the run skips with 77), and through the stand-in no such message may
+appear while the translated draw keeps its colour.
+
+## Render target binds and clears
+
+Command-list slot 50 (desktop `OMSetRenderTargets` plus four) takes the render target handles either as an array or,
+with `RTsSingleHandleToDescriptorRange` true, as the first handle only. In the single-range form the other handles follow
+the first at the title's own descriptor stride (`title_descriptor_stride`, the same stride the descriptor copies use), for
+a count of one as well as for several. The desktop call always receives the resolved array. Before this change a true
+single-range flag dropped the bind without a message, so every later draw on the list was skipped as not drawn.
+
+A bind is refused, as before, when a handle holds a view of the wrong kind, a depth view has one read-only plane, a depth
+handle resolves to nothing, or the count is above eight. What changed is that the refusals are visible: each handle
+that holds no view (render target or depth), and a count above eight, adds to `target binds N (unresolved M)` in
+the `x2w-render totals` line and logs one line (the first six of each kind), for example
+`OMSetRenderTargets refused: render target 1 (0x...) holds no view`. A depth pointer whose handle maps to no
+descriptor still binds no depth, now with a count and a log line.
+
+Slot 52 (`ClearRenderTargetView`) resolves its view the way the bind does: through the descriptor's shadow record,
+so a render target view the title copied with `CopyDescriptors` or `CopyDescriptorsSimple` clears the resource it
+now holds, with the creation-time table as the fallback for a handle with no record. A handle that resolves to nothing
+adds to the unresolved count and logs one line (`ClearRenderTargetView skipped: view 0x... is not a known render target
+view`); a depth view passed there is reported as not a render target view.
+
+`startup_rtv_bind_{warp,hardware}` records the bind forms (array, single range with one and two handles, an empty view
+inside the range, an empty view alone) and reads the counters through the `x2w_d3d12_render_target_stats` export,
+then copies a view into an empty slot, clears the copy red and reads the target back. It does not draw. The export reads
+the same counters the totals line prints.
 
 ## Composite provenance fixture
 
@@ -267,6 +339,21 @@ keep the debug heap, for example to look for heap corruption. In one local start
 the debug heap spent about 8.9 s freeing the nodes of a 99,776-entry map built by a single
 `XMemMapPhysicalPages` call; without it the whole call took 0.46 s and the first DirectStorage batch
 completed about 20 s earlier. `startup_debug` checks both settings on its probe.
+
+A second local comparison on Windows 11 build 26200.9974 used a custom debugger
+with the same runtime DLL, saved state and warm cache in both runs. Times are seconds
+from process creation. The ordinary-heap run also recorded process audio levels.
+
+| Startup milestone | Debugger default (variable unset) | Ordinary heap (`_NO_DEBUG_HEAP=1`) |
+|---|---:|---:|
+| First captured window frame, including black | 30.14 | 7.40 |
+| First opening-movie open request | 132.98 | 86.72 |
+| First language selection screen matched | 152.16 | 105.24 |
+
+There was one run per setting. Measure the window and the first visible content
+separately when repeating this comparison. Time from the first recorded button
+release to language selection was about 17 seconds in both runs. For the public
+heap-flag regression, run `ctest --preset dev --no-tests=error -R '^startup_debug$'`.
 
 It writes:
 
@@ -393,9 +480,10 @@ ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?
 | Variable | Effect |
 |---|---|
 | `X2W_XMEM_PERMISSIVE=1` | accepts the reservation, mapping and allocation shapes a startup run uses |
+| `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
-| `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` |
+| `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards the [single-record indirect compute dispatch](experiments.md#gpu-written-indirect-dispatch-arguments) for a desktop compute pipeline and a tracked placed buffer |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` and no manifest; `X2W_FXC=` (empty) skips compilation and publishes the manifest alone. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
@@ -502,6 +590,13 @@ These are measured on one executable; treat them as hypotheses for others.
   resources (for example the video frame planes) at the same offset in the second. On the console
   the second is a GPU view of the first. Mapping each page's section into both views makes those
   resources readable; without it, a YUV video shows a solid green screen (all-zero planes).
+- **DirectStorage status arrays (#1843).** A new status array's slots are complete with `S_OK`, so
+  `IsComplete` is true and `GetHResult` is `S_OK` for a slot nothing has been enqueued into.
+  `EnqueueStatus` makes its slot pending (`E_PENDING`) until the entries before it have run, and leaves
+  the other slots as they are. This follows Microsoft's Win32 implementation of the API in
+  Xbox-GDK-Samples (MIT), `SimpleDirectStorageCombo/DirectStorageWin32/DirectStorageWin32WrapperStatusArray.cpp`.
+  The `startup_stubs` check covers a fresh array, a slot held pending behind a fence signal while the
+  others stay complete, and that slot's completion.
 - **DirectStorage ordering.** Requests must run after `Submit`, in order with status and fence
   entries. Titles fill destination page-array entries after `EnqueueRequest`, and also replace
   entries filled earlier, so the whole page array is read again when the request runs. The
@@ -535,6 +630,20 @@ These are measured on one executable; treat them as hypotheses for others.
   survives its allocator's Reset, as on the console. If the fence that tracks a submit cannot be
   created or signalled, that submit's allocator is never reset or reused again. Run
   `ctest --preset dev --no-tests=error -R "^startup_list_resubmit_"`.
+- **Failed command-list Close.** A desktop list that fails Close cannot be reopened by desktop
+  Reset. The renderer reports the failed HRESULT and excludes the failed recording from queue
+  submission. The next Reset creates a fresh list of the same type on the requested allocator
+  while keeping the console-facing handle. If creation fails, another Reset can retry. The
+  resubmission fixture issues an invalid viewport command on a compute list while an older
+  valid submit is waiting on a fence. It verifies the failed Close and wrong-type Reset, then
+  closes and submits a recovered recording and lets the queue finish both valid submissions.
+- **Upload arena fixture.** The standalone arena allocates 640 writable bytes with 16-byte CPU
+  and GPU alignment, preserves them when a later allocation needs a new page, and translates
+  only byte ranges inside one live allocation. The idle reset retires those ranges. An eventual
+  command-list caller must wait for its recordings and GPU submissions to retire before reset.
+  The fixture exercises allocation and retirement without queue submission or guest slot binding.
+  Run `cmake --build --preset release --target startup_upload_arena` and
+  `ctest --preset release --no-tests=error -R '^startup_upload_arena_' -V`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and
@@ -555,6 +664,10 @@ These are measured on one executable; treat them as hypotheses for others.
   draw of a 4x4 texture of two slices with three mips whose cells all differ, with mutants that exchange
   slice and mip, ignore the mip, or shift it by one. The draw was written without a Windows run. Cube maps
   are still refused for `image_load_mip`.
+- **Packed 2D load coordinates.** Plain 2D `image_load` with `a16` reads unsigned x and y from the low and
+  high halves of one VGPR and reads mip zero. The packed form requires one address VGPR without an
+  NSA extension. Plain loads refuse an empty `dmask`, `r128`, `lwe`, `d16`, `tfe` and reserved bits.
+  The source-built startup mip-load check covers this translation on Linux.
 - **2D array images.** `image_sample`, `image_sample_lz`, `image_sample_l` and `image_load` with
   `dim:SQ_RSRC_IMG_2D_ARRAY` use a `Texture2DArray<float4>` (manifest kind `tex2da`). The slice is
   the third address component, as `float3(u, v, slice)` for a sample and `int4(x, y, slice, 0)`
@@ -564,12 +677,28 @@ These are measured on one executable; treat them as hypotheses for others.
   (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`). Cube, multisampled
   and 1D images are still refused. Not covered: binding a single-slice 2D view to an array declaration
   in the draw path.
+- **2D array depth comparison.** `image_sample_c_lz` and `image_sample_c` (sampler MAX_LOD 0) with
+  `dim:SQ_RSRC_IMG_2D_ARRAY` take the reference, u, v and the slice as four address registers and lower to
+  `Texture2DArray.SampleCmpLevelZero(smp, float3(u, v, slice), reference)` on the same constant comparison
+  sampler as the 2D form. Before, they were refused with `image_sample_c[_lz] on SQ_RSRC_IMG_2D_ARRAY`.
+  `python -B tests/startup_image_sample_c_check.py` translates the fixtures (words checked against `llvm-mc`) and
+  fails seven edited array lowerings. `tests/startup_image_2d_array_check.py` also compiles and draws both
+  comparison forms through `offscreen_check --startup-image-2d-array` against a two-slice `R32_FLOAT` 2D array
+  (depths `0.25` and `0.75` at texel `(1, 0)`, reference `0.5`, `LESS` via the manifest `smpc` line) and requires
+  always-slice-zero and swapped-slice controls to differ (`ctest --preset release --no-tests=error -R "^startup_image_2d_array_"`).
+  `image_sample_c_l` stays refused (shader model 6.7).
 - **Flat parameters.** `v_interp_mov_f32` reads a `nointerpolation uint4` copy written from the
   exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
   constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
   ([#1259](https://github.com/R0Y00/Xbox2Windows/issues/1259)). Colour exports of constant integer
   words still go through `float4` and have the same loss. Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_flat_param_"`.
+- **Non-fused multiply-add.** The gfx1013 `v_mad_f32`, `v_mac_f32`, `v_madmk_f32`,
+  `v_madak_f32` and `v_mad_legacy_f32` forms round the product before the sum and flush
+  binary32 denormals to signed zero at each step. The legacy form keeps its zero
+  multiplication rule. The existing HLSL for `v_fma_f32` and `v_fmac_f32` does not
+  guarantee a fused result. Run `ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_mad_'`.
+  [#1728](https://github.com/R0Y00/Xbox2Windows/issues/1728)
 - **Stream-cache identity.** A cached zlib stream is served only to the exact queued
   continuation entries in the same DirectStorage queue. The lookup checks the enqueued request
   id, the source, the compressed size and the destination chunk size. A later independent
@@ -596,6 +725,39 @@ These are measured on one executable; treat them as hypotheses for others.
   are generated by the test. It does not add a per-file offset or a size-based lookup, and it does not show
   what the title expects for a refused request.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_refusal_order$' -V`.
+- **DirectStorage failure causes (#1198).** After its totals line, the heartbeat prints
+  `x2w-dstorage heartbeat <n> s: failed requests by cause` with one count for each of
+  `read-at-or-past-eof`, `read-crossing-eof`, `read-other`, `destination-capacity`,
+  `destination-not-writable`, `zlib`, `bcpack` and `other`. The causes add up to `failed=` on the
+  totals line. `other` holds unknown option bits, page grant and page write failures, a page array
+  unreadable at run, an entry that threw and an entry never started. A refused file read is split
+  by comparing its range with the file size: at or past EOF when the offset is not below the size,
+  crossing EOF when the length is larger than the size minus the offset. No end offset is computed,
+  so nothing wraps. The per-request text stays `read failed`, and statuses and ordering are unchanged.
+  The `startup_storage_failure_counts` fixture compiles the stand-in into itself, submits two valid
+  requests and eleven failing ones covering every cause, and checks the exact count of each cause,
+  the heartbeat line text, the `read failed` text and edge ranges near 2^64. Its `one_bucket_control`
+  expects every failure under one cause and must fail. The counts cover the run as a whole; they do
+  not say which failure came first or what the title expects for a refused request.
+  Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_failure_counts' -V`.
+- **DirectStorage page-request ends (#1198).** After the failure causes, the heartbeat prints
+  `x2w-dstorage heartbeat <n> s: page requests by end against the first 64 KiB page` with
+  `inside-completed`, `inside-failed`, `at-page-end-completed`, `at-page-end-failed`,
+  `past-completed` and `past-failed`. It covers requests with a page destination (option bit 21)
+  and classifies each by `page_offset + destination_size`, formed in 64 bits so it cannot wrap:
+  below 0x10000 is inside the first page, 0x10000 is at its end, above is past it. A destination
+  size of 0 ends at its offset, so inside. A request is counted once, when it runs: completed when
+  it is written, failed under the same rule that sets `failed=` on the totals line, including a page
+  array unreadable at run and an entry that threw. An `empty` request (source size 0) is neither, and
+  an entry that never started is not counted. Outcomes, statuses and the per-request text are
+  unchanged. The `startup_storage_page_end_counts` fixture compiles the stand-in into itself, loads
+  the xmem shim for page writes, submits page requests of every end that complete and that fail at
+  each failure site, plus an `empty` and two linear-destination requests, and checks each count, that
+  the page counts match the totals less the linear requests, the logged outcome of every failure, the
+  heartbeat line text and edge ends where a 32-bit sum would wrap. Its `one_bucket_control` expects
+  every page request at the page end and must fail. The counts describe a run's request shapes; they
+  do not say why a request of one shape fails or what the title expects for it.
+  Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_page_end_counts' -V`.
 - **DirectStorage allocation failure (#1199, item 3).** A queue worker runs each entry inside
   a handler that turns any exception, including `std::bad_alloc` from a buffer sized by a request
   field, into a failed request: the next status entry reports `E_FAIL`, the destination is
@@ -893,7 +1055,9 @@ sections, so runs that stop at different points can be compared by memory spent 
 elapsed time. A physical-page section exists from a page's first use (a mapping or a DirectStorage
 write) until its grant is released; `xmem.dll` publishes that count through the experimental
 `x2w_xmem_page_stats` export. The heartbeat also prints while the request counters are unchanged
-when either memory value changed, so the cost of a stalled load is visible.
+when either memory value changed, so the cost of a stalled load is visible. Each report is followed
+by a line of failed requests by cause and a line of page-destination requests by end (see
+DirectStorage failure causes and DirectStorage page-request ends under Findings).
 
 ```powershell
 cmake --build --preset release --target xmem_shim startup_stub_xcrdapi
@@ -1012,10 +1176,11 @@ is not affected: section-backed pages already took the committed, not-aliased pa
   the same pages with writes seen both ways; an unmap refused at each of three steps
   (`X2W_XMEM_TEST_FAULT`); and a reader on a page while its neighbour is unmapped and mapped
   again. Two cases must end in an access violation, the reader without the handler
-  (`X2W_XMEM_NO_FAULT_RETRY=1`) and a read of a forgotten page; each runs in a child process
+  (`X2W_XMEM_NO_FAULT_RETRY=1`, with `X2W_XMEM_TEST_HOLD_WINDOW` holding the unmap until the
+  reader has read the unmapped page) and a read of a forgotten page; each runs in a child process
   whose exit code the parent checks. Those controls and `X2W_XMEM_TEST_FAULT` exist only in a
   second build of the shim (`xmem_shim_test_controls`, `X2W_XMEM_TEST_CONTROLS`); the check shows
-  that the deployed `xmem.dll` ignores both switches. Four more children cover the lifetime on
+  that the deployed `xmem.dll` ignores these switches. Four more children cover the lifetime on
   the deployed shim: without the opt-in, pages mapped with a view each and the shim unloading
   after that mapping, twice; with it, an unused shim unloads, a used one stays loaded through `FreeLibrary` with an
   unrelated handled access violation still delivered and the handler still working; `FreeLibrary`
