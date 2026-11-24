@@ -95,6 +95,7 @@ jobs:
               (["tests/startup_inline_sampler_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_smem_address_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/compute_entry_layout_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_ngg_slice_check.py", "binary", "llvm-mc-15"], {}),
           ]
 
           def run_one(item):

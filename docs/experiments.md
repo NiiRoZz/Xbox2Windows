@@ -3421,11 +3421,14 @@ must fail the decode comparison, and six planted model faults must each change
 an expected result: index slots read at 8-bit steps, the null bit ignored,
 swapped counts, no wave offset in the thread index, `s_barrier` as a no-op
 (caught by the reverse wave order alone) and exec ignored by vector ALU
-instructions. The words have not been reassembled with LLVM; there is no
-`binary` mode yet. The fixture is a classification aid, not a lowering.
+instructions. The `binary` mode reassembles all six programs with LLVM 15
+`llvm-mc` (gfx1013, wave64) and requires identical words; a deliberately wrong
+encoder word must be reported. The fixture is a classification aid, not a
+lowering.
 
 ```sh
 python3 -B tests/startup_ngg_slice_check.py
+python3 -B tests/startup_ngg_slice_check.py binary llvm-mc-15
 ```
 
 ## Compute UAV stores from a native container
