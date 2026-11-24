@@ -43,7 +43,8 @@ void check_stream_root_srv(ID3D12Device* device);
 void check_descriptor_window_submissions(ID3D12Device* device, DescriptorWindowCase scenario);
 void check_cpu_srv_refresh(ID3D12Device* device, bool stale);
 enum class MeshConstantBinding { root, root_pair, swapped_root_pair, table, swapped_table };
-enum class MeshDrawMode { color, textured, depth_pair };
+// multi_primitive: one native color draw whose export trace size comes from the fixture.
+enum class MeshDrawMode { color, textured, depth_pair, multi_primitive };
 struct MeshTextureProducers {
     const char* first;
     const char* second;
@@ -106,7 +107,7 @@ bool check_dxr_placed_build(ID3D12Device* device);
 bool check_dxr_rays(ID3D12Device* device, bool usePipeline);
 bool check_dxr_update(ID3D12Device* device, bool usePipeline);
 bool check_dxr_facing(ID3D12Device* device, bool usePipeline);
-bool check_dxr_opacity(ID3D12Device* device, bool warp, bool usePipeline);
+bool check_dxr_opacity(ID3D12Device* device, bool warp, bool usePipeline, float nearT);
 
 Microsoft::WRL::ComPtr<ID3D12Resource> make_buffer(ID3D12Device* device, UINT64 length, D3D12_HEAP_TYPE heap,
     D3D12_RESOURCE_STATES state, D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE);

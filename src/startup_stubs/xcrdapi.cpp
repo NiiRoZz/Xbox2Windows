@@ -10,6 +10,7 @@
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/inflate.h"
+#include "startup_stubs/dstorage_error_record.h"
 #include "startup_stubs/dstorage_file_read.h"
 #include "startup_stubs/bcpack_decoder.h"
 
@@ -32,7 +33,10 @@
 namespace {
 
 using u64 = std::uint64_t;
+using x2w_startup::StorageErrorRecord;
+using x2w_startup::StorageRequest;
 constexpr int slots = 32;
+constexpr u64 memory_source_option = 1ull << 22;
 
 enum Kind : unsigned { factory = 0x20, file = 0x40, status = 0x60, queue = 0x80 };
 const char* kind_name(unsigned kind)
@@ -59,6 +63,17 @@ struct Object {
     struct Unrecorded* unrecorded_tail = nullptr;
 };
 
+struct FileObject : Object {
+    wchar_t filename[MAX_PATH]{};
+};
+
+struct QueueObject : Object {
+    // Independent of QueueWork so a queue can report failures even when it has no worker.
+    std::mutex error_mutex;
+    StorageErrorRecord error_record = x2w_startup::empty_error_record();
+    HANDLE error_event = nullptr;
+};
+
 // A queue entry as enqueued: a request (its 0x48 bytes copied, and a snapshot of its destination page
 // tokens), a status entry or a fence signal. Entries run in order on the queue's worker after Submit,
 // like DirectStorage; a destination page token that was 0 at enqueue is read again at the entry's turn
@@ -71,7 +86,7 @@ struct Object {
 // are therefore a plain array, allocated once with new (std::nothrow) at EnqueueRequest.
 struct Entry {
     enum Type { request, status_entry, signal } type;
-    unsigned char bytes[0x48];
+    unsigned char bytes[sizeof(StorageRequest)];
     std::unique_ptr<ULONG_PTR[]> tokens;
     std::size_t token_count = 0;
     Object* array;
@@ -266,13 +281,25 @@ long __stdcall query_interface(Object* self, const GUID* riid, void** out)
     return S_OK;
 }
 unsigned long __stdcall add_ref(Object* self) { return static_cast<unsigned long>(InterlockedIncrement(&self->refs)); }
-unsigned long __stdcall release(Object* self) { return static_cast<unsigned long>(InterlockedDecrement(&self->refs)); }
+unsigned long __stdcall release(Object* self)
+{
+    const auto refs = static_cast<unsigned long>(InterlockedDecrement(&self->refs));
+    if (refs == 0 && self->kind == queue) {
+        auto& object = *static_cast<QueueObject*>(self);
+        const std::lock_guard guard(object.error_mutex);
+        if (object.error_event) CloseHandle(std::exchange(object.error_event, nullptr));
+    }
+    return refs;
+}
 
 void** make_table(unsigned kind);
 
 Object* make(unsigned kind)
 {
-    auto* object = new Object{};
+    Object* object;
+    if (kind == queue) object = new QueueObject{};
+    else if (kind == file) object = new FileObject{};
+    else object = new Object{};
     object->vtable = make_table(kind);
     object->kind = kind;
     object->refs = 1;
@@ -293,8 +320,9 @@ long __stdcall factory_open_file(Object*, const wchar_t* path, const GUID* riid,
     if (!out) return E_POINTER;
     *out = nullptr;
     if (handle == INVALID_HANDLE_VALUE) return HRESULT_FROM_WIN32(error);
-    Object* object = make(file);
+    auto* object = static_cast<FileObject*>(make(file));
     object->handle = handle;
+    wcsncpy_s(object->filename, path, _TRUNCATE);
     *out = object;
     return S_OK;
 }
@@ -309,7 +337,10 @@ long __stdcall factory_create_status_array(Object*, unsigned capacity, const cha
     Object* object = make(status);
     object->capacity = capacity;
     object->results = new LONG[capacity ? capacity : 1];
-    for (unsigned i = 0; i < capacity; ++i) object->results[i] = static_cast<LONG>(0x8000000A);  // E_PENDING
+    // A new slot is complete with S_OK until EnqueueStatus marks it pending (#1843), as in Microsoft's
+    // Win32 implementation of this API (Xbox-GDK-Samples, MIT: SimpleDirectStorageCombo/DirectStorageWin32/
+    // DirectStorageWin32WrapperStatusArray.cpp). A caller may poll IsComplete before a slot's first use.
+    for (unsigned i = 0; i < capacity; ++i) object->results[i] = S_OK;
     *out = object;
     return S_OK;
 }
@@ -374,10 +405,42 @@ enum class StorageFailure : unsigned {
 using StorageFailureCounts = LONG[static_cast<unsigned>(StorageFailure::count)];
 StorageFailureCounts storage_failures;
 
-void count_failure(StorageFailure cause) noexcept
+void count_failure(StorageFailure cause, Object* self = nullptr, const unsigned char* bytes = nullptr,
+                   HRESULT result = E_FAIL) noexcept
 {
     InterlockedIncrement(&storage_failures[static_cast<unsigned>(cause)]);
     InterlockedIncrement(&requests_failed);
+    if (!self || !bytes) return;
+
+    auto& object = *static_cast<QueueObject*>(self);
+    const std::lock_guard guard(object.error_mutex);
+    auto& record = object.error_record;
+    const bool first = record.failure_count == 0;
+    if (record.failure_count != UINT32_MAX) ++record.failure_count;
+    if (!first) return;
+
+    StorageRequest request;
+    std::memcpy(&request, bytes, sizeof request);
+    auto& failure = record.first_failure;
+    failure.result = result;
+    failure.command_type = x2w_startup::command_type_request;
+    failure.options = request.options;
+    failure.destination = request.destination;
+    failure.destination_size = request.destination_size;
+    if (request.options & memory_source_option) {
+        failure.source = request.source;
+    } else {
+        const auto* source = static_cast<const FileObject*>(request.source);
+        if (x2w_local::readable(source, sizeof(*source)) && source->kind == file)
+            std::memcpy(failure.filename, source->filename, sizeof failure.filename);
+        failure.file_offset = request.file_offset;
+    }
+    failure.source_size = request.source_size;
+    failure.cancellation_tag = request.cancellation_tag;
+    const std::size_t name_bytes = x2w_local::probe_readable(reinterpret_cast<std::uintptr_t>(request.name),
+                                                           sizeof failure.name - 1);
+    for (std::size_t i = 0; i < name_bytes && request.name[i]; ++i) failure.name[i] = request.name[i];
+    if (object.error_event) SetEvent(object.error_event);
 }
 
 // The cause of a refused file read, from its range against the file size. No end offset is formed, so
@@ -419,6 +482,52 @@ int format_failure_causes(char* out, std::size_t size, int second, const Storage
                          "read-crossing-eof=%ld read-other=%ld destination-capacity=%ld destination-not-writable=%ld "
                          "zlib=%ld bcpack=%ld other=%ld",
                          second, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7]);
+}
+
+// Page-destination requests (option bit 21) by where their destination ends against the first 64 KiB
+// page, each split into completed and failed, for the heartbeat (#1198). The end is page_offset (+0x10,
+// low 16 bits) plus destination_size (+0x18, u32), formed in 64 bits so it cannot wrap. A request is
+// counted once, when it runs: by execute_request for every outcome but "empty" (which is neither
+// completed nor failed), and as failed when its page array is unreadable at run or its run threw. An
+// entry that never started is not counted (it failed in Submit, without running). Fixed counters, no
+// allocation; nothing here changes an outcome.
+enum class PageEnd : unsigned { inside, at_page_end, past, count };
+using PageEndCounts = LONG[static_cast<unsigned>(PageEnd::count)][2];  // [end][0 completed, 1 failed]
+PageEndCounts page_end_counts;
+
+PageEnd page_end(unsigned page_offset, unsigned destination_size) noexcept
+{
+    const u64 end = u64{page_offset} + destination_size;
+    if (end < 0x10000) return PageEnd::inside;
+    if (end == 0x10000) return PageEnd::at_page_end;
+    return PageEnd::past;
+}
+
+void count_page_request(const unsigned char* request, bool failed) noexcept
+{
+    const u64 options = *reinterpret_cast<const u64*>(request);
+    if (!(options & (1ull << 21))) return;
+    const unsigned page_offset = static_cast<unsigned>(*reinterpret_cast<const u64*>(request + 0x10) & 0xFFFF);
+    const unsigned destination_size = *reinterpret_cast<const unsigned*>(request + 0x18);
+    InterlockedIncrement(&page_end_counts[static_cast<unsigned>(page_end(page_offset, destination_size))][failed ? 1 : 0]);
+}
+
+void sample_page_end_counts(PageEndCounts& counts) noexcept
+{
+    for (unsigned end = 0; end < static_cast<unsigned>(PageEnd::count); ++end)
+        for (unsigned failed = 0; failed < 2; ++failed)
+            counts[end][failed] = InterlockedCompareExchange(&page_end_counts[end][failed], 0, 0);
+}
+
+// The heartbeat's line of page-destination requests by end, after the failure causes. Like that line it
+// carries no "inflated=", "options=" or "commit peak=" text.
+int format_page_ends(char* out, std::size_t size, int second, const PageEndCounts& n) noexcept
+{
+    return std::snprintf(out, size,
+                         "x2w-dstorage heartbeat %d s: page requests by end against the first 64 KiB page "
+                         "inside-completed=%ld inside-failed=%ld at-page-end-completed=%ld at-page-end-failed=%ld "
+                         "past-completed=%ld past-failed=%ld",
+                         second, n[0][0], n[0][1], n[1][0], n[1][1], n[2][0], n[2][1]);
 }
 
 LONG bcpack_requests[16], bcpack_blank[16];
@@ -464,7 +573,7 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
     const u64 source = *reinterpret_cast<const u64*>(request + 0x20);
     const u64 offset = *reinterpret_cast<const u64*>(request + 0x28);
     const unsigned source_size = *reinterpret_cast<const unsigned*>(request + 0x30);
-    const bool memory_source = (options & 0x400000) != 0;
+    const bool memory_source = (options & memory_source_option) != 0;
     const unsigned compression = static_cast<unsigned>(options & 0xFF);
     static LONG logged;
     if (InterlockedIncrement(&logged) <= 12) {
@@ -707,8 +816,10 @@ void execute_request(Object* self, const unsigned char* request, const ULONG_PTR
             }
         }
     }
-    const bool failed = (data == nullptr || !written) && std::strcmp(outcome, "empty") != 0;
-    if (failed) count_failure(failure);
+    const bool empty = std::strcmp(outcome, "empty") == 0;
+    const bool failed = (data == nullptr || !written) && !empty;
+    if (failed) count_failure(failure, self, request);
+    if (!empty) count_page_request(request, failed);
     if (failed && self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG summaries, failures;
     if (InterlockedIncrement(&summaries) <= 12 || (failed && InterlockedIncrement(&failures) <= 12))
@@ -731,7 +842,8 @@ void run_entry(Object* self, Entry& entry)
             // no token captured at enqueue is ever used.
             const std::size_t bytes = entry.token_count * sizeof(ULONG_PTR);
             if (!title || !x2w_local::readable(title, bytes)) {
-                count_failure(StorageFailure::other);
+                count_failure(StorageFailure::other, self, entry.bytes);
+                count_page_request(entry.bytes, true);
                 if (self) InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
                 static LONG unreadable;
                 if (InterlockedIncrement(&unreadable) <= 12)
@@ -774,7 +886,8 @@ void copy_reason(char (&reason)[96], const char* text) noexcept
 // Fails the entry that threw: the next status entry reports E_FAIL, the worker goes on with the queue.
 void fail_entry(Object* self, const Entry& entry, const char* reason) noexcept
 {
-    count_failure(StorageFailure::other);
+    count_failure(StorageFailure::other, self, entry.type == Entry::request ? entry.bytes : nullptr);
+    if (entry.type == Entry::request) count_page_request(entry.bytes, true);
     InterlockedExchange(&self->pending, static_cast<LONG>(E_FAIL));
     static LONG reported;
     if (InterlockedIncrement(&reported) <= 12)
@@ -880,8 +993,8 @@ bool start_worker(Object* self, QueueWork* work)
     return true;
 }
 
-// What an entry that could not be stored needs in order to fail at Submit: no request bytes, since a
-// request only counts as failed.
+// What an entry that could not be stored needs in order to fail at Submit, including the request
+// bytes for the error record. No page tokens or separately allocated request storage are needed.
 struct Unrecorded {
     Unrecorded* next;
     u64 submission_id;
@@ -891,6 +1004,7 @@ struct Unrecorded {
     unsigned index;
     void* fence;
     u64 value;
+    unsigned char bytes[sizeof(StorageRequest)];
 };
 
 // True while snapshot entries of an earlier Submit are ready or being completed by some thread. The
@@ -905,10 +1019,11 @@ bool deferred_pending(const QueueWork& work)
 
 // Fails an entry that will not run: a request counts as failed, a status entry completes with the
 // pending failure (E_OUTOFMEMORY when nothing worse is pending), a fence is signaled.
-void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned index, void* fence, u64 value)
+void fail_unstarted(Object* self, Entry::Type type, Object* array, unsigned index, void* fence, u64 value,
+                    const unsigned char* request)
 {
     if (type == Entry::request) {
-        count_failure(StorageFailure::other);
+        count_failure(StorageFailure::other, self, request, E_OUTOFMEMORY);
         InterlockedCompareExchange(&self->pending, static_cast<LONG>(E_OUTOFMEMORY), S_OK);
     } else if (type == Entry::status_entry) {
         const LONG pending = InterlockedExchange(&self->pending, S_OK);
@@ -944,11 +1059,12 @@ bool has_unrecorded(Object* self)
 
 void defer_unrecorded(Object* self, const Entry& entry)
 {
-    auto* node = new (std::nothrow) Unrecorded{nullptr, 0, 0, entry.type, entry.array, entry.index, entry.fence, entry.value};
+    auto* node = new (std::nothrow) Unrecorded{nullptr, 0, 0, entry.type, entry.array, entry.index, entry.fence, entry.value, {}};
     if (!node) {
-        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
         return;
     }
+    if (entry.type == Entry::request) std::memcpy(node->bytes, entry.bytes, sizeof node->bytes);
     const std::lock_guard guard(setup_mutex());
     (self->unrecorded_tail ? self->unrecorded_tail->next : self->unrecorded_head) = node;
     self->unrecorded_tail = node;
@@ -964,7 +1080,7 @@ void fail_unrecorded(Object* self)
     }
     while (node) {
         Unrecorded* const next = node->next;
-        fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value);
+        fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
         delete node;
         node = next;
     }
@@ -981,7 +1097,7 @@ void fail_waiting(Object* self, QueueWork* work)
             entry = std::move(work->waiting.front());
             work->waiting.pop_front();
         }
-        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+        fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
     }
 }
 
@@ -1109,10 +1225,10 @@ void complete_deferred(Object* self, QueueWork* work)
             }
         }
         if (node) {
-            fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value);
+            fail_unstarted(self, node->type, node->array, node->index, node->fence, node->value, node->bytes);
             delete node;
         } else {
-            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value);
+            fail_unstarted(self, entry.type, entry.array, entry.index, entry.fence, entry.value, entry.bytes);
         }
     }
 }
@@ -1225,12 +1341,35 @@ void __stdcall queue_cancel(Object*, u64 mask, u64 value)
     if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::CancelRequestsWithTag mask=0x%llx value=0x%llx (no-op)", mask, value);
 }
 void __stdcall queue_close(Object*) { log("x2w-dstorage Queue::Close"); }
-HANDLE __stdcall queue_error_event(Object*)
+// Slots 9 and 10 follow Microsoft's Xbox-GDK-Samples dstorage_win32.h. GetErrorEvent's
+// caller owns its handle (Microsoft Learn IDStorageQueueX::GetErrorEvent).
+HANDLE __stdcall queue_error_event(Object* self)
 {
-    static HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    auto& object = *static_cast<QueueObject*>(self);
+    HANDLE event = nullptr;
+    {
+        const std::lock_guard guard(object.error_mutex);
+        if (!object.error_event)
+            object.error_event = CreateEventW(nullptr, TRUE, object.error_record.failure_count != 0, nullptr);
+        if (object.error_event)
+            DuplicateHandle(GetCurrentProcess(), object.error_event, GetCurrentProcess(), &event,
+                            0, FALSE, DUPLICATE_SAME_ACCESS);
+    }
     static LONG calls;
-    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::GetErrorEvent -> %p (never signaled)", event);
+    if (InterlockedIncrement(&calls) <= 4) log("x2w-dstorage Queue::GetErrorEvent -> %p", event);
     return event;
+}
+void __stdcall queue_retrieve_error_record(Object* self, StorageErrorRecord* out)
+{
+    if (!out) return;
+    auto& object = *static_cast<QueueObject*>(self);
+    const std::lock_guard guard(object.error_mutex);
+    std::memcpy(out, &object.error_record, sizeof *out);
+    object.error_record = x2w_startup::empty_error_record();
+    // The sample header and Microsoft Learn describe a new notification after each retrieve.
+    // Keep the manual-reset event signaled until retrieval consumes the record. Reset under
+    // the record's lock so a concurrent failure cannot lose its notification.
+    if (object.error_event) ResetEvent(object.error_event);
 }
 // Status array slot 3 IsComplete(index), slot 4 GetHResult(index).
 bool __stdcall status_is_complete(Object* self, unsigned index)
@@ -1272,6 +1411,7 @@ void** make_table(unsigned kind)
             table[7] = reinterpret_cast<void*>(&queue_cancel);
             table[8] = reinterpret_cast<void*>(&queue_close);
             table[9] = reinterpret_cast<void*>(&queue_error_event);
+            table[10] = reinterpret_cast<void*>(&queue_retrieve_error_record);
         } else if (kind == status) {
             table[3] = reinterpret_cast<void*>(&status_is_complete);
             table[4] = reinterpret_cast<void*>(&status_hresult);
@@ -1329,15 +1469,18 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
     // Heartbeat: the request counters every 10 s, so a run shows whether loading still progresses
     // after the per-call logs have gone quiet. Peak commit and the live physical-page sections show
     // what the run spends (#1199), including while requests are stalled. A second line splits the
-    // failed requests by cause (#1198).
+    // failed requests by cause, a third the page-destination requests by end (#1198).
     static HANDLE heartbeat = CreateThread(nullptr, 0, [](void*) -> DWORD {
         LONG last = -1;
         MemorySample last_memory;
         for (int second = 10;; second += 10) {
             Sleep(10000);
-            // Reuse one counter sample for both lines, even while the worker is reporting new failures.
+            // Sample the counters once for every line of this report, even while the worker is reporting
+            // new failures.
             StorageFailureCounts failure_counts;
             const LONG failed = sample_failure_counts(failure_counts);
+            PageEndCounts page_ends;
+            sample_page_end_counts(page_ends);
             const LONG total = requests_done + requests_compressed + failed;
             const LONG total2 = total + requests_bcpack_blank;
             const MemorySample sample = memory_sample();
@@ -1367,6 +1510,8 @@ extern "C" long __stdcall DStorageGetFactory(const GUID* riid, void** out)
                     section_text);
                 char causes[384];
                 if (format_failure_causes(causes, sizeof(causes), second, failure_counts) > 0) log("%s", causes);
+                char ends[384];
+                if (format_page_ends(ends, sizeof(ends), second, page_ends) > 0) log("%s", ends);
                 last = total2;
                 last_memory = sample;
             }

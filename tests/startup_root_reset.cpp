@@ -9,12 +9,12 @@ namespace {
 template<class T> StreamWord word_of(T* value) { return reinterpret_cast<std::uintptr_t>(value); }
 }
 
-// A descriptor table is bound with SetGraphicsRootDescriptorTable (list slot 36) under the stream root signature, then
+// A descriptor table and a root constant are set under the stream root signature, then
 // X2W_TEST_ROOT_RESET names what the title does before the draw:
-//   bound        nothing: the table stays
-//   same_root    SetGraphicsRootSignature with the same signature: the table stays
-//   switch_root  a different signature and back: the table is gone
-//   out_of_range six SetGraphicsRoot32BitConstants calls that reach no stored word, in four ways; the table stays
+//   bound        nothing: both bindings stay
+//   same_root    SetGraphicsRootSignature with the same signature: both bindings stay
+//   switch_root  a different signature and back: both bindings are invalidated
+//   out_of_range six out-of-range SetGraphicsRoot32BitConstants calls; both bindings stay
 int draw_root_reset(void* guest, void* list)
 {
     char mode[16]{};
@@ -47,6 +47,8 @@ int draw_root_reset(void* guest, void* list)
     invoke(list, 34, root);  // SetGraphicsRootSignature
     invoke(list, 32, 1, word_of(&heap));
     invoke(list, 36, 0, invoke(heap, 10));
+    const std::uint32_t blue = 173;
+    invoke(list, 40, 1, 1, word_of(&blue), 0);
     if (!std::strcmp(mode, "same_root")) {
         invoke(list, 34, root);
     } else if (!std::strcmp(mode, "switch_root")) {

@@ -143,8 +143,9 @@ def check_mesh():
         (root / "mesh.bin").write_bytes(code)
         for decoded, stage_status, pipeline_status, detail in (
                 (enumerate_pcs(PROGRAM), "mesh_lowering_passed", "needs_pso_validation", None),
+                # An empty allocation (0, 0) is refused by the count check.
                 (enumerate_pcs(invalid_alloc), "mesh_lowering_rejected", "blocked",
-                 "Expected a single three-vertex triangle"),
+                 "Conflicting mesh counts, vertices or primitive indices"),
                 ([(0, "s_mov_b32 m0, s99")], "mesh_lowering_rejected", "blocked", "99"),
                 ([], "disassembly_failed", "blocked", "empty instruction stream"),
                 (ValueError("Unknown instruction at byte 4"), "disassembly_failed", "blocked",

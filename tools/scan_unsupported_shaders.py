@@ -104,6 +104,8 @@ SCALAR64_SOURCE = r"(?:s\[\d+:\d+\]|0x[0-9a-f]{1,8}|-?\d+)"
 F16_PLAIN = r"(?:-?(?:\d+\.\d+|\d+)|0x[0-9a-f]{1,4}|[vs]\d+)"
 F16_MOD = rf"-?(?:\|{F16_PLAIN}\||abs\({F16_PLAIN}\)|{F16_PLAIN})"
 SDWA_SEL_PATTERN = r"(?:BYTE_[0-3]|WORD_[01]|DWORD)"
+PIXEL_SDWA_DST = r"(?:vcc(?:_lo)?|s\d+)"
+SDWA_CMP_SOURCE = rf"(?:sext\({INTEGER_SOURCE}\)|{INTEGER_SOURCE})"
 CVT_F32_E64_BASE = r"(?:[vs]\d+|0x[0-9a-f]{1,8})"
 CVT_F32_E64_ABS = rf"(?:\|{CVT_F32_E64_BASE}\||abs\({CVT_F32_E64_BASE}\))"
 CVT_F32_E64_SOURCE = rf"(?:neg\((?:{CVT_F32_E64_ABS}|{CVT_F32_E64_BASE})\)|-(?:{CVT_F32_E64_ABS}|[vs]\d+)|{CVT_F32_E64_ABS}|{CVT_F32_E64_BASE})"
@@ -167,8 +169,8 @@ SUPPORTED_INSTRUCTIONS_REGEX = [
     r"v_cvt_f32_f16(?:_e32|_e64)?\s+v\d+,\s+-?(?:\|(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\||abs\((?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)\)|[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_f32_f16_sdwa\s+v\d+,\s+-?(?:\|[vs]\d+\||[vs]\d+)(?:\s+clamp)?\s+dst_sel:DWORD\s+dst_unused:UNUSED_(?:PAD|PRESERVE)\s+src0_sel:WORD_[01]",
     r"v_cvt_f16_f32(?:_e32|_e64)?\s+v\d+,\s+[^,\s]+",
-    r"v_cvt_i32_f32_e32 v\d+, (?:[vs]\d+|0x[0-9a-f]{1,8})",
-    rf"v_cvt_(?:i32|u32)_f32_e64 v\d+, {CVT_F32_E64_SOURCE}",
+    r"v_cvt_(?:i32|flr_i32|rpi_i32)_f32_e32 v\d+, (?:[vs]\d+|0x[0-9a-f]{1,8})",
+    rf"v_cvt_(?:i32|u32|flr_i32|rpi_i32)_f32_e64 v\d+, {CVT_F32_E64_SOURCE}",
     r"v_cvt_f32_ubyte[0-3](?:_e32|_e64)?\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_off_f32_i4(?:_e32|_e64)?\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|\d+)(?:\s+clamp)?",
     r"v_cvt_f32_(?:u32|i32)_e32\s+v\d+,\s+(?:[vs]\d+|0x[0-9a-f]{1,8}|-?\d+)",
@@ -223,10 +225,27 @@ if PIXEL_COMPARE:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{cmp_ops})_f16_e64\s+{PIXEL_LANE_MASK},\s+{F16_MOD},\s+{F16_MOD}"
     )
+    # VOPC SDWA has only the two source selections; the destination is VCC or one SGPR.
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_(?:{cmp_ops})_f16_sdwa\s+{PIXEL_SDWA_DST},\s+{SDWA_CMP_SOURCE},\s+{SDWA_CMP_SOURCE}"
+        rf"\s+src0_sel:{SDWA_SEL_PATTERN}\s+src1_sel:{SDWA_SEL_PATTERN}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_class_(?:f16|f32)_sdwa\s+{PIXEL_SDWA_DST},\s+{SDWA_CMP_SOURCE},\s+{SDWA_CMP_SOURCE}"
+        rf"\s+src0_sel:{SDWA_SEL_PATTERN}\s+src1_sel:{SDWA_SEL_PATTERN}"
+    )
 if PIXEL_INT_COMPARE:
     icmp_ops = "|".join(map(re.escape, PIXEL_INT_COMPARE))
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{icmp_ops})_(?:i32|u32|i16|u16){PIXEL_VOPC_DST},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_(?:{icmp_ops})_(?:i32|u32)_sdwa\s+{PIXEL_SDWA_DST},\s+{SDWA_CMP_SOURCE},\s+{SDWA_CMP_SOURCE}"
+        rf"\s+src0_sel:{SDWA_SEL_PATTERN}\s+src1_sel:{SDWA_SEL_PATTERN}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_(?:eq|ne|lt|le|gt|ge)_(?:i16|u16)_sdwa\s+{PIXEL_SDWA_DST},\s+{SDWA_CMP_SOURCE},\s+{SDWA_CMP_SOURCE}"
+        rf"\s+src0_sel:{SDWA_SEL_PATTERN}\s+src1_sel:{SDWA_SEL_PATTERN}"
     )
     # 64-bit comparisons are checked by supports_int64_compare() below: the pair and inline ranges are numeric.
     INT64_COMPARE_PATTERN = re.compile(
