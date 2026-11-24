@@ -27,6 +27,17 @@ HEADER_TAG = b'\x80\xd5'  # bytes 2..3 of the first header word in every measure
 BLOCK = 0x40
 STEP = 0x100           # programs start on 256-byte steps of the stream
 WINDOW = 0x20000       # compressed bytes offered to one stream; a 64 KiB stream needs far less
+ENDPGM = bytes.fromhex('000081bf')  # s_endpgm
+
+
+def complete(program):
+    """True when the carved bytes hold an s_endpgm; an all-zero block inside a program cuts it short."""
+    return any(program[at:at + 4] == ENDPGM for at in range(HEADER, len(program) - 3, 4))
+
+
+def next_step(at, program):
+    """Stream offset of the 256-byte step right after the program."""
+    return at + -(-len(program) // STEP) * STEP
 
 
 def is_program(data, at):
@@ -77,18 +88,18 @@ def streams(archive):
     with open(archive, 'rb') as file:
         if os.fstat(file.fileno()).st_size == 0:
             return
-        view = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
-        start, joined, expected = None, [], None
-        for at, end, data in chunks(view):
-            if at != expected and joined:
+        with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as view:
+            start, joined, expected = None, [], None
+            for at, end, data in chunks(view):
+                if at != expected and joined:
+                    yield start, b''.join(joined)
+                    joined = []
+                if not joined:
+                    start = at
+                joined.append(data)
+                expected = (end + 63) & ~63
+            if joined:
                 yield start, b''.join(joined)
-                joined = []
-            if not joined:
-                start = at
-            joined.append(data)
-            expected = (end + 63) & ~63
-        if joined:
-            yield start, b''.join(joined)
 
 
 def read_roots(paths):
@@ -128,23 +139,29 @@ def main():
         sys.exit('no root signature found: run the title once with a shader cache, or pass --roots')
     os.makedirs(args.cache, exist_ok=True)
     # streams counts joined runs of consecutive zlib streams
-    counts = dict(streams=0, programs=0, ps=0, vs=0, other=0, undecodable=0, pairs=0, written=0, existing=0)
+    counts = dict(streams=0, programs=0, incomplete=0, ps=0, vs=0, other=0, undecodable=0, pairs=0,
+                  written=0, existing=0)
     for _, data in streams(args.archive):
         counts['streams'] += 1
-        previous = None
-        for _, program in carve(data):
+        previous = None  # (stage, offset, program) of the program carved just before
+        for at, program in carve(data):
             counts['programs'] += 1
+            if not complete(program):
+                counts['incomplete'] += 1
+                previous = None
+                continue
             try:
                 stage = gfx2hlsl.classify(program)
             except gfx2hlsl.Unsupported:
                 stage = 'undecodable'
             counts[stage] += 1
-            if stage == 'vs' and previous and previous[0] == 'ps':
+            # directly following: the vertex program starts on the 256-byte step after the pixel program
+            if stage == 'vs' and previous and previous[0] == 'ps' and at == next_step(previous[1], previous[2]):
                 counts['pairs'] += 1
                 for root in roots:
-                    key = gfx2hlsl.pipeline_key(previous[1], program, root)
-                    counts['written' if write_request(args.cache, key, previous[1], program, root) else 'existing'] += 1
-            previous = (stage, program)
+                    key = gfx2hlsl.pipeline_key(previous[2], program, root)
+                    counts['written' if write_request(args.cache, key, previous[2], program, root) else 'existing'] += 1
+            previous = (stage, at, program)
     counts['roots'] = len(roots)
     print(' '.join('%s=%d' % item for item in counts.items()))
 

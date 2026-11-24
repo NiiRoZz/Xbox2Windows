@@ -4,7 +4,8 @@ Programs follow the measured layout: a 36-byte header, s_inst_prefetch, code, s_
 64 bytes, each on a 256-byte step of a zlib stream that starts on a 64-byte boundary. Each pixel
 program directly followed by a vertex program must become one request per root, keyed exactly as
 the runtime keys it. Controls: a pixel program followed by another pixel program, a vertex program
-with no pixel program before it, a program that runs to the end of its stream, a valid pair in a
+with no pixel program before it, a vertex program one empty 256-byte step after a pixel program, a
+pixel program without s_endpgm, a program that runs to the end of its stream, a valid pair in a
 stream that is not on a 64-byte boundary, and a run with no root signature must write nothing. A
 pair split between two consecutive zlib streams must be carved whole. A second run must write
 nothing new.
@@ -63,8 +64,15 @@ misaligned = stream([(0x02c, PS6), (0x12c, VS6)])
 PS8, VS8 = program('ps', 13), program('vs', 14, blocks=2)
 split = stream([(0x02c, PS8), (0x12c, VS8)], length=0x300)
 
+# Controls that must not pair: a vertex program one empty 256-byte step after its pixel program, and
+# a vertex program after a pixel program that has no s_endpgm (cut short by an all-zero block).
+PS9, VS9 = program('ps', 15), program('vs', 16)
+cut = program('ps', 17).replace(struct.pack('<I', 0xbf810000), CODE_END)
+VS10 = program('vs', 18)
+gaps = stream([(0x02c, PS9), (0x22c, VS9), (0x32c, cut), (0x42c, VS10)], length=0x600)
+
 archive = bytearray()
-for blob, aligned in ((first, True), (misaligned, False), (second, True), (b'gap', True)):
+for blob, aligned in ((first, True), (misaligned, False), (second, True), (b'gap', True), (gaps, True), (b'gap', True)):
     while len(archive) % 64 != (0 if aligned else 32):
         archive.append(0)
     archive += zlib.compress(blob, 9) if blob != b'gap' else bytes(64)  # the gap keeps `split` apart
@@ -106,7 +114,8 @@ with tempfile.TemporaryDirectory() as tmp:
                       for ext in ('.a', '.b', '.root'))
         expect('request %016x parts' % key, parts, (a, b, r))
     expect('no temporary files left', sorted(p.name for p in cache.glob('*.tmp')), [])
-    expect('summary', 'pairs=4' in out.stdout and 'written=8' in out.stdout and 'streams=3' in out.stdout, True)
+    expect('summary', all(item in out.stdout.split() for item in ('pairs=4', 'written=8', 'streams=4', 'incomplete=1')),
+           True)
 
     again = run('--roots', str(rootdir))
     expect('second run', 'written=0' in again.stdout and 'existing=8' in again.stdout, True)

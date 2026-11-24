@@ -283,7 +283,7 @@ It writes:
 requests without starting the title, then `gfx2hlsl.py --pending <shader cache>` translates them:
 
 ```powershell
-python -B tools/startup/archive_requests.py <package root>\shaders.rpf out/startup/shader_cache
+python -B tools/startup/archive_requests.py <shader archive> out/startup/shader_cache
 python -B tools/startup/gfx2hlsl.py --pending out/startup/shader_cache
 ```
 
@@ -292,7 +292,8 @@ zlib streams in the shader archive that start on 64-byte boundaries and inflate 
 offline, those streams hold the exact bytes the runtime later records. Each program has a 36-byte
 header followed by `s_inst_prefetch`, is padded in 64-byte blocks and starts on a 256-byte step,
 and in every measured pipeline the vertex program directly follows the pixel program. The tool
-carves every complete program, pairs each pixel program with a directly following vertex program
+carves every program that ends in `s_endpgm` (an all-zero block inside a program would cut it
+short), pairs each pixel program with a vertex program that starts on the next 256-byte step
 and writes `req_<key>.{a,b,root}` with the runtime's key.
 
 What it cannot take from the archive:
@@ -318,7 +319,8 @@ byte-identical to those from the run. The other three were two pipelines whose p
 containers in the executable and one pipeline whose programs were not carved. Check with `python3 -B tests/startup_archive_requests_check.py`
 (ctest `startup_archive_requests`): on a synthetic archive each adjacent pixel/vertex pair becomes one
 request per root with the runtime's key; a pixel program followed by a pixel program, a vertex
-program without a pixel program before it, a pair that reaches the end of its stream, a pair in a
+program without a pixel program before it, a vertex program one empty step after its pixel program,
+a pixel program without `s_endpgm`, a pair that reaches the end of its stream, a pair in a
 stream off the 64-byte grid and a run without root signatures write nothing, a pair split between
 two consecutive zlib streams is carved whole, and a second run writes nothing new.
 
