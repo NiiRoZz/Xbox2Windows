@@ -9,6 +9,7 @@ as one worker, an unexpected translator error must become <key>.fail, and an inv
 X2W_TRANSLATE_JOBS must fall back to the processor count.
 """
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -41,8 +42,10 @@ def pending_run(directory, jobs):
     env = dict(os.environ, X2W_TRANSLATE_JOBS=str(jobs))
     out = subprocess.run([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'), '--pending', str(directory)],
                          capture_output=True, text=True, timeout=120, env=env)
-    fails = {p.name: p.read_bytes() for p in Path(directory).glob('*.fail')}
-    return out.returncode, sorted(out.stdout.splitlines()), fails
+    def local(text):  # the temporary directory differs between runs; keep the file name only
+        return re.sub(r"'[^']*?(req_[0-9a-f]{16}\.\w+)'", r"'\1'", text)
+    fails = {p.name: local(p.read_text()) for p in Path(directory).glob('*.fail')}
+    return out.returncode, sorted(local(line) for line in out.stdout.splitlines()), fails
 
 
 with tempfile.TemporaryDirectory() as tmp:
@@ -66,15 +69,22 @@ with tempfile.TemporaryDirectory() as tmp:
     expect('watch pass', scan(d, True), [1, 5, 6])
     expect('one-shot pass', scan(d, False), [1, 4, 5, 6])
 
-# Parallel --pending must give the same results as one worker: sixteen invalid RTV requests fail
-# alike; with four workers each batch holds one request, so the work is spread over the workers.
+# Parallel --pending must give the same results as one worker. Sixteen RTV variants each name a
+# different missing base request, so each failure names its own base and a result reported against
+# the wrong key is visible. With four workers each batch holds one request.
+bases = {}
 with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as many:
-    for d in (one, many):
-        for key in range(16):
-            touch(Path(d) / ('req_%016x.rtv' % (0x100 + key)), b'not an rtv request %d' % key)
+    for n in range(16):
+        request = b'rtv1 %d 28' % (0x7000 + n)
+        bases[gfx2hlsl.fnv(request)] = 0x7000 + n
+        for d in (one, many):
+            touch(Path(d) / ('req_%016x.rtv' % gfx2hlsl.fnv(request)), request)
     serial, parallel = pending_run(one, 1), pending_run(many, 4)
     expect('parallel --pending output and failures', parallel, serial)
     expect('every request answered', len(serial[1]), 16)
+    for line in parallel[1]:
+        key = int(line[:16], 16)
+        expect('result for %016x names its own base' % key, 'req_%016x.a' % bases.get(key, -1) in line, True)
 
 # An unexpected translator error becomes <key>.fail instead of ending the scan.
 with tempfile.TemporaryDirectory() as tmp:
