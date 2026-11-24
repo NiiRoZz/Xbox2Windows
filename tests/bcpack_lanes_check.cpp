@@ -42,9 +42,12 @@ const char MODE6_HEX[] =
 
 struct Stream {
     std::string name;
-    unsigned format;  // 1 or 7
+    unsigned format;  // 1 or 7; with lane widths below, decode_lanes only
     size_t blocks;
     std::vector<uint8_t> bytes;
+    std::vector<uint8_t> ab;  // lane widths of a lanes-only stream
+    size_t target = 0;        // symbols per lane of a lanes-only stream
+    bool whole_only = false;  // compared whole only (a stream decoded with the wrong table or count)
 };
 
 std::vector<uint8_t> from_hex(const std::string& hex) {
@@ -97,6 +100,10 @@ struct Checker {
     };
 
     void run(int path, const Stream& s, const uint8_t* data, size_t size, Result& r) {
+        if (!s.ab.empty()) {
+            r.ok = decode_lanes_on(path, data, size, s.ab.data(), s.ab.size(), s.target, r.symbols);
+            return;
+        }
         const uint8_t* ab = s.format == 7 ? AB7 : AB1;
         const size_t n = s.format == 7 ? 16 : 12, target = s.format == 7 ? 2 * s.blocks : s.blocks;
         r.ok = decode_lanes_on(path, data, size, ab, n, target, r.symbols);
@@ -127,7 +134,7 @@ struct Checker {
         ++compared;
         ref.ok ? ++accepted : ++rejected;
         if (ref.ok && !intact) ++damaged_accepted;
-        if (intact && (!ref.ok || !ref.bc_ok)) fail(s, "the reference rejects an intact stream", LANE_PATH_REFERENCE, data.size());
+        if (intact && (!ref.ok || (s.ab.empty() && !ref.bc_ok))) fail(s, "the reference rejects an intact stream", LANE_PATH_REFERENCE, data.size());
         for (int path = LANE_PATH_REFERENCE + 1; path < LANE_PATH_COUNT; ++path) {
             if (!lane_path_supported(path) || (only_path >= 0 && path != only_path)) continue;
             Result r;
@@ -140,7 +147,8 @@ struct Checker {
     }
 
     void sweep(const Stream& s, bool full) {
-        compare(s, s.bytes, true);
+        compare(s, s.bytes, !s.whole_only);
+        if (s.whole_only) return;
         const size_t size = s.bytes.size();
         const size_t cut_step = full ? 1 : (size / 48 + 1), bit_step = full ? 1 : (size * 8 / 160 + 1);
         for (size_t len = 0; len < size; len += cut_step) compare(s, std::vector<uint8_t>(s.bytes.begin(), s.bytes.begin() + len), false);
@@ -164,7 +172,7 @@ std::vector<Stream> streams(const std::string& dir, bool bench, bool large) {
         }
         list.push_back(s);
     }
-    if (!bench) list.push_back({ "mode6", 7, 1, from_hex(MODE6_HEX) });
+    if (!bench) list.push_back({ "mode6", 7, 1, from_hex(MODE6_HEX), {}, 0, false });
     bcpack_test::Rng rng{ bench ? 7u : 1139u };
     auto add = [&](unsigned format, size_t blocks, uint32_t fragment, bool uniform, size_t padding) {
         bcpack_test::Options o;
@@ -172,7 +180,7 @@ std::vector<Stream> streams(const std::string& dir, bool bench, bool large) {
         o.uniform = uniform;
         o.padding = padding;
         o.bc7_lane = format == 7 ? 15 : -1;
-        Stream s{ "", format, blocks, {} };
+        Stream s{ "", format, blocks, {}, {}, 0, false };
         std::vector<uint16_t> symbols;
         const size_t n = format == 7 ? 16 : 12, target = format == 7 ? 2 * blocks : blocks;
         if (!bcpack_test::make_stream(format == 7 ? AB7 : AB1, n, target, rng, o, s.bytes, symbols)) std::abort();
@@ -194,6 +202,38 @@ std::vector<Stream> streams(const std::string& dir, bool bench, bool large) {
             add(format, 300, 150, false, 0);
             add(format, 300, 150, true, 1);
             add(format, 300, 4096, false, 0);
+        }
+        // Each stream with one block more or fewer, and with the other format's lane table.
+        const size_t base_count = list.size();
+        for (size_t k = 0; k < base_count; ++k) {
+            const Stream b = list[k];
+            const size_t own = b.format == 7 ? 2 * b.blocks : b.blocks;
+            const std::vector<uint8_t> t1(AB1, AB1 + 12), t7(AB7, AB7 + 16);
+            for (size_t count : { own + 1, own - 1 }) {
+                if (count > 0) list.push_back({ b.name + ", wrong symbol count", 0, 0, b.bytes, b.format == 7 ? t7 : t1, count, true });
+            }
+            list.push_back({ b.name + ", other lane table", 0, 0, b.bytes, b.format == 7 ? t1 : t7, own, true });
+        }
+        // Lane counts and widths beyond the BC1 and BC7 tables, including PR 1390's BC3/BC4/BC5 tables.
+        std::vector<std::vector<uint8_t>> tables = {
+            { 8 }, std::vector<uint8_t>(16, 8), std::vector<uint8_t>(3, 0), { 0, 1, 2 },
+            { 7, 7, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 }, { 3, 3, 7, 7, 5, 5, 5, 5, 5, 5, 5, 5 },
+            { 3, 3, 7, 5, 5, 5, 5, 4, 5, 4, 7, 7 },
+        };
+        for (size_t n : { 7, 9, 13 }) {
+            std::vector<uint8_t> ab(n);
+            for (auto& w : ab) w = static_cast<uint8_t>(rng.below(9));
+            tables.push_back(ab);
+        }
+        for (const auto& ab : tables) {
+            bcpack_test::Options o;
+            o.max_fragment = 1 + rng.below(200);
+            o.padding = rng.below(2);
+            Stream s{ "", 0, 0, {}, ab, 1 + rng.below(160), false };
+            std::vector<uint16_t> symbols;
+            if (!bcpack_test::make_stream(ab.data(), ab.size(), s.target, rng, o, s.bytes, symbols)) std::abort();
+            s.name = std::to_string(ab.size()) + " lanes, widths " + std::to_string(ab.front()) + ".." + std::to_string(ab.back());
+            list.push_back(s);
         }
     }
     return list;
