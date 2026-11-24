@@ -7,7 +7,8 @@
 // accepts although they are damaged. Inputs end at a no-access page and the destination sits
 // between a canary and a no-access page. The model shortcut is compared on all inputs.
 //
-//   bcpack_lanes_check VECTOR_DIR [--path NAME] [--full]   check (--full: every truncation and bit flip)
+//   bcpack_lanes_check VECTOR_DIR [--path NAME] [--consumer FILE] [--full]   check (--full: every truncation and bit flip)
+//   bcpack_lanes_check VECTOR_DIR [--path NAME] --emit FILE   sample for tests/bcpack_lanes_python_check.py
 //   bcpack_lanes_check VECTOR_DIR --bench [--large]
 //
 // With --path, only that path is compared with the reference, and the exit code is 77 (capability
@@ -293,6 +294,141 @@ int bench(const std::vector<Stream>& list) {
     return 0;
 }
 
+// Outside anchors, checked on every path: the lane symbols stored in the repository vectors (written by
+// the upstream Rust encoder), and the expected decode_bcpack bytes of tests/bcpack_mode6_vector.py and
+// tests/startup_stub_consumer.cpp (read from that file, so the expected bytes have a single source).
+std::vector<std::vector<uint16_t>> json_symbols(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    std::stringstream ss;
+    ss << f.rdbuf();
+    const std::string text = ss.str();
+    std::vector<std::vector<uint16_t>> lanes;
+    size_t at = text.find("\"symbols\":[");
+    if (at == std::string::npos) return lanes;
+    at += 11;
+    while (at < text.size() && text[at] == '[') {
+        const size_t end = text.find(']', at);
+        std::vector<uint16_t> lane;
+        std::stringstream values(text.substr(at + 1, end - at - 1));
+        std::string item;
+        while (std::getline(values, item, ',')) lane.push_back(static_cast<uint16_t>(std::stoul(item)));
+        lanes.push_back(lane);
+        at = end + 1;
+        if (at < text.size() && text[at] == ',') ++at;
+    }
+    return lanes;
+}
+
+std::vector<uint8_t> c_array(const std::string& source, const std::string& name) {
+    const size_t at = source.find("const unsigned char " + name + "[");
+    if (at == std::string::npos) return {};
+    const size_t open = source.find('{', at), close = source.find('}', at);
+    std::vector<uint8_t> out;
+    for (size_t p = source.find("0x", open); p != std::string::npos && p < close; p = source.find("0x", p + 2)) {
+        out.push_back(static_cast<uint8_t>(std::stoul(source.substr(p + 2, 2), nullptr, 16)));
+    }
+    return out;
+}
+
+int check_anchors(const std::string& dir, const std::string& consumer_path) {
+    int failures = 0;
+    size_t checks = 0;
+    auto bcpack_on = [](int path, const std::vector<uint8_t>& in, unsigned format, size_t size) {
+        std::vector<uint8_t> out(size, 0xA5);
+        size_t produced = 0;
+        lane_path_override = path;
+        const bool ok = decode_bcpack(in.data(), in.size(), format, out.data(), out.size(), &produced);
+        lane_path_override = -1;
+        if (!ok || produced != size) out.clear();
+        return out;
+    };
+    for (int path = 0; path < LANE_PATH_COUNT; ++path) {
+        if (!lane_path_supported(path) || (only_path >= 0 && path != only_path && path != LANE_PATH_REFERENCE)) continue;
+        for (const char* v : { "synthetic_11", "synthetic_12" }) {
+            Stream s;
+            const std::vector<std::vector<uint16_t>> expected = json_symbols(dir + "/" + v + ".json");
+            if (!load_vector(dir + "/" + v + ".json", s) || expected.size() != 12) return 1;
+            std::vector<uint16_t> got;
+            const bool ok = decode_lanes_on(path, s.bytes.data(), s.bytes.size(), AB1, 12, s.blocks, got);
+            for (size_t l = 0; l < 12; ++l) {
+                ++checks;
+                if (!ok || expected[l].size() != s.blocks ||
+                    !std::equal(expected[l].begin(), expected[l].end(), got.begin() + l * s.blocks)) {
+                    std::fprintf(stderr, "%s path: %s lane %zu differs from the vector's symbols\n", PATH_NAMES[path], v, l);
+                    ++failures;
+                    break;
+                }
+            }
+        }
+        ++checks;
+        if (bcpack_on(path, from_hex(MODE6_HEX), 7, 16) != from_hex("40317204a56819be023456789abcdef0")) {
+            std::fprintf(stderr, "%s path: tests/bcpack_mode6_vector.py block differs\n", PATH_NAMES[path]);
+            ++failures;
+        }
+        if (consumer_path.empty()) continue;
+        std::ifstream f(consumer_path, std::ios::binary);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        const std::string source = ss.str();
+        const struct { const char* packed; const char* expected; unsigned format; } pairs[] = {
+            { "bc1_packed", "bc1_expected", 1 },
+            { "bc7_mode6_packed", "bc7_mode6_expected", 7 },
+            { "bc7_mode1_packed", "bc7_mode1_expected", 7 },
+        };
+        for (const auto& p : pairs) {
+            const std::vector<uint8_t> in = c_array(source, p.packed), expected = c_array(source, p.expected);
+            ++checks;
+            if (in.empty() || expected.empty() || bcpack_on(path, in, p.format, expected.size()) != expected) {
+                std::fprintf(stderr, "%s path: %s does not decode to %s\n", PATH_NAMES[path], p.packed, p.expected);
+                ++failures;
+            }
+        }
+    }
+    std::printf("outside anchors: %zu checks, %d failed\n", checks, failures);
+    return failures == 0 ? 0 : 1;
+}
+
+// For tests/bcpack_lanes_python_check.py: a sample of streams with every compared path's result, one
+// JSON object per line.
+int emit(const std::vector<Stream>& list, const char* file) {
+    std::FILE* out = std::fopen(file, "w");
+    if (!out) return 1;
+    auto write = [&](const Stream& s, const std::vector<uint8_t>& data) {
+        const std::vector<uint8_t> ab = !s.ab.empty() ? s.ab
+            : (s.format == 7 ? std::vector<uint8_t>(AB7, AB7 + 16) : std::vector<uint8_t>(AB1, AB1 + 12));
+        const size_t target = !s.ab.empty() ? s.target : (s.format == 7 ? 2 * s.blocks : s.blocks);
+        std::fprintf(out, "{\"ab\":[");
+        for (size_t i = 0; i < ab.size(); ++i) std::fprintf(out, "%s%u", i ? "," : "", ab[i]);
+        std::fprintf(out, "],\"target\":%zu,\"hex\":\"", target);
+        for (uint8_t b : data) std::fprintf(out, "%02x", b);
+        std::fprintf(out, "\",\"paths\":{");
+        bool first = true;
+        for (int path = 0; path < LANE_PATH_COUNT; ++path) {
+            if (!lane_path_supported(path) || (only_path >= 0 && path != only_path && path != LANE_PATH_REFERENCE)) continue;
+            std::vector<uint16_t> symbols;
+            const bool ok = decode_lanes_on(path, data.data(), data.size(), ab.data(), ab.size(), target, symbols);
+            std::fprintf(out, "%s\"%s\":{\"ok\":%s,\"symbols\":[", first ? "" : ",", PATH_NAMES[path], ok ? "true" : "false");
+            for (size_t i = 0; ok && i < symbols.size(); ++i) std::fprintf(out, "%s%u", i ? "," : "", symbols[i]);
+            std::fprintf(out, "]}");
+            first = false;
+        }
+        std::fprintf(out, "}}\n");
+    };
+    for (const Stream& s : list) {
+        if (s.whole_only) continue;
+        const size_t size = s.bytes.size();
+        write(s, s.bytes);
+        for (size_t len : { size / 4, size / 2, size - 1 }) write(s, std::vector<uint8_t>(s.bytes.begin(), s.bytes.begin() + len));
+        for (size_t k = 1; k <= 5; ++k) {
+            std::vector<uint8_t> flipped = s.bytes;
+            const size_t bit = (k * 2654435761u) % (size * 8);
+            flipped[bit / 8] ^= static_cast<uint8_t>(1u << (bit % 8));
+            write(s, flipped);
+        }
+    }
+    return std::fclose(out) == 0 ? 0 : 1;
+}
+
 // model_inverse_interval against model_inverse_fast + model_forward for every model and low state.
 int check_interval() {
     for (uint8_t eab = 0; eab < 9; ++eab) {
@@ -316,8 +452,12 @@ int check_interval() {
 
 int main(int argc, char** argv) {
     bool full = false, do_bench = false, large = false, usage = argc < 2;
+    const char* emit_file = nullptr;
+    std::string consumer;
     for (int k = 2; k < argc; ++k) {
         if (std::strcmp(argv[k], "--full") == 0) full = true;
+        else if (std::strcmp(argv[k], "--emit") == 0 && k + 1 < argc) emit_file = argv[++k];
+        else if (std::strcmp(argv[k], "--consumer") == 0 && k + 1 < argc) consumer = argv[++k];
         else if (std::strcmp(argv[k], "--bench") == 0) do_bench = true;
         else if (std::strcmp(argv[k], "--large") == 0) large = true;
         else if (std::strcmp(argv[k], "--path") == 0 && k + 1 < argc) {
@@ -329,7 +469,7 @@ int main(int argc, char** argv) {
         } else usage = true;
     }
     if (usage) {
-        std::fprintf(stderr, "usage: bcpack_lanes_check VECTOR_DIR [--path NAME] [--full | --bench [--large]]\n");
+        std::fprintf(stderr, "usage: bcpack_lanes_check VECTOR_DIR [--path NAME] [--consumer FILE] [--full | --emit FILE | --bench [--large]]\n");
         return 64;
     }
     std::printf("lane paths:");
@@ -341,8 +481,9 @@ int main(int argc, char** argv) {
     }
     const std::vector<Stream> list = streams(argv[1], do_bench, large);
     if (do_bench) return bench(list);
+    if (emit_file) return emit(list, emit_file);
 
-    if (check_interval() != 0) return 1;
+    if (check_interval() != 0 || check_anchors(argv[1], consumer) != 0) return 1;
     Checker checker;
     for (const Stream& s : list) checker.sweep(s, full);
     std::printf("%zu streams compared (%zu accepted, %zu rejected by the reference; %zu damaged streams accepted), %d mismatches\n",

@@ -631,11 +631,28 @@ foreach(variant IN ITEMS check control)
 endforeach()
 target_compile_definitions(bcpack_lanes_control PRIVATE X2W_BCPACK_LANES_CONTROL)
 set(bcpack_lane_paths scalar avx2)
+# Each path is also checked against outside anchors: the symbols stored in the repository vectors, the
+# expected bytes in tests/bcpack_mode6_vector.py and tests/startup_stub_consumer.cpp, and the vendored
+# Python decoder on a sample of streams (tests/bcpack_lanes_python_check.py).
 foreach(path IN LISTS bcpack_lane_paths)
-    add_test(NAME bcpack_lanes_${path} COMMAND bcpack_lanes_check "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors" --path ${path})
+    add_test(NAME bcpack_lanes_${path} COMMAND bcpack_lanes_check "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors"
+             --path ${path} --consumer "${CMAKE_SOURCE_DIR}/tests/startup_stub_consumer.cpp")
     add_test(NAME bcpack_lanes_${path}_drain_control
              COMMAND bcpack_lanes_control "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors" --path ${path})
-    set_tests_properties(bcpack_lanes_${path} bcpack_lanes_${path}_drain_control PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    set(bcpack_lane_tests bcpack_lanes_${path} bcpack_lanes_${path}_drain_control)
+    if(EXISTS "${INTAKE_PYTHON}")
+        foreach(variant IN ITEMS check control)
+            set(name bcpack_lanes_python_${path})
+            if(variant STREQUAL control)
+                set(name bcpack_lanes_python_${path}_drain_control)
+            endif()
+            add_test(NAME ${name} COMMAND "${INTAKE_PYTHON}" -B "${CMAKE_SOURCE_DIR}/tests/bcpack_lanes_python_check.py"
+                     "$<TARGET_FILE:bcpack_lanes_${variant}>" "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors" --path ${path})
+            list(APPEND bcpack_lane_tests ${name})
+        endforeach()
+        set_tests_properties(bcpack_lanes_python_${path}_drain_control PROPERTIES WILL_FAIL TRUE)
+    endif()
+    set_tests_properties(${bcpack_lane_tests} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
     set_tests_properties(bcpack_lanes_${path}_drain_control PROPERTIES WILL_FAIL TRUE)
 endforeach()
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
