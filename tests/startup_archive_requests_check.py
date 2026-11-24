@@ -3,14 +3,18 @@
 Programs follow the measured layout: a 36-byte header, s_inst_prefetch, code, s_code_end padding to
 64 bytes, each on a 256-byte step of a zlib stream that starts on a 64-byte boundary. Each pixel
 program directly followed by a vertex program must become one request per root, keyed exactly as
-the runtime keys it. Controls: a pixel program followed by another pixel program, a vertex program
-with no pixel program before it, a vertex program one empty 256-byte step after a pixel program, a
-pixel program without s_endpgm, a program that runs to the end of its stream, a valid pair in a
-stream that is not on a 64-byte boundary, and a run with no root signature must write nothing. A
-pair split between two consecutive zlib streams must be carved whole. A second run must write
-nothing new.
+the runtime keys it; the expected keys are computed here with an independent FNV-1a, not with the
+translator's function.
+
+Controls that must write nothing: a pixel program followed by another pixel program, a vertex
+program with no pixel program before it, a vertex program one empty 256-byte step after a pixel
+program, a pixel program without s_endpgm, a program without the header tag, a pair at an offset
+that is not a multiple of 4, a program that runs to the end of its stream, a valid pair in a stream
+that is not on a 64-byte boundary, an empty or duplicate root file, a stream that inflates past the
+limit, and a run with no root signature. A pair split between two consecutive zlib streams must be
+carved whole. A request whose .root cannot be written must leave no .a and no temporary file and make
+the run fail. An archive without any pair must make the run fail. A second run must write nothing new.
 """
-import os
 import struct
 import subprocess
 import sys
@@ -20,10 +24,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / 'tools' / 'startup' / 'archive_requests.py'
-sys.path.insert(0, str(ROOT / 'tools' / 'startup'))
-import gfx2hlsl  # noqa: E402
 
+PREFETCH = bytes.fromhex('0300a0bf')  # s_inst_prefetch 0x3
 CODE_END = bytes.fromhex('00009fbf')
+ENDPGM = struct.pack('<I', 0xbf810000)
 failures = []
 
 
@@ -32,10 +36,22 @@ def expect(label, got, want):
         failures.append('%s: got %r, want %r' % (label, got, want))
 
 
-def program(stage, serial, blocks=1):
+def runtime_key(a, b, root):
+    """The runtime's key (fnv_bytes and cached_translation in src/startup_stubs/d3d12_draw.inl): FNV-1a 64
+    over the revision text, then the first recorded blob, the second and the root signature. The
+    runtime's start value is 1469598103934665603, not the standard offset basis 14695981039346656037;
+    the cache keys depend on it, so it is reproduced as written."""
+    h = 1469598103934665603
+    for part in (b'x2w-startup-shader-3', a, b, root):
+        for byte in part:
+            h = ((h ^ byte) * 1099511628211) & 0xffffffffffffffff
+    return h
+
+
+def program(stage, serial, blocks=1, tag=b'\x80\xd5'):
     target = {'vs': 12, 'ps': 0}[stage]  # exp pos0 / exp mrt0, then s_endpgm
-    header = b'\x00\x00\x80\xd5' + struct.pack('<I', serial) + bytes(28)
-    body = header + gfx2hlsl.PREFETCH + struct.pack('<3I', 0xf800080f | target << 4, 0, 0xbf810000)
+    header = b'\x00\x00' + tag + struct.pack('<I', serial) + bytes(28)
+    body = header + PREFETCH + struct.pack('<2I', 0xf800080f | target << 4, 0) + ENDPGM
     size = 0x40 * blocks
     return body + CODE_END * ((size - len(body)) // 4)
 
@@ -46,6 +62,10 @@ def stream(layout, length=0x1000):
     for at, blob in layout:
         data[at:at + len(blob)] = blob
     return bytes(data)
+
+
+def summary(text):
+    return dict(item.split('=', 1) for item in text.split() if '=' in item)
 
 
 PS1, VS1 = program('ps', 1), program('vs', 2, blocks=2)
@@ -64,47 +84,69 @@ misaligned = stream([(0x02c, PS6), (0x12c, VS6)])
 PS8, VS8 = program('ps', 13), program('vs', 14, blocks=2)
 split = stream([(0x02c, PS8), (0x12c, VS8)], length=0x300)
 
-# Controls that must not pair: a vertex program one empty 256-byte step after its pixel program, and
-# a vertex program after a pixel program that has no s_endpgm (cut short by an all-zero block).
+# Must not pair: a vertex program one empty 256-byte step after its pixel program, and a vertex
+# program after a pixel program that has no s_endpgm (cut short by an all-zero block).
 PS9, VS9 = program('ps', 15), program('vs', 16)
-cut = program('ps', 17).replace(struct.pack('<I', 0xbf810000), CODE_END)
+cut = program('ps', 17).replace(ENDPGM, CODE_END)
 VS10 = program('vs', 18)
 gaps = stream([(0x02c, PS9), (0x22c, VS9), (0x32c, cut), (0x42c, VS10)], length=0x600)
 
+# Must not pair: a pixel program without the header tag, and a pair at offsets that are not a
+# multiple of 4 (whose bytes would otherwise form a complete, adjacent pair).
+untagged, VS11 = program('ps', 19, tag=b'\x00\x00'), program('vs', 20)
+PS12, VS12 = program('ps', 21), program('vs', 22)
+decoys = stream([(0x02c, untagged), (0x12c, VS11), (0x32e, PS12), (0x42e, VS12)], length=0x600)
+
+# A stream that inflates to 2 MiB: refused as oversized, never inflated in full.
+oversized = zlib.compress(bytes(0x200000), 9)
+
+
+def aligned(archive, alignment=0):
+    while len(archive) % 64 != alignment:
+        archive.append(0)
+
+
 archive = bytearray()
-for blob, aligned in ((first, True), (misaligned, False), (second, True), (b'gap', True), (gaps, True), (b'gap', True)):
-    while len(archive) % 64 != (0 if aligned else 32):
-        archive.append(0)
-    archive += zlib.compress(blob, 9) if blob != b'gap' else bytes(64)  # the gap keeps `split` apart
+for blob, offset in ((first, 0), (misaligned, 32), (second, 0)):
+    aligned(archive, offset)
+    archive += zlib.compress(blob, 9)
+for blob in (gaps, decoys):
+    aligned(archive)
+    archive += bytes(64)  # a gap keeps each stream apart from the previous one
+    archive += zlib.compress(blob, 9)
+aligned(archive)
+archive += bytes(64) + oversized
+aligned(archive)
+archive += bytes(64)
 for piece in (split[:0x150], split[0x150:]):
-    while len(archive) % 64:
-        archive.append(0)
+    aligned(archive)
     archive += zlib.compress(piece, 9)
+
 roots = [b'DXBC-root-one', b'DXBC-root-two']
-want = {gfx2hlsl.pipeline_key(a, b, r): (a, b, r)
-        for a, b in ((PS1, VS1), (PS3, VS3), (PS5, VS5), (PS8, VS8)) for r in roots}
+want = {runtime_key(a, b, r): (a, b, r) for a, b in ((PS1, VS1), (PS3, VS3), (PS5, VS5), (PS8, VS8)) for r in roots}
 
 with tempfile.TemporaryDirectory() as tmp:
     tmp = Path(tmp)
     (tmp / 'archive.bin').write_bytes(archive)
+    (tmp / 'nopairs.bin').write_bytes(zlib.compress(stream([(0x02c, PS2), (0x12c, PS3)]), 9))
     rootdir = tmp / 'roots'
     rootdir.mkdir()
-    for i, r in enumerate(roots + roots[:1]):  # a duplicate root must not double the requests
+    for i, r in enumerate(roots + roots[:1] + [b'']):  # a duplicate and an empty root must be ignored
         (rootdir / ('req_%016x.root' % i)).write_bytes(r)
     cache = tmp / 'cache'
 
-    def run(*extra):
-        return subprocess.run([sys.executable, '-B', str(TOOL), str(tmp / 'archive.bin'), str(cache), *extra],
+    def run(cache_dir, *extra, archive_name='archive.bin'):
+        return subprocess.run([sys.executable, '-B', str(TOOL), str(tmp / archive_name), str(cache_dir), *extra],
                               capture_output=True, text=True, timeout=120)
 
-    missing = run('--roots', str(tmp / 'absent'))
+    missing = run(cache, '--roots', str(tmp / 'absent'))
     expect('missing roots path: refused', missing.returncode != 0 and 'not found' in missing.stderr, True)
     cache.mkdir()  # an existing cache without any req_*.root
-    empty = run()
+    empty = run(cache)
     expect('no roots: refused with a message', empty.returncode != 0 and 'no root signature' in empty.stderr, True)
     expect('no roots: requests written', sorted(cache.glob('req_*')), [])
 
-    out = run('--roots', str(rootdir))
+    out = run(cache, '--roots', str(rootdir))
     expect('run exit status', out.returncode, 0)
     got = {int(p.name[4:20], 16) for p in cache.glob('req_*.a')}
     expect('request keys', sorted(got), sorted(want))
@@ -114,13 +156,28 @@ with tempfile.TemporaryDirectory() as tmp:
                       for ext in ('.a', '.b', '.root'))
         expect('request %016x parts' % key, parts, (a, b, r))
     expect('no temporary files left', sorted(p.name for p in cache.glob('*.tmp')), [])
-    expect('summary', all(item in out.stdout.split() for item in ('pairs=4', 'written=8', 'streams=4', 'incomplete=1')),
-           True)
+    counts = summary(out.stdout)
+    expect('summary', {k: counts.get(k) for k in ('streams', 'oversized', 'incomplete', 'pairs', 'written', 'roots')},
+           {'streams': '5', 'oversized': '1', 'incomplete': '1', 'pairs': '4', 'written': '8', 'roots': '2'})
 
-    again = run('--roots', str(rootdir))
-    expect('second run', 'written=0' in again.stdout and 'existing=8' in again.stdout, True)
+    again = run(cache, '--roots', str(rootdir))
+    expect('second run', {k: summary(again.stdout).get(k) for k in ('written', 'existing')}, {'written': '0', 'existing': '8'})
+
+    # A .root that cannot be written (a directory stands in the way): no .a, no temporary file, exit 1.
+    blocked = tmp / 'blocked'
+    blocked.mkdir()
+    stuck = runtime_key(PS1, VS1, roots[0])
+    (blocked / ('req_%016x.root' % stuck)).mkdir()
+    jam = run(blocked, '--roots', str(rootdir))
+    expect('blocked write: run fails', jam.returncode != 0 and 'could not be written' in jam.stderr, True)
+    expect('blocked write: no ready marker', (blocked / ('req_%016x.a' % stuck)).exists(), False)
+    expect('blocked write: no temporary files', sorted(p.name for p in blocked.glob('*.tmp')), [])
+    expect('blocked write: others written', summary(jam.stdout).get('written'), '7')
+
+    none = run(tmp / 'none', '--roots', str(rootdir), archive_name='nopairs.bin')
+    expect('no pairs: run fails', none.returncode != 0 and 'no program pair' in none.stderr, True)
     if failures:
-        print(out.stdout, out.stderr, again.stdout, sep='\n')
+        print(out.stdout, out.stderr, again.stdout, jam.stdout, jam.stderr, sep='\n')
 
 for item in failures:
     print('FAIL', item)

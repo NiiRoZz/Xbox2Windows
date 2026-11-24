@@ -62,8 +62,13 @@ def carve(data):
         hit = data.find(gfx2hlsl.PREFETCH, hit + 4)
 
 
-def chunks(view):
-    """Yield (archive offset, end offset, inflated bytes) for each complete zlib stream on a 64-byte boundary."""
+MAX_INFLATE = 0x100000   # one measured stream inflates to 64 KiB; a larger one is refused
+MAX_JOINED = 0x4000000   # bound a joined run of consecutive streams (64 MiB)
+
+
+def chunks(view, counts):
+    """Yield (archive offset, end offset, inflated bytes) for each complete zlib stream on a 64-byte
+    boundary. A stream that inflates past MAX_INFLATE is counted as oversized and skipped."""
     at = 0
     while at < len(view) - 1:
         cmf, flg = view[at], view[at + 1]
@@ -71,10 +76,12 @@ def chunks(view):
             inflater = zlib.decompressobj()
             window = view[at:at + WINDOW]
             try:
-                data = inflater.decompress(window)
+                data = inflater.decompress(window, MAX_INFLATE)
             except zlib.error:
                 data = b''
-            if inflater.eof and data:
+            if data and not inflater.eof and len(data) == MAX_INFLATE:
+                counts['oversized'] += 1
+            elif inflater.eof and data:
                 end = at + len(window) - len(inflater.unused_data)
                 yield at, end, data
                 at = (end + 63) & ~63
@@ -82,21 +89,22 @@ def chunks(view):
         at += 64
 
 
-def streams(archive):
+def streams(archive, counts):
     """Yield (archive offset, inflated bytes); a zlib stream that starts on the 64-byte boundary right
     after the previous one continues it, so a program split between the two is carved whole."""
     with open(archive, 'rb') as file:
         if os.fstat(file.fileno()).st_size == 0:
             return
         with mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ) as view:
-            start, joined, expected = None, [], None
-            for at, end, data in chunks(view):
-                if at != expected and joined:
+            start, joined, size, expected = None, [], 0, None
+            for at, end, data in chunks(view, counts):
+                if joined and (at != expected or size + len(data) > MAX_JOINED):
                     yield start, b''.join(joined)
-                    joined = []
+                    joined, size = [], 0
                 if not joined:
                     start = at
                 joined.append(data)
+                size += len(data)
                 expected = (end + 63) & ~63
             if joined:
                 yield start, b''.join(joined)
@@ -109,23 +117,31 @@ def read_roots(paths):
             sys.exit('root signature path not found: %s' % path)
         files = sorted(glob.glob(os.path.join(path, 'req_*.root'))) if os.path.isdir(path) else [path]
         for name in files:
-            blob = open(name, 'rb').read()
+            with open(name, 'rb') as file:
+                blob = file.read()
             if blob and blob not in roots:
                 roots.append(blob)
     return roots
 
 
 def write_request(cache, key, a, b, root):
-    """Writes .b and .root, then .a last: the scanner treats .a as the ready marker."""
+    """Writes .b and .root, then .a last: the scanner treats .a as the ready marker. Returns 'written',
+    'existing' or 'failed'; a failed write leaves no temporary file and no .a."""
     name = os.path.join(cache, 'req_%016x' % key)
     if os.path.exists(name + '.a'):
-        return False
+        return 'existing'
     for ext, blob in (('.b', b), ('.root', root), ('.a', a)):
         temporary = '%s%s.%d.tmp' % (name, ext, os.getpid())
-        with open(temporary, 'wb') as out:
-            out.write(blob)
-        os.replace(temporary, name + ext)
-    return True
+        try:
+            with open(temporary, 'wb') as out:
+                out.write(blob)
+            os.replace(temporary, name + ext)
+        except OSError as error:
+            print('req_%016x%s: %s' % (key, ext, error), file=sys.stderr)
+            if os.path.exists(temporary):
+                os.remove(temporary)
+            return 'failed'
+    return 'written'
 
 
 def main():
@@ -139,9 +155,9 @@ def main():
         sys.exit('no root signature found: run the title once with a shader cache, or pass --roots')
     os.makedirs(args.cache, exist_ok=True)
     # streams counts joined runs of consecutive zlib streams
-    counts = dict(streams=0, programs=0, incomplete=0, ps=0, vs=0, other=0, undecodable=0, pairs=0,
-                  written=0, existing=0)
-    for _, data in streams(args.archive):
+    counts = dict(streams=0, oversized=0, programs=0, incomplete=0, ps=0, vs=0, other=0, undecodable=0,
+                  pairs=0, written=0, existing=0, failed=0)
+    for _, data in streams(args.archive, counts):
         counts['streams'] += 1
         previous = None  # (stage, offset, program) of the program carved just before
         for at, program in carve(data):
@@ -159,11 +175,17 @@ def main():
             if stage == 'vs' and previous and previous[0] == 'ps' and at == next_step(previous[1], previous[2]):
                 counts['pairs'] += 1
                 for root in roots:
+                    # The runtime hashes its first recorded blob (the pixel program here) first.
+                    # pipeline_key names its parameters vs_code, ps_code; only the order matters.
                     key = gfx2hlsl.pipeline_key(previous[2], program, root)
-                    counts['written' if write_request(args.cache, key, previous[2], program, root) else 'existing'] += 1
+                    counts[write_request(args.cache, key, previous[2], program, root)] += 1
             previous = (stage, at, program)
     counts['roots'] = len(roots)
     print(' '.join('%s=%d' % item for item in counts.items()))
+    if counts['failed']:
+        sys.exit('%d request(s) could not be written' % counts['failed'])
+    if not counts['pairs']:
+        sys.exit('no program pair found in %s' % args.archive)
 
 
 if __name__ == '__main__':

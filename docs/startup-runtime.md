@@ -311,18 +311,32 @@ What it cannot take from the archive:
   right after the previous one continues it, and the two are carved as one, so a program split
   between them is kept. A program that reaches the end of such a joined run is skipped.
 
+A stream that would inflate past 1 MiB is counted as `oversized` and skipped without inflating it in
+full, and a joined run stops growing at 64 MiB. A request is written as `.b`, `.root`, then `.a`;
+if one part cannot be written, no `.a` and no temporary file are left and the run exits with an
+error, as it does when the archive yields no pair at all.
+
 In one local measurement the tool joined 1,079 zlib streams into 800 runs, carved 4,982 programs
 (2,730 pixel, 2,115 vertex, 137 other) and wrote 3,774 requests for 1,258 pairs and three recorded
 root signatures in 22 s. Eight of the eleven pipelines that a cold run recorded were among them with
 identical keys, and their translations (`<key>.txt`, both `.hlsl` files and both `.cso` files) were
 byte-identical to those from the run. The other three were two pipelines whose programs are DXBC
-containers in the executable and one pipeline whose programs were not carved. Check with `python3 -B tests/startup_archive_requests_check.py`
-(ctest `startup_archive_requests`): on a synthetic archive each adjacent pixel/vertex pair becomes one
-request per root with the runtime's key; a pixel program followed by a pixel program, a vertex
-program without a pixel program before it, a vertex program one empty step after its pixel program,
-a pixel program without `s_endpgm`, a pair that reaches the end of its stream, a pair in a
-stream off the 64-byte grid and a run without root signatures write nothing, a pair split between
-two consecutive zlib streams is carved whole, and a second run writes nothing new.
+containers in the executable and one pipeline whose programs were not carved.
+
+Check with `python3 -B tests/startup_archive_requests_check.py` (ctest `startup_archive_requests`).
+On a synthetic archive built from documented instruction words, each adjacent pixel/vertex pair
+becomes one request per root, and the test computes the expected keys with its own copy of the
+runtime's hash. Controls that write nothing:
+
+- a pixel program followed by a pixel program, or a vertex program without a pixel program before it;
+- a vertex program one empty step after its pixel program, or after a pixel program without `s_endpgm`;
+- a program without the header tag, or a pair at offsets that are not a multiple of 4;
+- a pair that reaches the end of its stream, or a pair in a stream off the 64-byte grid;
+- an empty or duplicate root file, an oversized stream, or a run without root signatures.
+
+A pair split between two consecutive zlib streams is carved whole. A blocked `.root` write leaves no
+`.a` and no temporary file and fails the run, as does an archive without pairs. A second run writes
+nothing new.
 
 `run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
 the process could not be created, 0 when the debugger finished its report, whatever the process
