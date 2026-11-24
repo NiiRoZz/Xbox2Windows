@@ -13,7 +13,8 @@ that is not a multiple of 4, a program that runs to the end of its stream, a val
 that is not on a 64-byte boundary, an empty or duplicate root file, a stream that inflates past the
 limit, and a run with no root signature. A pair split between two consecutive zlib streams must be
 carved whole. A request whose .root cannot be written must leave no .a and no temporary file and make
-the run fail. An archive without any pair must make the run fail. A second run must write nothing new.
+the run fail. An archive without any pair must make the run fail. 65 MiB of consecutive streams
+must be split into two joined runs. A second run must write nothing new.
 """
 import re
 import struct
@@ -184,6 +185,17 @@ with tempfile.TemporaryDirectory() as tmp:
 
     none = run(tmp / 'none', '--roots', str(rootdir), archive_name='nopairs.bin')
     expect('no pairs: run fails', none.returncode != 0 and 'no program pair' in none.stderr, True)
+
+    # 130 consecutive 512 KiB streams (65 MiB inflated, a few KB on disk) would join into one run;
+    # the 64 MiB cap must split them into two.
+    piece = zlib.compress(bytes(0x80000), 9)
+    joined = bytearray()
+    for _ in range(130):
+        aligned(joined)
+        joined += piece
+    (tmp / 'joined.bin').write_bytes(joined)
+    capped = run(tmp / 'capped', '--roots', str(rootdir), archive_name='joined.bin')
+    expect('joined run capped at 64 MiB', summary(capped.stdout).get('streams'), '2')
     if failures:
         print(out.stdout, out.stderr, again.stdout, jam.stdout, jam.stderr, sep='\n')
 
