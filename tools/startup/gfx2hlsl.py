@@ -9,6 +9,7 @@ import os
 import re
 import struct
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
@@ -1481,7 +1482,36 @@ def main():
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
-    # translate every request that has no result yet
+    if sys.argv[1] == '--watch':
+        # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
+        interval = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
+        while True:
+            translate_pending(out_dir, skip_failed=True)
+            time.sleep(interval)
+    translate_pending(out_dir)
+
+
+def translate_pending(out_dir, skip_failed=False, jobs=None):
+    """Translate every request that has no result yet. The runtime writes .a and .rtv last, as ready markers.
+
+    Requests are independent (each writes only its own <key>.* files), so several run in parallel
+    processes; X2W_TRANSLATE_JOBS (default: the processor count) sets how many.
+    """
+    keys = pending_keys(out_dir, skip_failed)
+    jobs = jobs or int(os.environ.get('X2W_TRANSLATE_JOBS', 0)) or os.cpu_count() or 1
+    if len(keys) < 2 or jobs < 2:
+        for key in keys:
+            print('%016x: %s' % (key, translate_request(out_dir, key)), flush=True)
+        return
+    from concurrent.futures import ProcessPoolExecutor
+    # ProcessPoolExecutor refuses more than 61 workers on Windows
+    with ProcessPoolExecutor(max_workers=min(jobs, len(keys), 61 if os.name == 'nt' else jobs)) as pool:
+        for key, result in zip(keys, pool.map(translate_request, [out_dir] * len(keys), keys, chunksize=8)):
+            print('%016x: %s' % (key, result), flush=True)
+
+
+def pending_keys(out_dir, skip_failed):
+    keys = []
     for name in sorted(os.listdir(out_dir)):
         m = re.fullmatch(r'req_([0-9a-f]{16})\.(?:a|rtv)', name)
         if not m:
@@ -1489,7 +1519,12 @@ def main():
         key = int(m.group(1), 16)
         if os.path.exists(os.path.join(out_dir, '%016x.txt' % key)):
             continue
-        print('%016x: %s' % (key, translate_request(out_dir, key)))
+        fail = os.path.join(out_dir, '%016x.fail' % key)
+        # A repeated pass retries a failure only once its request is rewritten.
+        if skip_failed and os.path.exists(fail) and os.path.getmtime(fail) >= os.path.getmtime(os.path.join(out_dir, name)):
+            continue
+        keys.append(key)
+    return keys
 
 
 if __name__ == '__main__':
