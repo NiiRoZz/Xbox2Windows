@@ -1640,6 +1640,10 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_gfx2hlsl_capture COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_capture_check.py")
     set_tests_properties(startup_gfx2hlsl_capture PROPERTIES TIMEOUT 120)
+    # archive_requests.py writes runtime-keyed shader requests from a synthetic archive.
+    add_test(NAME startup_archive_requests COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_archive_requests_check.py")
+    set_tests_properties(startup_archive_requests PROPERTIES TIMEOUT 120)
     # gfx2hlsl refuses a binary32 or integer vector operation with a source too few or too many.
     add_test(NAME startup_gfx2hlsl_operand_count COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_operand_count_check.py")

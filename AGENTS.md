@@ -148,6 +148,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
 ./out/pe-env/bin/python -B tests/startup_host_cpu_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_capture_check.py
+./out/pe-env/bin/python -B tests/startup_archive_requests_check.py
 ./out/pe-env/bin/python -B tests/startup_translator_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_smem_offset_check.py
 ./out/pe-env/bin/python -B tests/startup_flat_param_check.py

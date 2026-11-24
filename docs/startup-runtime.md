@@ -277,6 +277,51 @@ It writes:
 | `<log>/stderr.txt` | the stand-ins' logs (`x2w-d3d12`, `x2w-dstorage`, `x2w-xmem`, `x2w-runtime`, ...) |
 | `<log>/files.txt` | every file the process opened |
 
+### Shader requests from the archive, before a run
+
+`tools/startup/archive_requests.py <archive> <shader cache> [--roots <dir or req_*.root> ...]` writes
+requests without starting the title, then `gfx2hlsl.py --pending <shader cache>` translates them:
+
+```powershell
+python -B tools/startup/archive_requests.py <package root>\shaders.rpf out/startup/shader_cache
+python -B tools/startup/gfx2hlsl.py --pending out/startup/shader_cache
+```
+
+A startup run that traced every DirectStorage read showed where the native programs come from:
+zlib streams in the shader archive that start on 64-byte boundaries and inflate to 64 KiB. Inflated
+offline, those streams hold the exact bytes the runtime later records. Each program has a 36-byte
+header followed by `s_inst_prefetch`, is padded in 64-byte blocks and starts on a 256-byte step,
+and in every measured pipeline the vertex program directly follows the pixel program. The tool
+carves every complete program, pairs each pixel program with a directly following vertex program
+and writes `req_<key>.{a,b,root}` with the runtime's key.
+
+What it cannot take from the archive:
+
+- **Root signatures.** None of the recorded root signatures occurs in the archive or the
+  executable; the title appears to serialize them at run time. The tool reads `req_*.root` files
+  from earlier runs (by default those in the cache) and writes each pair once per distinct root.
+  A key is only used when the title binds that pair with that root, so the extra requests cost
+  translation time and nothing else.
+- **Pipelines the title builds from other sources.** Programs embedded in the executable as DXBC
+  containers are not in the archive.
+- **Other pairings.** A program shared by several pipelines, or a pair that is not adjacent, is
+  only found by a run (`run.ps1 -Translate`).
+- **Programs cut off at the end of a stream.** A zlib stream that starts on the 64-byte boundary
+  right after the previous one continues it, and the two are carved as one, so a program split
+  between them is kept. A program that reaches the end of such a joined run is skipped.
+
+In one local measurement the tool joined 1,079 zlib streams into 800 runs, carved 4,982 programs
+(2,730 pixel, 2,115 vertex, 137 other) and wrote 3,774 requests for 1,258 pairs and three recorded
+root signatures in 22 s. Eight of the eleven pipelines that a cold run recorded were among them with
+identical keys, and their translations (`<key>.txt`, both `.hlsl` files and both `.cso` files) were
+byte-identical to those from the run. The other three were two pipelines whose programs are DXBC
+containers in the executable and one pipeline whose programs were not carved. Check with `python3 -B tests/startup_archive_requests_check.py`
+(ctest `startup_archive_requests`): on a synthetic archive each adjacent pixel/vertex pair becomes one
+request per root with the runtime's key; a pixel program followed by a pixel program, a vertex
+program without a pixel program before it, a pair that reaches the end of its stream, a pair in a
+stream off the 64-byte grid and a run without root signatures write nothing, a pair split between
+two consecutive zlib streams is carved whole, and a second run writes nothing new.
+
 `run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
 the process could not be created, 0 when the debugger finished its report, whatever the process
 did. Check with `python3 -B tests/startup_run_ps1_check.py` (ctest `startup_run_ps1`): on Windows it
