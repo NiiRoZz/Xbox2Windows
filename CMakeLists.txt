@@ -1702,6 +1702,29 @@ else()
 endif()
 add_test(NAME xg_bc64_tiling_reference COMMAND xg_swizzle_select_check --bc64-tiling)
 set_tests_properties(xg_bc64_tiling_reference PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+# 4 KiB allocation answers for small 2D textures (src/startup_stubs/small_texture_4k.h): literal sizes and
+# refused descriptions without a device; the mutated run is the negative control; the addrlib run compares
+# every accepted shape with addrlib's GFX10 4 KiB layout and skips (77) without addrlib.
+add_executable(startup_small_texture_4k_check tests/startup_small_texture_4k_check.cpp)
+target_compile_features(startup_small_texture_4k_check PRIVATE cxx_std_17)
+target_include_directories(startup_small_texture_4k_check PRIVATE src)
+if(XBOX2WINDOWS_ADDRLIB_DIR)
+    target_link_libraries(startup_small_texture_4k_check PRIVATE xbw_addrlib)
+    target_compile_definitions(startup_small_texture_4k_check PRIVATE XBOX2WINDOWS_HAVE_ADDRLIB)
+endif()
+add_test(NAME startup_small_texture_4k COMMAND startup_small_texture_4k_check)
+add_test(NAME startup_small_texture_4k_whole_width_tail_control COMMAND startup_small_texture_4k_check --mutate whole-width-tail)
+set_tests_properties(startup_small_texture_4k_whole_width_tail_control PROPERTIES WILL_FAIL TRUE)
+add_test(NAME startup_small_texture_4k_addrlib COMMAND startup_small_texture_4k_check --addrlib)
+set_tests_properties(startup_small_texture_4k_addrlib PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+# The same answers through the device wrapper: allocation-info slots 25 and 108, with controls.
+add_executable(startup_small_texture_4k_device_check tests/startup_small_texture_4k_device_check.cpp)
+target_compile_features(startup_small_texture_4k_device_check PRIVATE cxx_std_17)
+target_link_libraries(startup_small_texture_4k_device_check PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(adapter IN ITEMS warp hardware)
+    add_test(NAME startup_small_texture_4k_device_${adapter} COMMAND startup_small_texture_4k_device_check ${adapter})
+endforeach()
+set_tests_properties(startup_small_texture_4k_device_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # Which descriptions take the 64 KiB standard BC chain (src/startup_stubs/bc64_chain.h), without addrlib
 # or a device. The mutated run expects layout UNKNOWN to be accepted and is the negative control.
 add_executable(startup_bc64_supports_check tests/startup_bc64_supports_check.cpp)
