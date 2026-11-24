@@ -242,10 +242,11 @@ inline bool phase1(Lane& ln) {
     return true;
 }
 
-inline bool decode_lanes(const uint8_t* input, size_t input_size,
-                         const uint8_t* alphabet_bits, size_t num_lanes,
-                         size_t target_symbols_per_lane,
-                         std::vector<uint16_t>& symbols) {
+// The original cycle loop. decode_lanes no longer calls it; tests compare every path with it.
+inline bool decode_lanes_reference(const uint8_t* input, size_t input_size,
+                                   const uint8_t* alphabet_bits, size_t num_lanes,
+                                   size_t target_symbols_per_lane,
+                                   std::vector<uint16_t>& symbols) {
     if (num_lanes == 0 || num_lanes > 16 || target_symbols_per_lane == 0) return false;
     for (size_t i = 0; i < num_lanes; ++i) {
         if (alphabet_bits[i] > 8) return false;
@@ -351,6 +352,215 @@ inline bool decode_lanes(const uint8_t* input, size_t input_size,
         }
     }
     return false;
+}
+
+// model_inverse_fast followed by model_forward of its result. The enabled BASE entries of a row
+// never decrease, so the comparator chain is a count, and the reciprocal divide never leaves the
+// segment it starts in. bcpack_lanes_check compares all 9 x 16 x 65536 inputs with the originals.
+inline uint16_t model_inverse_interval(uint8_t eab, uint8_t q, uint32_t c, uint32_t& f, uint32_t& cf) {
+    const uint16_t* base = BASE_TABLE[eab][q];
+    uint32_t seg = 0;
+    for (uint32_t k = 1; k < 10; ++k) {
+        seg += (k <= eab + 1u) & (c >= base[k]);
+    }
+    uint32_t dist = (c - base[seg] + RN_TABLE[eab][q][seg]) & 0xFFFF;
+    uint32_t steps = (((dist * RF_TABLE[eab][q][seg]) >> 15) >> RS_TABLE[eab][q][seg]) & 0x1FF;
+    uint32_t fa = FREQ_TABLE[eab][q][seg];
+    uint32_t cfa = (base[seg] + fa * steps) & 0xFFFF;
+    f = cfa ? fa : ((fa - 1) & 0xFFFF);
+    cf = cfa ? cfa : 1;
+    return static_cast<uint16_t>((((1u << seg) >> 1) + steps) & 0x1FF);
+}
+
+// Lowest DRAIN state that decodes without a state change. bcpack_lanes_check builds a negative control
+// with X2W_BCPACK_LANES_CONTROL, which also sends the home state L down the short path. Define it only
+// for a whole test executable: two translation units of one binary that disagree on it would break the
+// one-definition rule for every inline function below.
+#ifdef X2W_BCPACK_LANES_CONTROL
+inline constexpr uint32_t LANE_DRAIN_SHORT_MIN = 0x1000000;
+#else
+inline constexpr uint32_t LANE_DRAIN_SHORT_MIN = 0x1000001;
+#endif
+
+// decode_lanes_reference with both phases in one pass over the lanes. Exact because a lane's
+// phase 1 reads and writes only that lane, and a later lane's phase 0 reads only its own state and
+// the shared cursor. Steps without a header, fragment end or flush go through a short path; all
+// others use phase1. A lane's f and cf are kept from the step that decoded its symbol.
+inline bool decode_lanes_scalar(const uint8_t* input, size_t input_size,
+                                const uint8_t* alphabet_bits, size_t num_lanes,
+                                size_t target_symbols_per_lane,
+                                std::vector<uint16_t>& symbols) {
+    if (num_lanes == 0 || num_lanes > 16 || target_symbols_per_lane == 0) return false;
+    for (size_t i = 0; i < num_lanes; ++i) {
+        if (alphabet_bits[i] > 8) return false;
+    }
+    symbols.assign(num_lanes * target_symbols_per_lane, 0);
+
+    Lane lanes[16];
+    uint32_t lane_f[16] = {};
+    uint32_t lane_cf[16] = {};
+    for (size_t i = 0; i < num_lanes; ++i) {
+        lanes[i].ab = alphabet_bits[i];
+        lanes[i].target = static_cast<uint32_t>(target_symbols_per_lane);
+    }
+
+    uint32_t slots = 0;
+    size_t pos = 0;
+    uint64_t cycle = 0;
+    uint64_t max_cycles = 64ull * (num_lanes * target_symbols_per_lane + input_size) + 1000;
+    uint64_t total_syms = 0;
+    size_t last_pos = SIZE_MAX;
+    uint64_t last_total_syms = UINT64_MAX;
+    uint32_t last_state_sum = UINT32_MAX;
+    uint64_t last_change = 0;
+
+    while (cycle < max_cycles) {
+        size_t served = 0;
+        uint32_t active = 0;
+        bool finished = true;
+        bool failed = false;
+        uint32_t state_sum = 0;
+        for (size_t i = 0; i < num_lanes; ++i) {
+            Lane& ln = lanes[i];
+            uint32_t bit = 1u << i;
+            bool blocked_out = ln.sym_full && ((slots & bit) != 0);
+            bool need = !ln.ib_full && ((ln.state >= LANE_HDR0 && ln.state <= LANE_HDR2) ||
+                                       (ln.state == LANE_PROC && ln.in_rem > 0));
+            // The reference's exhausted mask is implied: pos never moves back from input_size.
+            bool valid = need && !blocked_out && served < 8 && pos < input_size;
+            bool stall = (need && !valid) || blocked_out;
+            if (!stall) {
+                if (ln.state == LANE_PROC || ln.state == LANE_DRAIN) {
+                    ln.p0 = ln.sym_full ? lane_f[i] * (ln.p1 >> 16) + (ln.p1 & 0xFFFF) - lane_cf[i] : ln.p1;
+                }
+                if (valid) {
+                    ln.ib = input[pos];
+                    ln.ib_full = true;
+                    pos++;
+                    served++;
+                }
+                if (ln.sym_full) {
+                    slots |= bit;
+                    symbols[i * target_symbols_per_lane + ln.nsyms] = ln.sym;
+                    ln.nsyms++;
+                    total_syms++;
+                    ln.sym_full = false;
+                }
+            }
+            // After a failed phase 1 the reference still ran phase 0 for every lane, but no phase 1.
+            bool skip = stall || failed;
+            bool short_step = skip;
+            if (!skip && ln.state == LANE_PROC) {
+                bool will = ln.p0 < 0x1000000 && ln.ib_full;
+                if (ln.in_rem > static_cast<uint32_t>(will)) {
+                    short_step = true;
+                    uint32_t x = will ? ((ln.p0 << 8) | ln.ib) : ln.p0;
+                    bool nsf = (x > 0x1000000) && (ln.out_rem > 0);
+                    if (nsf) {
+                        ln.out_rem--;
+                        ln.sym = model_inverse_interval(ln.eab, ln.q, x & 0xFFFF, lane_f[i], lane_cf[i]);
+                    }
+                    ln.p1 = x;
+                    ln.sym_full = nsf;
+                    if (will) {
+                        ln.in_rem--;
+                        ln.ib_full = false;
+                    }
+                }
+            } else if (!skip && ln.state == LANE_DRAIN && ln.p0 >= LANE_DRAIN_SHORT_MIN) {
+                short_step = true;
+                bool nsf = ln.out_rem > 0;
+                if (nsf) {
+                    ln.out_rem--;
+                    ln.sym = model_inverse_interval(ln.eab, ln.q, ln.p0 & 0xFFFF, lane_f[i], lane_cf[i]);
+                }
+                ln.p1 = ln.p0;
+                ln.sym_full = nsf;
+            }
+            if (!short_step) {
+                if (!phase1(ln)) {
+                    failed = true;
+                } else if (ln.sym_full) {
+                    model_forward(ln.eab, ln.q, ln.sym, lane_f[i], lane_cf[i]);
+                }
+            }
+            if (!(ln.done && !ln.sym_full && (slots & bit) == 0)) {
+                active |= bit;
+            }
+            finished &= (ln.done && !ln.sym_full);
+            state_sum += ln.state;
+        }
+        if (failed) return false;
+
+        if (slots != 0 && (slots & active) == active) {
+            slots = 0;
+        }
+        cycle++;
+        if (finished) {
+            for (size_t i = 0; i < num_lanes; ++i) {
+                uint32_t f = lanes[i].final_state;
+                if (f != 0x1000000 && f != 0x10000 && f != 0x100) {
+                    return false;
+                }
+            }
+            for (size_t p = pos; p < input_size; ++p) {
+                if (input[p] != 0) return false;
+            }
+            return true;
+        }
+
+        if (pos != last_pos || total_syms != last_total_syms || state_sum != last_state_sum) {
+            last_pos = pos;
+            last_total_syms = total_syms;
+            last_state_sum = state_sum;
+            last_change = cycle;
+        } else if (cycle - last_change > 64) {
+            return false;
+        }
+    }
+    return false;
+}
+
+enum LanePath : int { LANE_PATH_REFERENCE, LANE_PATH_SCALAR, LANE_PATH_COUNT };
+
+inline bool lane_path_supported(int path) {
+    return path == LANE_PATH_REFERENCE || path == LANE_PATH_SCALAR;
+}
+
+inline int best_lane_path() {
+    return LANE_PATH_SCALAR;
+}
+
+#ifdef X2W_BCPACK_LANE_TESTS
+// Test-only switch, compiled only into tests that define X2W_BCPACK_LANE_TESTS for the whole binary:
+// when set to a supported LanePath, decode_lanes uses it.
+inline int lane_path_override = -1;
+#endif
+
+inline bool decode_lanes_on(int path, const uint8_t* input, size_t input_size,
+                            const uint8_t* alphabet_bits, size_t num_lanes,
+                            size_t target_symbols_per_lane,
+                            std::vector<uint16_t>& symbols) {
+    switch (path) {
+    case LANE_PATH_REFERENCE:
+        return decode_lanes_reference(input, input_size, alphabet_bits, num_lanes, target_symbols_per_lane, symbols);
+    case LANE_PATH_SCALAR:
+        return decode_lanes_scalar(input, input_size, alphabet_bits, num_lanes, target_symbols_per_lane, symbols);
+    default:
+        return false;
+    }
+}
+
+inline bool decode_lanes(const uint8_t* input, size_t input_size,
+                         const uint8_t* alphabet_bits, size_t num_lanes,
+                         size_t target_symbols_per_lane,
+                         std::vector<uint16_t>& symbols) {
+#ifdef X2W_BCPACK_LANE_TESTS
+    int path = lane_path_supported(lane_path_override) ? lane_path_override : best_lane_path();
+#else
+    int path = best_lane_path();
+#endif
+    return decode_lanes_on(path, input, input_size, alphabet_bits, num_lanes, target_symbols_per_lane, symbols);
 }
 
 inline constexpr uint8_t SUBSETS[8] = { 3, 2, 3, 2, 1, 1, 1, 2 };

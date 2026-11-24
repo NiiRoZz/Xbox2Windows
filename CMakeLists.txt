@@ -620,6 +620,24 @@ add_test(NAME bcpack_encoder_roundtrip COMMAND bcpack_encoder_check)
 add_test(NAME bcpack_encoder_window_control COMMAND bcpack_encoder_check --mutate window)
 set_tests_properties(bcpack_encoder_roundtrip bcpack_encoder_window_control PROPERTIES TIMEOUT 120)
 set_tests_properties(bcpack_encoder_window_control PROPERTIES WILL_FAIL TRUE)
+# Each decode_lanes path against the original cycle loop on whole, truncated and bit-flipped streams
+# (tests/bcpack_lanes_check.cpp), one test per path; 77 means this CPU lacks that path. The control
+# build takes a wrong short DRAIN step at the home state and must fail on every path.
+foreach(variant IN ITEMS check control)
+    add_executable(bcpack_lanes_${variant} tests/bcpack_lanes_check.cpp)
+    target_compile_features(bcpack_lanes_${variant} PRIVATE cxx_std_17)
+    target_include_directories(bcpack_lanes_${variant} PRIVATE src)
+    target_compile_definitions(bcpack_lanes_${variant} PRIVATE X2W_BCPACK_LANE_TESTS)
+endforeach()
+target_compile_definitions(bcpack_lanes_control PRIVATE X2W_BCPACK_LANES_CONTROL)
+set(bcpack_lane_paths scalar)
+foreach(path IN LISTS bcpack_lane_paths)
+    add_test(NAME bcpack_lanes_${path} COMMAND bcpack_lanes_check "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors" --path ${path})
+    add_test(NAME bcpack_lanes_${path}_drain_control
+             COMMAND bcpack_lanes_control "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors" --path ${path})
+    set_tests_properties(bcpack_lanes_${path} bcpack_lanes_${path}_drain_control PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    set_tests_properties(bcpack_lanes_${path}_drain_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
