@@ -15,6 +15,7 @@ limit, and a run with no root signature. A pair split between two consecutive zl
 carved whole. A request whose .root cannot be written must leave no .a and no temporary file and make
 the run fail. An archive without any pair must make the run fail. A second run must write nothing new.
 """
+import re
 import struct
 import subprocess
 import sys
@@ -25,6 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / 'tools' / 'startup' / 'archive_requests.py'
 
+REVISION = re.search(rb'constexpr char revision\[\] = "([^"]+)";',
+                     (ROOT / 'src' / 'startup_stubs' / 'd3d12_draw.inl').read_bytes()).group(1)
 PREFETCH = bytes.fromhex('0300a0bf')  # s_inst_prefetch 0x3
 CODE_END = bytes.fromhex('00009fbf')
 ENDPGM = struct.pack('<I', 0xbf810000)
@@ -40,18 +43,19 @@ def runtime_key(a, b, root):
     """The runtime's key (fnv_bytes and cached_translation in src/startup_stubs/d3d12_draw.inl): FNV-1a 64
     over the revision text, then the first recorded blob, the second and the root signature. The
     runtime's start value is 1469598103934665603, not the standard offset basis 14695981039346656037;
-    the cache keys depend on it, so it is reproduced as written."""
+    the cache keys depend on it, so it is reproduced as written. The revision text is read from the
+    runtime source, so a revision bump there is followed here and checked against the tool."""
     h = 1469598103934665603
-    for part in (b'x2w-startup-shader-3', a, b, root):
+    for part in (REVISION, a, b, root):
         for byte in part:
             h = ((h ^ byte) * 1099511628211) & 0xffffffffffffffff
     return h
 
 
-def program(stage, serial, blocks=1, tag=b'\x80\xd5'):
+def program(stage, serial, blocks=1, tag=b'\x80\xd5', extra=b''):
     target = {'vs': 12, 'ps': 0}[stage]  # exp pos0 / exp mrt0, then s_endpgm
     header = b'\x00\x00' + tag + struct.pack('<I', serial) + bytes(28)
-    body = header + PREFETCH + struct.pack('<2I', 0xf800080f | target << 4, 0) + ENDPGM
+    body = header + PREFETCH + extra + struct.pack('<2I', 0xf800080f | target << 4, 0) + ENDPGM
     size = 0x40 * blocks
     return body + CODE_END * ((size - len(body)) // 4)
 
@@ -71,7 +75,11 @@ def summary(text):
 PS1, VS1 = program('ps', 1), program('vs', 2, blocks=2)
 PS2, PS3, VS3, VS4 = program('ps', 3), program('ps', 4), program('vs', 5), program('vs', 6)
 PS_TAIL, VS_TAIL = program('ps', 7), program('vs', 12, blocks=2)  # VS_TAIL ends where the stream ends
-PS5, VS5 = program('ps', 8), program('vs', 9)
+# VS5 holds v_cndmask_b32_e64 v1, -1, v0, vcc_lo with NEG on the inline -1 (VOP3 opcode 0x101,
+# src0 193, src1 v0, src2 vcc_lo, neg bit 0): a form the translator refuses while decoding. Pairing
+# must depend on the export targets only, not on whether the program can be translated.
+CNDMASK_NEG_IMM = struct.pack('<2I', 0xd5010001, 193 | 256 << 9 | 106 << 18 | 1 << 29)
+PS5, VS5 = program('ps', 8), program('vs', 9, extra=CNDMASK_NEG_IMM)
 PS6, VS6 = program('ps', 10), program('vs', 11)
 
 first = stream([(0x02c, PS1), (0x12c, VS1), (0x22c, PS2), (0x32c, PS3), (0x42c, VS3), (0x52c, VS4),

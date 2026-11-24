@@ -35,6 +35,25 @@ def complete(program):
     return any(program[at:at + 4] == ENDPGM for at in range(HEADER, len(program) - 3, 4))
 
 
+def stage_of(program):
+    """'vs', 'ps', 'other' or 'undecodable', from the export targets alone (the rule of
+    gfx2hlsl.classify). It reads the disassembler directly: gfx2hlsl.decode also refuses forms the
+    translator cannot lower, and whether a program can be translated must not decide its pairing."""
+    code, at, exports = gfx2hlsl.strip_header(program), 0, []
+    while at + 4 <= len(code):
+        try:
+            size, name, asm, _ = gfx2hlsl.D.decode_instruction(code, at)
+        except Exception:  # noqa: BLE001 - any word the disassembler cannot read
+            return 'undecodable'
+        if name == 'exp':
+            exports.append(asm)
+        if name == 's_endpgm':
+            break
+        at += size
+    text = ' '.join(exports)
+    return 'vs' if 'pos' in text else 'ps' if 'mrt' in text or not text else 'other'
+
+
 def next_step(at, program):
     """Stream offset of the 256-byte step right after the program."""
     return at + -(-len(program) // STEP) * STEP
@@ -166,10 +185,7 @@ def main():
                 counts['incomplete'] += 1
                 previous = None
                 continue
-            try:
-                stage = gfx2hlsl.classify(program)
-            except gfx2hlsl.Unsupported:
-                stage = 'undecodable'
+            stage = stage_of(program)
             counts[stage] += 1
             # directly following: the vertex program starts on the 256-byte step after the pixel program
             if stage == 'vs' and previous and previous[0] == 'ps' and at == next_step(previous[1], previous[2]):
