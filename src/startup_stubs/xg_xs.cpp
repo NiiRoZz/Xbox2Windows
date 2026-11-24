@@ -12,6 +12,7 @@
 #include <array>
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/tile64_plan.h"
+#include "startup_stubs/small_texture_4k.h"
 #include <cstdio>
 #include <cstring>
 #include <utility>
@@ -172,18 +173,22 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
     UINT64 slice_total = plan.size;
     const bool valid = slice_total != ~0ull && slice_total != 0;
     if (!valid) slice_total = 0x10000;
-    const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
+    // A description the allocation-info entries answer with 4 KiB gets the same size and alignment here
+    // (small_texture_4k.h); its mip records still describe the desktop linear footprint.
+    const u64 extent = x2w_startup::small_texture_4k_extent(self->desc);
+    const u64 stride = extent ? extent : (slice_total + 0xFFFF) & ~u64{0xFFFF};
     const u64 total = stride * slices;
+    const u64 alignment = extent ? 0x1000 : 0x10000;
 
     put64(layout + 0x00, total);
-    put64(layout + 0x08, 0x10000);
+    put64(layout + 0x08, alignment);
     put32(layout + 0x10, mips);
     put32(layout + 0x14, plan.planes);
     for (unsigned p = 0; p < plan.planes; ++p) {
         unsigned char* plane = layout + layout_header + p * plane_bytes;
         put64(plane + 0x08, total);
         put64(plane + 0x10, slices > 1 ? stride : 0);
-        put64(plane + 0x18, 0x10000);
+        put64(plane + 0x18, alignment);
         for (unsigned m = 0; valid && m < mips; ++m) {
             const unsigned i = p * mips + m;
             unsigned char* mip = plane + mip_base + m * mip_bytes;
@@ -213,9 +218,9 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
             used += std::snprintf(sizes + used, sizeof sizes - used, " %llx@%llx",
                                   u64{footprints[i].Footprint.RowPitch} * rows[i] * footprints[i].Footprint.Depth, footprints[i].Offset);
         x2w_local::logf("x2w-xg TextureComputer::slot2(layout) dim=%d %llux%ux%u mips=%u fmt=%d(->%d) layout=0x%x -> %s "
-                        "slice=0x%llx total=0x%llx mip0 pitch=%u mips:%s", self->desc.Dimension, self->desc.Width, self->desc.Height,
+                        "slice=0x%llx total=0x%llx align=0x%llx mip0 pitch=%u mips:%s", self->desc.Dimension, self->desc.Width, self->desc.Height,
                         self->desc.DepthOrArraySize, self->desc.MipLevels, self->desc.Format, desc.Format, self->desc.Layout,
-                        valid ? "ok" : "DESKTOP REJECTED THE DESC", stride, total, valid ? footprints[0].Footprint.RowPitch : 0, sizes);
+                        valid ? "ok" : "DESKTOP REJECTED THE DESC", stride, total, alignment, valid ? footprints[0].Footprint.RowPitch : 0, sizes);
     }
     return 0;
 }
@@ -322,24 +327,31 @@ long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned 
                             static_cast<void*>(base), plane, subresource, static_cast<const void*>(linear), row_pitch, slice_pitch);
         return static_cast<long>(0x80070057);
     }
+    // A description given the 4 KiB allocation answer has only that much memory at base: rows past it are
+    // not written (small_texture_4k.h).
+    const u64 extent = x2w_startup::small_texture_4k_extent(self->desc);
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
     const auto& fp = footprints[i].Footprint;
     const u64 used = row_bytes[i] < row_pitch ? row_bytes[i] : row_pitch;
-    unsigned char* target = base + stride * slice + footprints[i].Offset;
-    const u64 target_bytes = plan.bytes(i);
+    const u64 start = stride * slice + footprints[i].Offset;
+    unsigned char* target = base + start;
+    const u64 target_bytes = x2w_startup::small_texture_4k_within(start, plan.bytes(i), extent);
     const u64 source_slice = slice_pitch ? slice_pitch : u64{row_pitch} * rows[i];
-    const bool ok = x2w_local::writable(target, target_bytes) &&
+    const bool ok = (!target_bytes || x2w_local::writable(target, target_bytes)) &&
                     x2w_local::readable(linear, source_slice * (fp.Depth - 1) + u64{row_pitch} * (rows[i] - 1) + used);
     if (ok) {
         for (unsigned z = 0; z < fp.Depth; ++z)
-            for (unsigned y = 0; y < rows[i]; ++y)
-                std::memcpy(target + (u64{z} * rows[i] + y) * fp.RowPitch, linear + z * source_slice + u64{y} * row_pitch, used);
-        notify_texture_write(base, stride * slices);
+            for (unsigned y = 0; y < rows[i]; ++y) {
+                const u64 row = (u64{z} * rows[i] + y) * fp.RowPitch;
+                const u64 inside = x2w_startup::small_texture_4k_within(start + row, used, extent);
+                if (inside) std::memcpy(target + row, linear + z * source_slice + u64{y} * row_pitch, inside);
+            }
+        notify_texture_write(base, extent ? extent : stride * slices);
     }
     if (x2w_local::first_calls(calls, 12) || !ok)
         x2w_local::logf("x2w-xg TextureComputer::slot8(copy into) base=%p subresource=%u (mip %u slice %u) %ux%u fmt=%d rows=%u "
-                        "pitch %u->%u -> %s", static_cast<void*>(base), subresource, mip, slice, fp.Width, fp.Height, desc.Format,
-                        rows[i], row_pitch, fp.RowPitch, ok ? "copied" : "MEMORY NOT ACCESSIBLE");
+                        "pitch %u->%u extent=0x%llx -> %s", static_cast<void*>(base), subresource, mip, slice, fp.Width, fp.Height, desc.Format,
+                        rows[i], row_pitch, fp.RowPitch, extent, ok ? "copied" : "MEMORY NOT ACCESSIBLE");
     return ok ? 0 : static_cast<long>(0x80004005);
 }
 

@@ -1325,10 +1325,23 @@ substitute: on the adapter measured it answered 0x2000 for a 128 x 4 R16G16B16A1
 4 KiB layout takes 0x4000.
 
 Scope: a 2D texture with layout UNKNOWN, `Alignment` 0x1000, one sample, one array slice, power-of-two
-width and height, `MipLevels` 0 (full chain) up to the full chain, no render-target or depth flag, a
-format of 4, 8, 16, 32, 64 or 128 bits a texel (`small_texture_4k_bits`), and the executable's
-0x80007-bit bound. Any other description, arrays, other layouts and 1D or 3D textures included, keeps
-the desktop answer.
+width and height up to 16384, `MipLevels` 0 (full chain) up to the full chain, no render-target or
+depth flag, a single-plane format of 4, 8, 16, 32, 64 or 128 bits a texel (`small_texture_4k_bits`;
+depth with stencil is not answered), the executable's 0x80007-bit bound, and a desktop answer that is
+not a failure. Any other description, arrays, other layouts and 1D or 3D textures included, keeps the
+desktop answer.
+
+The executable's memory for such a texture is then only the answered size. The desktop linear footprint
+can be larger: a 32 x 32 R8G8B8A8 texture takes 0x1f80 bytes at a 256-byte row pitch. So the stand-in's
+own accesses stop at the answer for a description of that shape at alignment 0 or 0x1000
+(`small_texture_4k_extent`):
+- texture upload (`upload_texture`) reads no further, and fills the rest of the footprint with zeros;
+- XG slot 8 writes no rows past it;
+- XG slot 2 reports the same size at 4 KiB alignment, though its mip records still describe the
+  linear footprint.
+
+Texel layout inside the answer is unchanged by this: these paths still treat the memory as the linear
+footprint, not as the console's 4 KiB swizzle.
 
 Measured on one console executable under the startup debugger: 18 such reads failed during
 first-run setup in every run, each with the executable's check firing once. With this answer both
@@ -1343,6 +1356,9 @@ places in 4 KiB blocks starts exactly the size above after the previous one.
   `ADDR_SW_4KB_S` size (Mesa 25.1.0, `tools/fetch_addrlib.py`); it skips (77) without addrlib.
 - `ctest --preset release --no-tests=error -R '^startup_small_texture_4k_device_' -V` goes through the
   wrapper: slots 25 and 108 must give the 4 KiB answer, and controls the desktop answer.
+- `ctest --preset release --no-tests=error -R '^startup_small_texture_4k_xg' -V` checks XG slot 2's size
+  and alignment, and a slot 8 copy into exactly the answered size in front of a no-access guard page. The
+  `_no_limit_control` run asks at an explicit 64 KiB alignment, which is not limited, and must fail.
 
 ## Physical pages in shared sections
 

@@ -103,11 +103,67 @@ int literal(bool whole_width_tail)
     d = texture(28, 32, 16);
     d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
     kept("3D texture", d);
+    kept("depth with stencil R32G8X24 (two planes)", texture(20, 32, 16));
+    kept("depth with stencil R24G8 (two planes)", texture(45, 32, 16));
+    d = texture(61, 1, 1);
+    d.Width = 1ull << 40;
+    d.Height = 1u << 24;
+    kept("2^40 x 2^24 R8, past the dimension limit", d);
+    kept("32768x1 R8, past 16384", texture(61, 32768, 1));
+    {
+        D3D12_RESOURCE_ALLOCATION_INFO failed{~0ull, 0};
+        if (x2w_startup::small_texture_4k(texture(71, 2, 2), failed) || failed.SizeInBytes != ~0ull) {
+            std::printf("FAIL 2x2 BC1: a desktop failure was replaced\n");
+            ++failures;
+        }
+    }
+
+    // Bits per texel for every format value, listed from the DXGI format table (not from the helper's ranges).
+    const unsigned bits128[] = {1, 2, 3, 4};
+    const unsigned bits64[] = {9, 10, 11, 12, 13, 14, 15, 16, 17, 18};
+    const unsigned bits32[] = {23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43,
+                               67, 87, 88, 89, 90, 91, 92, 93};
+    const unsigned bits16[] = {48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 85, 86, 115};
+    const unsigned bits8[] = {60, 61, 62, 63, 64, 65, 73, 74, 75, 76, 77, 78, 82, 83, 84, 94, 95, 96, 97, 98, 99};
+    const unsigned bits4[] = {70, 71, 72, 79, 80, 81};
+    unsigned expected_bits[256] = {};
+    for (unsigned f : bits128) expected_bits[f] = 128;
+    for (unsigned f : bits64) expected_bits[f] = 64;
+    for (unsigned f : bits32) expected_bits[f] = 32;
+    for (unsigned f : bits16) expected_bits[f] = 16;
+    for (unsigned f : bits8) expected_bits[f] = 8;
+    for (unsigned f : bits4) expected_bits[f] = 4;
+    for (unsigned f = 0; f < 256; ++f)
+        if (x2w_startup::small_texture_4k_bits(f) != expected_bits[f]) {
+            std::printf("FAIL format %u: %u bits per texel, expected %u\n", f, x2w_startup::small_texture_4k_bits(f), expected_bits[f]);
+            ++failures;
+        }
+
+    // The limit the stand-in's own reads and writes use: the 4 KiB answer whatever Alignment 0 or 0x1000 says.
+    const auto extent_is = [](const char* name, const D3D12_RESOURCE_DESC& desc, unsigned long long expected) {
+        const unsigned long long got = x2w_startup::small_texture_4k_extent(desc);
+        if (got != expected) {
+            std::printf("FAIL extent %s: 0x%llx, expected 0x%llx\n", name, got, expected);
+            ++failures;
+        }
+    };
+    extent_is("32x32 R8G8B8A8 at alignment 0", texture(28, 32, 32, 1, 0), 0x1000);
+    extent_is("32x32 R8G8B8A8 at 4 KiB", texture(28, 32, 32), 0x1000);
+    extent_is("32x32 R8G8B8A8 at 64 KiB", texture(28, 32, 32, 1, 0x10000), 0);
+    extent_is("256x128 R8G8B8A8, over the bound", texture(28, 256, 128, 1, 0), 0);
+    struct { unsigned long long offset, bytes, extent, inside; } spans[] = {
+        {0, 0x1f80, 0x1000, 0x1000}, {0xf00, 0x80, 0x1000, 0x80}, {0xf80, 0x100, 0x1000, 0x80},
+        {0x1000, 0x80, 0x1000, 0}, {0x2000, 0x80, 0x1000, 0}, {0x1800, 0x80, 0, 0x80}};
+    for (const auto& c : spans)
+        if (x2w_startup::small_texture_4k_within(c.offset, c.bytes, c.extent) != c.inside) {
+            std::printf("FAIL within(0x%llx, 0x%llx, 0x%llx) != 0x%llx\n", c.offset, c.bytes, c.extent, c.inside);
+            ++failures;
+        }
     if (failures) {
         std::printf("startup_small_texture_4k: %d failure(s)\n", failures);
         return 1;
     }
-    std::printf("startup_small_texture_4k: PASS (14 sizes, 14 refused descriptions)\n");
+    std::printf("startup_small_texture_4k: PASS (14 sizes, 19 refused descriptions, 256 format values, extent and span limits)\n");
     return 0;
 }
 }  // namespace

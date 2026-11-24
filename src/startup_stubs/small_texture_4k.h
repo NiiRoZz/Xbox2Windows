@@ -10,10 +10,15 @@
 // block's height while at most 8 levels remain; that level and every smaller one share one block.
 //
 // Scope, any other description keeps the desktop answer: a 2D texture with layout UNKNOWN, Alignment
-// 0x1000, one sample, one array slice, power-of-two width and height (so block-compressed mip sizes are the
-// same in texels and in blocks), MipLevels 0 (full chain) to the full chain, no render-target or depth
-// flag, a format whose bits per texel are 4, 8, 16, 32, 64 or 128 (small_texture_4k_bits), and the top
-// level within the executable's 0x80007-bit bound.
+// 0x1000, one sample, one array slice, power-of-two width and height up to 16384 (so block-compressed mip
+// sizes are the same in texels and in blocks), MipLevels 0 (full chain) to the full chain, no render-target
+// or depth flag, a single-plane format whose bits per texel are 4, 8, 16, 32, 64 or 128
+// (small_texture_4k_bits), the top level within the executable's 0x80007-bit bound, and a desktop answer
+// that is not a failure.
+//
+// Once a description gets this answer, the executable's memory for it is that many bytes. The stand-in's
+// own reads and writes of that memory (texture upload, XG copies) are limited to it with
+// small_texture_4k_extent() and small_texture_4k_within().
 #pragma once
 
 #include <d3d12.h>
@@ -40,13 +45,14 @@ inline Block block(unsigned bits)
 inline bool power_of_two(std::uint64_t v) { return v && !(v & (v - 1)); }
 }  // namespace small_texture_4k_detail
 
-// Bits per texel of the formats answered; 0 for every other format.
+// Bits per texel of the single-plane formats answered; 0 for every other format (depth with stencil in
+// the R32G8X24 and R24G8 families has two planes on the console and is not answered here).
 inline unsigned small_texture_4k_bits(unsigned format)
 {
     const unsigned f = format;
     if (f >= 1 && f <= 4) return 128;                                        // R32G32B32A32
-    if (f >= 9 && f <= 22) return 64;                                        // R16G16B16A16, R32G32, R32G8X24
-    if ((f >= 23 && f <= 47) || f == 67 || (f >= 87 && f <= 93)) return 32;  // R10G10B10A2 .. R24G8, R9G9B9E5, B8G8R8A8
+    if (f >= 9 && f <= 18) return 64;                                        // R16G16B16A16, R32G32
+    if ((f >= 23 && f <= 43) || f == 67 || (f >= 87 && f <= 93)) return 32;  // R10G10B10A2 .. R32, R9G9B9E5, B8G8R8A8
     if ((f >= 48 && f <= 59) || f == 85 || f == 86 || f == 115) return 16;   // R8G8, R16, B5G6R5, B5G5R5A1, B4G4R4A4
     if (f >= 60 && f <= 65) return 8;                                        // R8, A8
     if ((f >= 70 && f <= 72) || (f >= 79 && f <= 81)) return 4;              // BC1, BC4
@@ -67,26 +73,50 @@ inline std::uint64_t small_texture_4k_bytes(std::uint64_t width, std::uint64_t h
     return blocks * 0x1000;
 }
 
-// Replaces info with the console answer and returns true for a description in scope; false leaves it.
-inline bool small_texture_4k(const D3D12_RESOURCE_DESC& d, D3D12_RESOURCE_ALLOCATION_INFO& info)
+// Bytes of the 4 KiB answer for a description in scope apart from its Alignment field; 0 otherwise.
+inline std::uint64_t small_texture_4k_shape(const D3D12_RESOURCE_DESC& d)
 {
     using namespace small_texture_4k_detail;
-    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Alignment != 0x1000 || d.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN ||
-        d.SampleDesc.Count != 1 || d.DepthOrArraySize != 1 || !power_of_two(d.Width) || !power_of_two(d.Height))
-        return false;
-    if (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return false;
+    if (d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || d.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || d.SampleDesc.Count != 1 ||
+        d.DepthOrArraySize != 1 || d.Width > 16384 || d.Height > 16384 || !power_of_two(d.Width) || !power_of_two(d.Height))
+        return 0;
+    if (d.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) return 0;
     const unsigned bits = small_texture_4k_bits(d.Format);
     const Block b = block(bits);
-    if (!b.width) return false;
+    if (!b.width) return 0;
     unsigned full = 0;
     for (std::uint64_t e = d.Width > d.Height ? d.Width : d.Height; e; e >>= 1) ++full;
     const unsigned mips = d.MipLevels ? d.MipLevels : full;
-    if (mips > full) return false;
+    if (mips > full) return 0;
     // The executable's bound: the top level padded to whole blocks, in bits, at most 0x80007.
     const std::uint64_t padded = (d.Width + b.width - 1) / b.width * b.width * ((d.Height + b.height - 1) / b.height * b.height);
-    if (padded * bits > 0x80007) return false;
-    info = {small_texture_4k_bytes(d.Width, d.Height, mips, bits), 0x1000};
+    if (padded * bits > 0x80007) return 0;
+    return small_texture_4k_bytes(d.Width, d.Height, mips, bits);
+}
+
+// Replaces info with the console answer and returns true for a description in scope; false leaves it.
+inline bool small_texture_4k(const D3D12_RESOURCE_DESC& d, D3D12_RESOURCE_ALLOCATION_INFO& info)
+{
+    if (d.Alignment != 0x1000 || info.SizeInBytes == ~0ull) return false;
+    const std::uint64_t bytes = small_texture_4k_shape(d);
+    if (!bytes) return false;
+    info = {bytes, 0x1000};
     return true;
+}
+
+// Bytes of executable memory behind a texture of this description, when the allocation-info entries give it
+// the 4 KiB answer: Alignment 0x1000 or unspecified (0); 0 when the description is not limited.
+inline std::uint64_t small_texture_4k_extent(const D3D12_RESOURCE_DESC& d)
+{
+    return d.Alignment == 0x1000 || d.Alignment == 0 ? small_texture_4k_shape(d) : 0;
+}
+
+// Bytes of [offset, offset + bytes) that lie inside the first extent bytes; extent 0 means no limit.
+inline std::uint64_t small_texture_4k_within(std::uint64_t offset, std::uint64_t bytes, std::uint64_t extent)
+{
+    if (!extent) return bytes;
+    if (offset >= extent) return 0;
+    return bytes < extent - offset ? bytes : extent - offset;
 }
 
 }  // namespace x2w_startup
