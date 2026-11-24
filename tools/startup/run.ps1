@@ -56,6 +56,7 @@ New-Item -ItemType Directory -Force $LogDir | Out-Null
 $python = Join-Path $repo "out\pe-env\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
 $translator = $null
+if ($Translate -and -not $Render) { Write-Warning "-Translate needs -Render (no shader cache without it); ignored" }
 if ($Translate -and $Render) {
     $translator = Start-Process -FilePath $python -PassThru -NoNewWindow `
         -ArgumentList "-B", "`"$(Join-Path $PSScriptRoot 'gfx2hlsl.py')`"", "--watch", "`"$env:X2W_SHADER_CACHE`"" `
@@ -66,7 +67,8 @@ try {
         --trace-files 1 --continue-asserts $ContinueAsserts *> "$LogDir.out"
     $debuggerExit = $LASTEXITCODE
 } finally {
-    if ($translator) { Stop-Process -Id $translator.Id -Force -ErrorAction SilentlyContinue }
+    # /T: the watcher's parallel workers (and their fxc.exe) are separate processes
+    if ($translator) { & taskkill.exe /T /F /PID $translator.Id 2>&1 | Out-Null }
 }
 Get-Content "$LogDir.out" -TotalCount 5
 exit $debuggerExit

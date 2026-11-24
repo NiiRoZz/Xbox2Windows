@@ -1485,28 +1485,52 @@ def main():
     if sys.argv[1] == '--watch':
         # --watch <dir> [seconds]: translate requests as a running title writes them, until stopped
         interval = float(sys.argv[3]) if len(sys.argv) > 3 else 2.0
+        # The first pass retries earlier failures once (the runtime never rewrites a request, so a
+        # translator fix would otherwise not reach them); later passes skip failures already written.
+        skip_failed = False
         while True:
-            translate_pending(out_dir, skip_failed=True)
+            translate_pending(out_dir, skip_failed=skip_failed)
+            skip_failed = True
             time.sleep(interval)
     translate_pending(out_dir)
+
+
+def translate_one(out_dir, key):
+    """translate_request, with an unexpected translator error recorded as <key>.fail instead of raised."""
+    try:
+        return translate_request(out_dir, key)
+    except Exception as error:  # noqa: BLE001 - one bad request must not stop a scan or the watcher
+        reason = 'translator error: %s: %s' % (type(error).__name__, error)
+        with open(os.path.join(out_dir, '%016x.fail' % key), 'w') as fail:
+            fail.write(reason + '\n')
+        return reason
+
+
+def translation_jobs():
+    try:
+        jobs = int(os.environ.get('X2W_TRANSLATE_JOBS') or 0)
+    except ValueError:
+        jobs = 0
+    jobs = jobs if jobs > 0 else os.cpu_count() or 1
+    return min(jobs, 61) if os.name == 'nt' else jobs  # ProcessPoolExecutor refuses more than 61 on Windows
 
 
 def translate_pending(out_dir, skip_failed=False, jobs=None):
     """Translate every request that has no result yet. The runtime writes .a and .rtv last, as ready markers.
 
     Requests are independent (each writes only its own <key>.* files), so several run in parallel
-    processes; X2W_TRANSLATE_JOBS (default: the processor count) sets how many.
+    processes; X2W_TRANSLATE_JOBS (default: the processor count, at most 61 on Windows) sets how many.
     """
     keys = pending_keys(out_dir, skip_failed)
-    jobs = jobs or int(os.environ.get('X2W_TRANSLATE_JOBS', 0)) or os.cpu_count() or 1
-    if len(keys) < 2 or jobs < 2:
+    jobs = min(jobs or translation_jobs(), len(keys))
+    if jobs < 2:
         for key in keys:
-            print('%016x: %s' % (key, translate_request(out_dir, key)), flush=True)
+            print('%016x: %s' % (key, translate_one(out_dir, key)), flush=True)
         return
     from concurrent.futures import ProcessPoolExecutor
-    # ProcessPoolExecutor refuses more than 61 workers on Windows
-    with ProcessPoolExecutor(max_workers=min(jobs, len(keys), 61 if os.name == 'nt' else jobs)) as pool:
-        for key, result in zip(keys, pool.map(translate_request, [out_dir] * len(keys), keys, chunksize=8)):
+    chunk = max(1, len(keys) // (jobs * 4))  # small batches keep every worker busy
+    with ProcessPoolExecutor(max_workers=jobs) as pool:
+        for key, result in zip(keys, pool.map(translate_one, [out_dir] * len(keys), keys, chunksize=chunk)):
             print('%016x: %s' % (key, result), flush=True)
 
 

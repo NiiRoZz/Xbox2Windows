@@ -281,22 +281,30 @@ It writes:
 ### Translating shaders during a run
 
 With `-Render -Translate`, `run.ps1` starts `tools/startup/gfx2hlsl.py --watch <shader cache>` beside
-the debugger and stops it when the debugger returns. The watcher repeats the `--pending` scan every
+the debugger and stops it, with its worker processes, when the debugger returns (`-Translate`
+without `-Render` is ignored with a warning). The watcher repeats the `--pending` scan every
 2 seconds (`--watch <dir> <seconds>` sets another interval), so a pipeline the title creates during
 the run is translated within seconds, and the runtime picks it up on a later draw instead of on the
 next run. The cache persists: a later run reads every published `<key>.txt` and translates only new
-requests. In watch mode a request whose `<key>.fail` is newer than its ready marker is not retried
-until the runtime rewrites the request; the one-shot `--pending` scan still retries every failure.
+requests. The watcher's first pass retries every earlier failure once, so a translator update reaches
+requests that failed in an earlier run; after that, a request whose `<key>.fail` is newer than its
+ready marker is not retried during the run (the runtime writes each request once and never rewrites
+it). The one-shot `--pending` scan retries every failure. An unexpected translator error is written
+to `<key>.fail` as `translator error: ...` instead of stopping the scan.
 FXC is located as described for `X2W_SHADER_CACHE` under [Switches](#switches). A scan with more than
-one pending request translates them in parallel processes, one per logical processor unless
-`X2W_TRANSLATE_JOBS` sets the count; each request writes only its own files. On a 16-thread host,
-3,513 requests (132 translated, 3,381 refused) took 44.0 s with one process and 6.1 s in parallel,
+one pending request translates them in parallel processes, one per logical processor (at most 61 on
+Windows, the `ProcessPoolExecutor` limit) unless `X2W_TRANSLATE_JOBS` sets the count; each request
+writes only its own files. On a 16-thread host,
+3,513 requests (132 translated, 3,381 refused) took 56.9 s with one process and 7.8 s in parallel,
 with byte-identical results.
 
 Check with `python3 -B tests/startup_gfx2hlsl_watch_check.py` (ctest `startup_gfx2hlsl_watch`): a
-request without its ready marker is not consumed, a failure is not retried until its request is
-rewritten, the watcher translates a request written while it runs, and four parallel workers print
-the same results and write the same failures as one. `startup_run_ps1` checks that `-Translate` starts the watcher on the cache and stops it.
+request without its ready marker is not consumed, the watcher retries an earlier failure once and
+then leaves failures alone, it translates a request written while it runs, four parallel workers
+print the same results and write the same failures as one, an unexpected translator error becomes
+`<key>.fail`, and an invalid `X2W_TRANSLATE_JOBS` falls back to the processor count.
+`startup_run_ps1` checks that `-Translate` starts the watcher on the cache and stops it together
+with a child process.
 
 `run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
 the process could not be created, 0 when the debugger finished its report, whatever the process

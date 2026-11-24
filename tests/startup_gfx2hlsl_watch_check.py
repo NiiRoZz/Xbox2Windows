@@ -1,10 +1,12 @@
 """gfx2hlsl.py pending scan and --watch on synthetic request files (pure Python, no Windows, no GPU).
 
 A request is consumed only once its ready marker (.a or .rtv) exists and it has no published .txt.
-In watch mode a request whose .fail is newer than its marker is not retried until the marker is
-rewritten; the one-shot --pending scan still retries it. The --watch process must translate a new
-request while it runs and must not rewrite a failure on later passes. A --pending scan with four
-parallel workers must print the same results and write the same failures as one worker.
+After the watcher's first pass, a request whose .fail is newer than its marker is not retried; the
+first pass and the one-shot --pending scan retry it. The --watch process must retry an earlier
+failure once, translate a new request while it runs and not rewrite a failure on later passes. A
+--pending scan with four parallel workers must print the same results and write the same failures
+as one worker, an unexpected translator error must become <key>.fail, and an invalid
+X2W_TRANSLATE_JOBS must fall back to the processor count.
 """
 import os
 import subprocess
@@ -64,17 +66,49 @@ with tempfile.TemporaryDirectory() as tmp:
     expect('watch pass', scan(d, True), [1, 5, 6])
     expect('one-shot pass', scan(d, False), [1, 4, 5, 6])
 
-# Parallel --pending must give the same results as one worker: eight invalid RTV requests fail alike.
+# Parallel --pending must give the same results as one worker: sixteen invalid RTV requests fail
+# alike; with four workers each batch holds one request, so the work is spread over the workers.
 with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as many:
     for d in (one, many):
-        for key in range(8):
+        for key in range(16):
             touch(Path(d) / ('req_%016x.rtv' % (0x100 + key)), b'not an rtv request %d' % key)
     serial, parallel = pending_run(one, 1), pending_run(many, 4)
     expect('parallel --pending output and failures', parallel, serial)
-    expect('every request answered', len(serial[1]), 8)
+    expect('every request answered', len(serial[1]), 16)
+
+# An unexpected translator error becomes <key>.fail instead of ending the scan.
+with tempfile.TemporaryDirectory() as tmp:
+    d = Path(tmp)
+    touch(d / ('req_%016x.rtv' % 9))
+    real = gfx2hlsl.translate_request
+    gfx2hlsl.translate_request = lambda out_dir, key: 1 / 0
+    try:
+        gfx2hlsl.translate_pending(str(d), jobs=1)
+    except ZeroDivisionError:
+        failures.append('a translator error escaped translate_pending')
+    finally:
+        gfx2hlsl.translate_request = real
+    fail = d / ('%016x.fail' % 9)
+    expect('translator error recorded', fail.read_text().startswith('translator error: ZeroDivisionError') if fail.exists() else None, True)
+
+# An invalid job count falls back to the processor count instead of raising.
+saved = os.environ.get('X2W_TRANSLATE_JOBS')
+for value in ('', 'abc', '-3'):
+    os.environ['X2W_TRANSLATE_JOBS'] = value
+    expect('X2W_TRANSLATE_JOBS=%r' % value, gfx2hlsl.translation_jobs() >= 1, True)
+os.environ['X2W_TRANSLATE_JOBS'] = '2'
+expect('X2W_TRANSLATE_JOBS=2', gfx2hlsl.translation_jobs(), 2)
+if saved is None:
+    del os.environ['X2W_TRANSLATE_JOBS']
+else:
+    os.environ['X2W_TRANSLATE_JOBS'] = saved
 
 with tempfile.TemporaryDirectory() as tmp:
     d = Path(tmp)
+    # A failure from an earlier run, newer than its marker: the watcher's first pass retries it once.
+    now = time.time()
+    touch(d / ('req_%016x.rtv' % 8), b'not an rtv request either', mtime=now - 20)
+    touch(d / ('%016x.fail' % 8), b'stale reason\n', mtime=now - 10)
     watch = subprocess.Popen([sys.executable, '-B', str(ROOT / 'tools' / 'startup' / 'gfx2hlsl.py'),
                               '--watch', str(d), '0.1'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     try:
@@ -89,12 +123,14 @@ with tempfile.TemporaryDirectory() as tmp:
         first = fail.stat().st_mtime_ns if fail.exists() else None
         time.sleep(1.0)
         expect('failure left unchanged by later passes', fail.stat().st_mtime_ns if fail.exists() else None, first)
+        old = (d / ('%016x.fail' % 8)).read_text().strip()
+        expect('earlier failure retried once at start', old, 'invalid RTV variant request')
         expect('watcher still running', watch.poll(), None)
     finally:
         watch.kill()
         out, err = watch.communicate(timeout=20)
-    lines = [line for line in out.splitlines() if line.strip()]
-    expect('watcher output lines', len(lines), 1)
+    lines = sorted(line for line in out.splitlines() if line.strip())
+    expect('watcher output (each request translated once)', [line[:16] for line in lines], ['%016x' % 7, '%016x' % 8])
     if err.strip():
         failures.append('watcher stderr: %r' % err.strip()[-500:])
 

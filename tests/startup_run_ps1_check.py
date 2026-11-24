@@ -38,19 +38,21 @@ for n in range(1, 8):
     print("stub debugger line", n)
 sys.exit({code})
 """
-# Stands in for tools/startup/gfx2hlsl.py under -Translate: records its arguments and process id,
-# then waits to be stopped.
+# Stands in for tools/startup/gfx2hlsl.py under -Translate: starts a child process, as the parallel
+# workers are, records its own and the child's process ids and its arguments, then waits to be stopped.
 WATCH_STUB = """\
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
 
-Path(__file__).with_name("watch.json").write_text(json.dumps([os.getpid()] + sys.argv[1:]), encoding="utf-8")
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+Path(__file__).with_name("watch.json").write_text(json.dumps([os.getpid(), child.pid] + sys.argv[1:]), encoding="utf-8")
 time.sleep(120)
 """
-STOP = "Stop-Process -Id $translator.Id"
+STOP = "taskkill.exe /T /F /PID $translator.Id"
 CAPTURE = re.compile(r"\$(\w+)\s*=\s*\$LASTEXITCODE", re.I)
 EXIT = re.compile(r"exit\s+\$(\w+)", re.I)
 HEAD = 'Get-Content "$LogDir.out" -TotalCount 5'
@@ -119,11 +121,13 @@ def run_case(shell, script, code, work, translate=False):
     watch = startup / "watch.json"
     if translate:
         started = json.loads(watch.read_text(encoding="utf-8")) if watch.is_file() else None
-        if not started or started[1:] != ["--watch", str(root / "cache")]:
+        if not started or started[2:] != ["--watch", str(root / "cache")]:
             found.append(f"-Translate: the translator received {started}, expected --watch {root / 'cache'}")
-        elif alive(started[0]):
-            subprocess.run(["taskkill", "/PID", str(started[0]), "/F"], capture_output=True)
-            found.append("-Translate: the translator was still running after run.ps1 exited")
+        else:
+            for pid, what in ((started[0], "translator"), (started[1], "translator's child process")):
+                if alive(pid):
+                    subprocess.run(["taskkill", "/T", "/PID", str(pid), "/F"], capture_output=True)
+                    found.append(f"-Translate: the {what} was still running after run.ps1 exited")
     elif watch.is_file():
         found.append(f"stub exit {code}: the translator started without -Translate")
     return found
@@ -214,6 +218,8 @@ def main():
             if shells:  # only an executed run can see the translator outlive the script
                 stopless = "\n".join(line for line in script.splitlines() if STOP not in line) + "\n"
                 mutants["translator left running"] = None if stopless == script else stopless
+                parent_only = script.replace(STOP, "Stop-Process -Id $translator.Id -Force")
+                mutants["translator's workers left running"] = None if parent_only == script else parent_only
             for label, mutant in mutants.items():
                 if mutant is None or not check(mutant, True):
                     failures.append(f"{name}: mutant '{label}' was not detected")
