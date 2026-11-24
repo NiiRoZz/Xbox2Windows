@@ -42,6 +42,7 @@
 #include "console_plane_size.h"
 #include "descriptor_heap_type.h"
 #include "null_binding_cause.h"
+#include "root_constant_store.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
 #include "present_view_format.h"
@@ -1882,7 +1883,9 @@ struct Pass {
     x2w_startup::ViewTable view_tables[16]{};
     u64 source_view_heap = 0;
     u64 root_address[16] = {};       // title address of each root descriptor
-    std::uint32_t constants[16][8] = {};
+    x2w_root_constants::Store constants;          // graphics root constants (slot 40)
+    x2w_root_constants::Store compute_constants;  // compute root constants (slots 37 and 39)
+    Wrapper* compute_root_wrapper = nullptr;      // compute root signature last set by slot 33
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
     PlacedVertexView placed_vb[8] = {};
     D3D12_INDEX_BUFFER_VIEW ib = {};
@@ -1994,6 +1997,9 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     if (!list) return;
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
+    // A different root signature invalidates the title's cached compute root arguments.
+    if (pass.compute_root_wrapper != w) pass.compute_constants.clear();
+    pass.compute_root_wrapper = w;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
     if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
@@ -2267,7 +2273,7 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
     if (pass.root != params) {
         for (auto& table : pass.view_tables) table = {};
         std::fill_n(pass.root_address, 16, 0);
-        std::memset(pass.constants, 0, sizeof(pass.constants));
+        pass.constants.clear();
     }
     pass.root = params;
     pass.srv_bound = 0;
@@ -4001,6 +4007,8 @@ void build_tables()
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);
+        list_typed[37] = reinterpret_cast<ListTyped>(&list_compute_constant);
+        list_typed[39] = reinterpret_cast<ListTyped>(&list_compute_constants);
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);

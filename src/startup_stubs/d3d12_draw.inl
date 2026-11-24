@@ -1402,7 +1402,7 @@ bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UI
         values[i] = ud.kind == Translation::rect ? (rect ? 1u : 0u)
             : ud.kind == Translation::base_vertex ? static_cast<std::uint32_t>((indexed ? base_vertex : static_cast<INT>(start)) - vertex_first)
             : ud.kind == Translation::start_instance ? start_instance
-            : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants[ud.a][ud.b] : 0)
+            : ud.kind == Translation::root_constant ? ((ud.a >= 0 && ud.a < 16 && ud.b >= 0 && ud.b < 8) ? pass.constants.words[ud.a][ud.b] : 0)
             : ud.kind == Translation::stride && ud.a >= 0 && ud.a < 32 ? strides[ud.a]
             : ud.kind == Translation::d16_unorm16 && ud.a >= 0 && ud.a < 32 ? d16_unorm16[ud.a] : 0;
     }
@@ -1518,15 +1518,31 @@ void __stdcall list_table(Wrapper* self, UINT parameter, u64 gpu_handle)
     ReleaseSRWLockShared(&note_lock);
     pass.view_tables[parameter] = table;
 }
+// Keeps the words of a root constants call; a call outside the 16 x 8 words kept is logged and cut or dropped.
+static void store_root_constants(x2w_root_constants::Store& store, const char* kind, UINT parameter, UINT count,
+                                 const std::uint32_t* data, UINT offset)
+{
+    if (!count || !x2w_local::readable(data, std::size_t{count} * 4)) return;
+    const auto result = store.set(parameter, count, data, offset);
+    static LONG refused;
+    if (result != x2w_root_constants::Result::stored && first_calls(refused, 4))
+        log("x2w-render %s root constants %s: parameter %u, offset %u, count %u (16 parameters of 8 words are kept)", kind,
+            result == x2w_root_constants::Result::dropped ? "dropped" : "truncated", parameter, offset, count);
+}
 // List slot 40 (desktop 36 + 4), SetGraphicsRoot32BitConstants(parameter, count, data, offset).
 void __stdcall list_root_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)
 {
-    static LONG dropped;
-    if (count && (parameter >= 16 || offset >= 8 || count > 8 - offset) && first_calls(dropped, 4))
-        log("x2w-render root constants %s: parameter %u, offset %u, count %u (16 parameters of 8 words are kept)",
-            parameter >= 16 || offset >= 8 ? "dropped" : "truncated", parameter, offset, count);
-    if (parameter >= 16 || offset >= 8 || !count || !x2w_local::readable(data, std::size_t{count} * 4)) return;
-    for (UINT i = 0; i < count && offset + i < 8; ++i) pass_of(self).constants[parameter][offset + i] = data[i];
+    store_root_constants(pass_of(self).constants, "graphics", parameter, count, data, offset);
+}
+// List slot 37 (desktop 33 + 4), SetComputeRoot32BitConstant(parameter, value, offset).
+void __stdcall list_compute_constant(Wrapper* self, UINT parameter, UINT value, UINT offset)
+{
+    store_root_constants(pass_of(self).compute_constants, "compute", parameter, 1, &value, offset);
+}
+// List slot 39 (desktop 35 + 4), SetComputeRoot32BitConstants(parameter, count, data, offset).
+void __stdcall list_compute_constants(Wrapper* self, UINT parameter, UINT count, const std::uint32_t* data, UINT offset)
+{
+    store_root_constants(pass_of(self).compute_constants, "compute", parameter, count, data, offset);
 }
 // List slot 47 (desktop 43 + 4), IASetIndexBuffer(view).
 void __stdcall list_index_buffer(Wrapper* self, const D3D12_INDEX_BUFFER_VIEW* view)
