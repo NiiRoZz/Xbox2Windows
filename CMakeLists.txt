@@ -630,7 +630,7 @@ foreach(variant IN ITEMS check control)
     target_compile_definitions(bcpack_lanes_${variant} PRIVATE X2W_BCPACK_LANE_TESTS)
 endforeach()
 target_compile_definitions(bcpack_lanes_control PRIVATE X2W_BCPACK_LANES_CONTROL)
-set(bcpack_lane_paths scalar)
+set(bcpack_lane_paths scalar avx2)
 foreach(path IN LISTS bcpack_lane_paths)
     add_test(NAME bcpack_lanes_${path} COMMAND bcpack_lanes_check "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors" --path ${path})
     add_test(NAME bcpack_lanes_${path}_drain_control

@@ -29,7 +29,7 @@ using namespace x2w_bcpack;
 
 const uint8_t AB1[12] = { 7, 7, 4, 5, 4, 4, 5, 4, 7, 7, 7, 7 };
 const uint8_t AB7[16] = { 3, 3, 7, 7, 7, 7, 7, 6, 6, 4, 5, 7, 7, 7, 7, 4 };
-const char* const PATH_NAMES[LANE_PATH_COUNT] = { "reference", "scalar" };
+const char* const PATH_NAMES[LANE_PATH_COUNT] = { "reference", "scalar", "avx2" };
 int only_path = -1;  // --path: the one path compared with the reference
 
 // tests/bcpack_mode6_vector.py (issue #442): one BC7 block.

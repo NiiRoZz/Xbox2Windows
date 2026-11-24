@@ -11,6 +11,9 @@
 #include <utility>
 #include <algorithm>
 #include <intrin.h>
+#if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 #include "bcpack_tables.h"
 
@@ -521,14 +524,300 @@ inline bool decode_lanes_scalar(const uint8_t* input, size_t input_size,
     return false;
 }
 
-enum LanePath : int { LANE_PATH_REFERENCE, LANE_PATH_SCALAR, LANE_PATH_COUNT };
+#if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
+#define X2W_BCPACK_LANE_SIMD 1
+
+// AVX, AVX2 and POPCNT, and an OS that saves the YMM state.
+inline bool lane_avx2_supported() {
+    static const bool supported = [] {
+        int r[4];
+        __cpuid(r, 0);
+        if (r[0] < 7) return false;
+        __cpuid(r, 1);
+        const int popcnt_osxsave_avx = (1 << 23) | (1 << 27) | (1 << 28);
+        if ((r[2] & popcnt_osxsave_avx) != popcnt_osxsave_avx) return false;
+        if ((_xgetbv(0) & 0x6) != 0x6) return false;  // XMM and YMM state
+        __cpuidex(r, 7, 0);
+        return (r[1] & (1 << 5)) != 0;                // AVX2
+    }();
+    return supported;
+}
+
+// The lowest count set bits of mask. Not pdep, which is microcoded on AMD cores before Zen 3.
+inline uint32_t lowest_bits(uint32_t mask, uint32_t count) {
+    uint32_t kept = 0;
+    for (uint32_t k = 0; k < count; ++k, mask &= mask - 1) kept |= mask & (0u - mask);
+    return kept;
+}
+
+// For each 8-bit lane mask, the source byte of every lane when the set lanes take consecutive bytes.
+struct LaneExpandTable {
+    uint8_t index[256][8];
+    constexpr LaneExpandTable() : index() {
+        for (int m = 0; m < 256; ++m) {
+            int next = 0;
+            for (int lane = 0; lane < 8; ++lane) index[m][lane] = static_cast<uint8_t>((m >> lane) & 1 ? next++ : 0);
+        }
+    }
+};
+inline constexpr LaneExpandTable LANE_EXPAND{};
+
+// decode_lanes_scalar with each per-lane field of up to 16 lanes held as two 8-lane AVX2 halves. The
+// byte arbitration is a mask computation: the first min(8, bytes left) requesting lanes, in lane order,
+// receive the next stream bytes (lowest_bits picks them; LANE_EXPAND with vpermd places them). Lanes
+// whose step is a header, an idle start, a fragment end or a flush run the existing phase1 one by one,
+// in lane order, after the vector step. Phase 0 of every lane precedes every phase 1, as in the
+// reference, so a rejection leaves the same symbols. Within a segment the symbol's interval follows
+// from the inverse (model_inverse_interval). Lane masks are kept as bits; vector masks are rebuilt from
+// them, and unsigned compares use a sign flip.
+inline bool decode_lanes_avx2_body(const uint8_t* input, size_t input_size,
+                                   const uint8_t* alphabet_bits, size_t num_lanes,
+                                   size_t target_symbols_per_lane,
+                                   std::vector<uint16_t>& symbols) {
+    if (num_lanes == 0 || num_lanes > 16 || target_symbols_per_lane == 0) return false;
+    for (size_t i = 0; i < num_lanes; ++i) {
+        if (alphabet_bits[i] > 8) return false;
+    }
+    symbols.assign(num_lanes * target_symbols_per_lane, 0);
+    const size_t target = target_symbols_per_lane;
+    const uint32_t lane_mask = (1u << num_lanes) - 1;
+
+    Lane lanes[16];
+    alignas(32) uint32_t p0[16] = {}, p1[16] = {}, in_rem[16] = {}, out_rem[16] = {};
+    alignas(32) uint32_t sym[16] = {}, lane_f[16] = {}, lane_cf[16] = {}, ib[16] = {};
+    alignas(32) uint32_t bound[9][16], base_rn[10][16], freq_rs[10][16], rf[10][16];
+    uint32_t nsyms[16] = {};
+    uint8_t row_eab[16], row_q[16];
+    auto load_rows = [&](size_t i) {
+        const uint8_t e = lanes[i].eab, q = lanes[i].q;
+        row_eab[i] = e;
+        row_q[i] = q;
+        for (uint32_t k = 1; k < 10; ++k) bound[k - 1][i] = (k <= e + 1u) ? BASE_TABLE[e][q][k] : 0x10000u;
+        for (uint32_t k = 0; k < 10; ++k) {
+            base_rn[k][i] = BASE_TABLE[e][q][k] | (uint32_t(RN_TABLE[e][q][k]) << 16);
+            freq_rs[k][i] = FREQ_TABLE[e][q][k] | (uint32_t(RS_TABLE[e][q][k]) << 16);
+            rf[k][i] = RF_TABLE[e][q][k];
+        }
+    };
+    for (size_t i = 0; i < 16; ++i) {
+        if (i < num_lanes) {
+            lanes[i].ab = alphabet_bits[i];
+            lanes[i].target = static_cast<uint32_t>(target);
+        }
+        load_rows(i);
+    }
+    uint32_t ib_full = 0, sym_full = 0, proc = 0, drain = 0, header = 0, quiet = 0, done = 0;
+    auto set_bit = [](uint32_t& m, uint32_t bit, bool on) { m = on ? (m | bit) : (m & ~bit); };
+
+    const __m256i one = _mm256_set1_epi32(1), low16 = _mm256_set1_epi32(0xFFFF), sign = _mm256_set1_epi32(INT32_MIN);
+    const __m256i home_s = _mm256_set1_epi32(static_cast<int>(0x1000000u ^ 0x80000000u));
+    const __m256i drain_min_s = _mm256_set1_epi32(static_cast<int>(LANE_DRAIN_SHORT_MIN ^ 0x80000000u));
+    const __m256i lane_bits = _mm256_set_epi32(128, 64, 32, 16, 8, 4, 2, 1);
+    const __m256i lane_index = _mm256_set_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+    auto bits_of = [](__m256i lo, __m256i hi) {
+        return static_cast<uint32_t>(_mm256_movemask_ps(_mm256_castsi256_ps(lo))) |
+               (static_cast<uint32_t>(_mm256_movemask_ps(_mm256_castsi256_ps(hi))) << 8);
+    };
+    auto mask_of = [&](uint32_t m, int h) {
+        return _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(static_cast<int>((m >> (8 * h)) & 0xFF)), lane_bits), lane_bits);
+    };
+    auto load = [](const uint32_t* a, int h) { return _mm256_load_si256(reinterpret_cast<const __m256i*>(a + 8 * h)); };
+    auto store = [](uint32_t* a, int h, __m256i v) { _mm256_store_si256(reinterpret_cast<__m256i*>(a + 8 * h), v); };
+
+    uint32_t slots = 0;
+    size_t pos = 0;
+    uint64_t cycle = 0;
+    uint64_t max_cycles = 64ull * (num_lanes * target_symbols_per_lane + input_size) + 1000;
+    uint64_t total_syms = 0;
+    size_t last_pos = SIZE_MAX;
+    uint64_t last_total_syms = UINT64_MAX;
+    uint32_t last_state_sum = UINT32_MAX;
+    uint64_t last_change = 0;
+    uint32_t state_sum = 0;
+
+    while (cycle < max_cycles) {
+        __m256i v_in_rem[2], v_ib[2], v_p0[2], v_p1[2], v_x[2], v_out[2];
+        for (int h = 0; h < 2; ++h) v_in_rem[h] = load(in_rem, h);
+        const uint32_t in_left = ~bits_of(_mm256_cmpeq_epi32(v_in_rem[0], _mm256_setzero_si256()),
+                                          _mm256_cmpeq_epi32(v_in_rem[1], _mm256_setzero_si256())) & 0xFFFF;
+        const uint32_t blocked = sym_full & slots;
+        const uint32_t need = ~ib_full & (header | (proc & in_left)) & lane_mask;
+        const uint32_t request = need & ~blocked;
+        const size_t left = input_size - pos;
+        const uint32_t avail = left < 8 ? static_cast<uint32_t>(left) : 8u;
+        uint32_t valid = request;
+        if (static_cast<uint32_t>(_mm_popcnt_u32(request)) > avail) valid = lowest_bits(request, avail);
+        const uint32_t run = lane_mask & ~((need & ~valid) | blocked);
+        uint64_t raw = 0;
+        if (avail != 0) std::memcpy(&raw, input + pos, avail);
+        const uint32_t low_taken = static_cast<uint32_t>(_mm_popcnt_u32(valid & 0xFF));
+        const uint64_t raw_half[2] = { raw, low_taken < 8 ? raw >> (8 * low_taken) : 0 };
+        ib_full |= valid;
+        pos += _mm_popcnt_u32(valid);
+
+        const uint32_t pd = proc | drain;
+        const uint32_t emit = run & sym_full;
+        for (int h = 0; h < 2; ++h) {
+            const uint32_t vh = (valid >> (8 * h)) & 0xFF;
+            const __m256i bytes = _mm256_permutevar8x32_epi32(
+                _mm256_cvtepu8_epi32(_mm_cvtsi64_si128(static_cast<long long>(raw_half[h]))),
+                _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(LANE_EXPAND.index[vh]))));
+            v_ib[h] = _mm256_blendv_epi8(load(ib, h), bytes, mask_of(valid, h));
+            v_p1[h] = load(p1, h);
+            const __m256i adv = _mm256_sub_epi32(
+                _mm256_add_epi32(_mm256_mullo_epi32(load(lane_f, h), _mm256_srli_epi32(v_p1[h], 16)), _mm256_and_si256(v_p1[h], low16)),
+                load(lane_cf, h));
+            v_p0[h] = _mm256_blendv_epi8(load(p0, h), _mm256_blendv_epi8(v_p1[h], adv, mask_of(sym_full, h)), mask_of(run & pd, h));
+        }
+        for (uint32_t m = emit; m != 0; m &= m - 1) {
+            unsigned long i;
+            _BitScanForward(&i, m);
+            symbols[i * target + nsyms[i]++] = static_cast<uint16_t>(sym[i]);
+        }
+        slots |= emit;
+        total_syms += _mm_popcnt_u32(emit);
+        sym_full &= ~run;
+
+        __m256i below_home[2], in_is_will[2], below_drain_min[2], above_home[2], out_left[2];
+        for (int h = 0; h < 2; ++h) {
+            below_home[h] = _mm256_cmpgt_epi32(home_s, _mm256_xor_si256(v_p0[h], sign));
+        }
+        const uint32_t will = proc & run & in_left & ib_full & bits_of(below_home[0], below_home[1]);
+        for (int h = 0; h < 2; ++h) {
+            const __m256i wm = mask_of(will, h);
+            v_x[h] = _mm256_blendv_epi8(v_p0[h], _mm256_or_si256(_mm256_slli_epi32(v_p0[h], 8), v_ib[h]), wm);
+            in_is_will[h] = _mm256_cmpeq_epi32(v_in_rem[h], _mm256_and_si256(wm, one));
+            const __m256i xs = _mm256_xor_si256(v_x[h], sign);
+            below_drain_min[h] = _mm256_cmpgt_epi32(drain_min_s, xs);
+            above_home[h] = _mm256_cmpgt_epi32(xs, home_s);
+            v_out[h] = load(out_rem, h);
+            out_left[h] = _mm256_cmpeq_epi32(v_out[h], _mm256_setzero_si256());
+        }
+        const uint32_t edge = (proc & bits_of(in_is_will[0], in_is_will[1])) | (drain & bits_of(below_drain_min[0], below_drain_min[1]));
+        const uint32_t simple = run & pd & ~edge;
+        const uint32_t generic = run & ((~pd & ~quiet) | (pd & edge));
+        const uint32_t nsf = simple & bits_of(above_home[0], above_home[1]) & ~bits_of(out_left[0], out_left[1]);
+        const uint32_t consumed = simple & will;
+        for (int h = 0; h < 2; ++h) {
+            if (((nsf >> (8 * h)) & 0xFF) != 0) {
+                const __m256i c = _mm256_and_si256(v_x[h], low16);
+                __m256i seg = _mm256_set1_epi32(9);
+                for (int k = 0; k < 9; ++k) seg = _mm256_add_epi32(seg, _mm256_cmpgt_epi32(load(bound[k], h), c));
+                const __m256i idx = _mm256_add_epi32(_mm256_slli_epi32(seg, 4), lane_index);
+                const __m256i v_base_rn = _mm256_i32gather_epi32(reinterpret_cast<const int*>(&base_rn[0][8 * h]), idx, 4);
+                const __m256i v_freq_rs = _mm256_i32gather_epi32(reinterpret_cast<const int*>(&freq_rs[0][8 * h]), idx, 4);
+                const __m256i v_rf = _mm256_i32gather_epi32(reinterpret_cast<const int*>(&rf[0][8 * h]), idx, 4);
+                const __m256i base = _mm256_and_si256(v_base_rn, low16);
+                const __m256i freq = _mm256_and_si256(v_freq_rs, low16);
+                const __m256i dist = _mm256_and_si256(_mm256_add_epi32(_mm256_sub_epi32(c, base), _mm256_srli_epi32(v_base_rn, 16)), low16);
+                const __m256i steps = _mm256_and_si256(
+                    _mm256_srlv_epi32(_mm256_srli_epi32(_mm256_mullo_epi32(dist, v_rf), 15), _mm256_srli_epi32(v_freq_rs, 16)),
+                    _mm256_set1_epi32(0x1FF));
+                const __m256i s = _mm256_and_si256(_mm256_add_epi32(_mm256_srli_epi32(_mm256_sllv_epi32(one, seg), 1), steps),
+                                                   _mm256_set1_epi32(0x1FF));
+                const __m256i cfa = _mm256_and_si256(_mm256_add_epi32(base, _mm256_mullo_epi32(freq, steps)), low16);
+                const __m256i zero = _mm256_cmpeq_epi32(cfa, _mm256_setzero_si256());
+                const __m256i k = mask_of(nsf, h);
+                store(sym, h, _mm256_blendv_epi8(load(sym, h), s, k));
+                store(lane_f, h, _mm256_blendv_epi8(load(lane_f, h),
+                                                     _mm256_blendv_epi8(freq, _mm256_and_si256(_mm256_sub_epi32(freq, one), low16), zero), k));
+                store(lane_cf, h, _mm256_blendv_epi8(load(lane_cf, h), _mm256_blendv_epi8(cfa, one, zero), k));
+                v_out[h] = _mm256_add_epi32(v_out[h], k);  // k is -1 where a symbol was decoded
+            }
+            store(p0, h, v_p0[h]);
+            store(p1, h, _mm256_blendv_epi8(v_p1[h], v_x[h], mask_of(simple, h)));
+            store(in_rem, h, _mm256_add_epi32(v_in_rem[h], mask_of(consumed, h)));
+            store(out_rem, h, v_out[h]);
+            store(ib, h, v_ib[h]);
+        }
+        sym_full |= nsf;
+        ib_full &= ~consumed;
+
+        for (uint32_t m = generic; m != 0; m &= m - 1) {
+            unsigned long i;
+            _BitScanForward(&i, m);
+            const uint32_t bit = 1u << i;
+            Lane& ln = lanes[i];
+            ln.p0 = p0[i];
+            ln.p1 = p1[i];
+            ln.in_rem = in_rem[i];
+            ln.out_rem = out_rem[i];
+            ln.sym = static_cast<uint16_t>(sym[i]);
+            ln.ib = static_cast<uint8_t>(ib[i]);
+            ln.ib_full = (ib_full & bit) != 0;
+            ln.sym_full = (sym_full & bit) != 0;
+            const uint32_t old_state = ln.state;
+            if (!phase1(ln)) return false;
+            p0[i] = ln.p0;
+            p1[i] = ln.p1;
+            in_rem[i] = ln.in_rem;
+            out_rem[i] = ln.out_rem;
+            sym[i] = ln.sym;
+            set_bit(ib_full, bit, ln.ib_full);
+            set_bit(sym_full, bit, ln.sym_full);
+            if (ln.sym_full) model_forward(ln.eab, ln.q, ln.sym, lane_f[i], lane_cf[i]);
+            state_sum += static_cast<uint32_t>(ln.state) - old_state;
+            set_bit(proc, bit, ln.state == LANE_PROC);
+            set_bit(drain, bit, ln.state == LANE_DRAIN);
+            set_bit(header, bit, ln.state >= LANE_HDR0 && ln.state <= LANE_HDR2);
+            set_bit(quiet, bit, ln.state == LANE_IDLE && !ln.go);
+            set_bit(done, bit, ln.done);
+            if (ln.eab != row_eab[i] || ln.q != row_q[i]) load_rows(i);
+        }
+
+        const uint32_t settled = done & ~sym_full;
+        const uint32_t active = lane_mask & ~(settled & ~slots);
+        if (slots != 0 && (slots & active) == active) {
+            slots = 0;
+        }
+        cycle++;
+        if ((settled & lane_mask) == lane_mask) {
+            for (size_t i = 0; i < num_lanes; ++i) {
+                uint32_t f = lanes[i].final_state;
+                if (f != 0x1000000 && f != 0x10000 && f != 0x100) {
+                    return false;
+                }
+            }
+            for (size_t p = pos; p < input_size; ++p) {
+                if (input[p] != 0) return false;
+            }
+            return true;
+        }
+
+        if (pos != last_pos || total_syms != last_total_syms || state_sum != last_state_sum) {
+            last_pos = pos;
+            last_total_syms = total_syms;
+            last_state_sum = state_sum;
+            last_change = cycle;
+        } else if (cycle - last_change > 64) {
+            return false;
+        }
+    }
+    return false;
+}
+
+inline bool decode_lanes_avx2(const uint8_t* input, size_t input_size,
+                              const uint8_t* alphabet_bits, size_t num_lanes,
+                              size_t target_symbols_per_lane,
+                              std::vector<uint16_t>& symbols) {
+    bool ok = decode_lanes_avx2_body(input, input_size, alphabet_bits, num_lanes, target_symbols_per_lane, symbols);
+    _mm256_zeroupper();
+    return ok;
+}
+#endif
+
+enum LanePath : int { LANE_PATH_REFERENCE, LANE_PATH_SCALAR, LANE_PATH_AVX2, LANE_PATH_COUNT };
 
 inline bool lane_path_supported(int path) {
-    return path == LANE_PATH_REFERENCE || path == LANE_PATH_SCALAR;
+    if (path == LANE_PATH_REFERENCE || path == LANE_PATH_SCALAR) return true;
+#ifdef X2W_BCPACK_LANE_SIMD
+    if (path == LANE_PATH_AVX2) return lane_avx2_supported();
+#endif
+    return false;
 }
 
 inline int best_lane_path() {
-    return LANE_PATH_SCALAR;
+    return lane_path_supported(LANE_PATH_AVX2) ? LANE_PATH_AVX2 : LANE_PATH_SCALAR;
 }
 
 #ifdef X2W_BCPACK_LANE_TESTS
@@ -546,6 +835,10 @@ inline bool decode_lanes_on(int path, const uint8_t* input, size_t input_size,
         return decode_lanes_reference(input, input_size, alphabet_bits, num_lanes, target_symbols_per_lane, symbols);
     case LANE_PATH_SCALAR:
         return decode_lanes_scalar(input, input_size, alphabet_bits, num_lanes, target_symbols_per_lane, symbols);
+#ifdef X2W_BCPACK_LANE_SIMD
+    case LANE_PATH_AVX2:
+        return decode_lanes_avx2(input, input_size, alphabet_bits, num_lanes, target_symbols_per_lane, symbols);
+#endif
     default:
         return false;
     }
