@@ -20,15 +20,16 @@
 // 8. A placeholder split in two, its first piece replaced by committed private memory: a buffer inside
 //    the piece and one ending in the placeholder after it.
 // 8b. Other private allocations: MEM_WRITE_WATCH, MEM_TOP_DOWN, PAGE_EXECUTE_READWRITE, a heap block
-//    (its allocation starts with reserved pages, so nothing from its base is committed), an AWE reservation (MEM_PHYSICAL, nothing
-//    committed) and, when the process may lock pages, MEM_LARGE_PAGES (otherwise reported, not run).
+//    (compare the observed layout with the full walk), a reservation with only its second 64 KiB
+//    committed, an AWE reservation (MEM_PHYSICAL, nothing committed) and, when the process may lock
+//    pages, MEM_LARGE_PAGES (otherwise reported, not run).
 // 9. Cost: a 512 MiB committed private block with one page touched per 64 KiB, 64 buffers spread over
 //    it. Decisions as above; in addition every placement must be proven without VirtualQuery (a call
 //    count, not a time). The time per placement of the full walk, the bounded walk and the exact
 //    proof is printed.
 //
 // --mutate region-only trusts the allocation size without checking that every page is committed: it
-// exits 1 only if decisions differ in the partly committed cases (2, 4, 4b, 7) and nowhere else.
+// exits 1 only if decisions differ in the partly committed cases and nowhere else.
 // --mutate walk-only never uses the region information: it exits 1 only if the call count of case 9
 // fails and nothing else does. Either exits 0 otherwise, so its WILL_FAIL test fails. A refused
 // allocation or mapping is a capability skip (77) in the controls and a failure in the main check.
@@ -103,8 +104,8 @@ UINT64 offset_of(const void* address, const void* base)
 }
 
 // One placement: the full walk and measure_placed_buffer on the same memory, the slot-133 decision
-// from each, compared. expect is the decision the case requires (1 alias, 0 refuse), which also checks
-// the reference itself. range receives the measurement for the cost case.
+// from each, compared. expect also checks the reference when the layout is controlled (1 alias,
+// 0 refuse). Pass -1 to compare the decisions on an allocator's observed layout.
 bool place(void* address, UINT64 width, int expect, const char* what, x2w_startup::PlacedBufferRange* range_out = nullptr)
 {
     const Full full = full_walk(address);
@@ -125,7 +126,7 @@ bool place(void* address, UINT64 width, int expect, const char* what, x2w_startu
                      full.base, full.type, full.bytes, full_alias, committed, range.base, range.type, range.covered,
                      range.region_info, alias);
         fail(what, address);
-    } else if (static_cast<int>(alias) != expect) {
+    } else if (expect >= 0 && static_cast<int>(alias) != expect) {
         std::fprintf(stderr, "  %s: both give alias=%d, the case expects %d\n", what, alias, expect);
         fail(what, address);
     }
@@ -326,21 +327,31 @@ int main(int argc, char** argv)
         } else {
             setup_fail("cannot allocate executable memory", nullptr);
         }
-        // A large heap block is its own allocation, and its first pages are only reserved: the committed
-        // run from the base is empty, so every buffer in it is refused.
+        // The heap allocator can commit the allocation's prefix. Check its actual layout against the
+        // full walk and construct the reserved-prefix case separately.
         HANDLE heap = HeapCreate(0, 0, 0);
         auto* block = heap ? static_cast<char*>(HeapAlloc(heap, 0, 4u << 20)) : nullptr;
         MEMORY_BASIC_INFORMATION info{};
-        if (!block || !VirtualQuery(block, &info, sizeof(info))) {
+        if (!block || VirtualQuery(block, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT) {
             setup_fail("cannot allocate a 4 MiB heap block", block);
         } else {
             auto* base = static_cast<char*>(info.AllocationBase);
             current = partial;
-            place(base + page, page, 0, "heap block: buffer in the committed part, base page reserved");
-            place(base + page, 5u << 20, 0, "heap block: buffer ending past the allocation");
+            place(base + page, page, -1, "heap block near its allocation base");
+            place(base + page, 5u << 20, -1, "heap block span wider than the heap request");
             current = other;
         }
         if (heap) HeapDestroy(heap);
+        auto* reservation = static_cast<char*>(VirtualAlloc(nullptr, 2 * page, MEM_RESERVE, PAGE_READWRITE));
+        if (reservation && VirtualAlloc(reservation + page, page, MEM_COMMIT, PAGE_READWRITE)) {
+            current = partial;
+            place(reservation + page, page, 0, "committed suffix after a reserved prefix");
+            place(reservation + page, 2 * page, 0, "committed suffix with buffer past the allocation");
+            current = other;
+        } else {
+            setup_fail("cannot construct an allocation with a reserved prefix", reservation);
+        }
+        if (reservation) VirtualFree(reservation, 0, MEM_RELEASE);
         if (auto* p = static_cast<char*>(VirtualAlloc(nullptr, 16 * page, MEM_RESERVE | MEM_PHYSICAL, PAGE_READWRITE))) {
             current = partial;
             place(p, page, 0, "AWE reservation: nothing committed");

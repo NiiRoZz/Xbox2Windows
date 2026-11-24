@@ -1431,16 +1431,25 @@ class Stage:
         if not m:
             raise Unsupported(base)
         writes_exec, cond, typ, sdwa = m.group(1) == 'x', m.group(2), m.group(3), bool(m.group(4))
-        table = {'lt': '{0} < {1}', 'eq': '{0} == {1}', 'le': '{0} <= {1}', 'gt': '{0} > {1}', 'lg': '{0} != {1}', 'ne': '{0} != {1}',
-                 'ge': '{0} >= {1}', 'neq': '!({0} == {1})', 'nlt': '!({0} < {1})', 'nle': '!({0} <= {1})', 'ngt': '!({0} > {1})',
-                 'nge': '!({0} >= {1})', 'nlg': '!({0} != {1})', 'o': '({0} == {0} && {1} == {1})', 'u': '({0} != {0} || {1} != {1})',
+        # f32 lg is ordered and not equal (false when either source is NaN) and nlg its negation (#1920).
+        # HLSL != is unordered, so lg reads as less or greater, behind {2}: both source words not NaN,
+        # tested on their bits. DXC marks float compares fast unless -Gis, and a driver may then fold
+        # less-or-greater into an unordered not-equal.
+        # FXC without /Gis compiles !(a < b) to a >= b, false on NaN, and DXC without -Gis folds x != x
+        # and x == x to constants (#1936). So nlt, nle, ngt and nge negate an ordered relation behind {2},
+        # and o and u read {2} alone; the startup cache compiles with FXC and no flags.
+        table = {'lt': '{0} < {1}', 'eq': '{0} == {1}', 'le': '{0} <= {1}', 'gt': '{0} > {1}',
+                 'lg': '({2} && ({0} < {1} || {0} > {1}))', 'ne': '{0} != {1}',
+                 'ge': '{0} >= {1}', 'neq': '!({0} == {1})', 'nlt': '!({2} && {0} < {1})',
+                 'nle': '!({2} && {0} <= {1})', 'ngt': '!({2} && {0} > {1})', 'nge': '!({2} && {0} >= {1})',
+                 'nlg': '!({2} && ({0} < {1} || {0} > {1}))', 'o': '({2})', 'u': '!({2})',
                  't': 'true', 'f': 'false'}
         # Conditions outside the table, v_cmp_class_* among them, stay refused in both forms.
         if cond not in table:
             raise Unsupported(base)
         if sdwa and typ == 'f32':
-            # The f32 predicates are shared with the non-SDWA forms, whose lg/nlg do not yet follow the
-            # ordered RDNA 2 definition for NaN (#1920). SDWA keeps them refused until that is verified.
+            # The f32 predicates are verified on the plain and e64 forms only (#1920); the SDWA forms
+            # stay refused until they are verified too.
             raise Unsupported('%s: f32 SDWA compares are not lowered' % base)
         if sdwa:
             # v_cmpx_*_sdwa prints its two sources and writes EXEC (gfx10 forbids sdst_en there);
@@ -1462,7 +1471,17 @@ class Stage:
             x, y = 'int(%s)' % self.u(a), 'int(%s)' % self.u(b)
         else:
             x, y = self.u(a), self.u(b)
-        expr = '((%s) ? 1u : 0u)' % table[cond].format(x, y)
+        def word(tok):
+            # A float source's word before its neg/abs modifiers, as f() reads them; they keep a NaN a NaN.
+            if tok.startswith('-') and not re.match(r'-[\d.]', tok):
+                tok = tok[1:]
+            if tok.startswith('|') and tok.endswith('|'):
+                tok = tok[1:-1]
+            return self.u(tok)
+        ordered = ''
+        if '{2}' in table[cond]:
+            ordered = ' && '.join('(%s & 0x7fffffffu) <= 0x7f800000u' % word(t) for t in (a, b))
+        expr = '((%s) ? 1u : 0u)' % table[cond].format(x, y, ordered)
         if not self.exec_known:
             expr = '(exec & %s)' % expr
         if writes_exec or dst in ('exec', 'exec_lo'):

@@ -366,6 +366,7 @@ def controls():
     scalar_alu_controls()
     mbcnt_controls()
     bcnt_exec_controls()
+    vadd_nc_i32_controls()
     cvt_u32_f32_controls()
     ff1_exec_controls()
     writelane_controls()
@@ -2019,6 +2020,133 @@ def cvt_u32_f32_draw(directory, compiler, renderer, backend):
         bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
         if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
             raise AssertionError(f"cvt_u32_f32: mutation '{label}' escaped detection")
+    return 0
+
+
+VADD_NC_I32 = [
+    "s_mov_b32 s9, 0",
+    "s_load_dwordx4 s[12:15], s[8:9], null",
+    "s_mov_b32 s4, 0x80000005",
+    "s_mov_b32 s5, 0x80000001",
+    "v_lshl_add_u32 v3, s10, 6, v0",
+    "v_add_nc_i32 v4, v3, 0x7ffffff0",
+    "v_sub_nc_i32 v5, s5, v3",
+    "v_add_nc_i32 v6, v4, -16",
+    "v_sub_nc_i32 v7, v6, v5",
+    "v_add_nc_i32 v8, v7, s4",
+    "s_waitcnt lgkmcnt(0)",
+    "buffer_store_dword v8, v3, s[12:15], 0 idxen",
+    "s_endpgm",
+]
+VADD_NC_I32_BINDING = dict(table_reg=8, descriptor_offset=0, group_reg=10, stride=4)
+
+
+def _signed32(word):
+    return word - 0x100000000 if word >= 0x80000000 else word
+
+
+def _clamp32(val):
+    return max(-0x80000000, min(0x7fffffff, val)) & 0xffffffff
+
+
+def vadd_nc_i32_words(*, add_op=lambda a, b: (a + b) & 0xffffffff,
+                      sub_op=lambda a, b: (a - b) & 0xffffffff):
+    """Independent reference for VADD_NC_I32: 32-bit two's-complement wrap-around without carry-out."""
+    words = [SENTINEL] * 320
+    for flat in range(64):
+        v4 = add_op(flat, 0x7ffffff0)
+        v5 = sub_op(0x80000001, flat)
+        v6 = add_op(v4, -16)
+        v7 = sub_op(v6, v5)
+        v8 = add_op(v7, 0x80000005)
+        words[flat] = v8
+    return words
+
+
+def vadd_nc_i32_controls():
+    """v_add_nc_i32 / v_sub_nc_i32: exact HLSL output and one rejection per unsupported operand or modifier."""
+    lines = aot.lower(VADD_NC_I32, 64, **VADD_NC_I32_BINDING).splitlines()
+    expected_expr = "((((tid.x + 0x7ffffff0u) + 0xfffffff0u) - (0x80000001u - tid.x)) + 0x80000005u)"
+    assert lines[3] == f"    outputData.Store(tid.x * 4u + 0u, {expected_expr});", lines
+    # 1. Unknown or pending sources
+    rejects("Unverified ALU operand", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v4, s30, 0x7ffffff0")), 64, **VADD_NC_I32_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v4, v40, 0x7ffffff0")), 64, **VADD_NC_I32_BINDING)
+    rejects("Unverified ALU operand", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v4, s12, 0x7ffffff0")), 64, **VADD_NC_I32_BINDING)
+    # 2. clamp and omod modifiers are refused
+    rejects("Unsupported compute instruction: v_add_nc_i32 v4, v3, 0x7ffffff0 clamp", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v4, v3, 0x7ffffff0 clamp")), 64, **VADD_NC_I32_BINDING)
+    rejects("Unsupported compute instruction: v_sub_nc_i32 v5, s5, v3 clamp", aot.lower,
+            variant(VADD_NC_I32, ("v5, s5, v3", "v5, s5, v3 clamp")), 64, **VADD_NC_I32_BINDING)
+    rejects("Unsupported compute instruction: v_add_nc_i32 v4, v3, 0x7ffffff0 mul:2", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v4, v3, 0x7ffffff0 mul:2")), 64, **VADD_NC_I32_BINDING)
+    # 3. Source modifiers are refused
+    for bad_src in ("-v3", "|v3|", "neg(v3)"):
+        rejects(f"Unsupported compute instruction: v_add_nc_i32 v4, {bad_src}, 0x7ffffff0", aot.lower,
+                variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", f"v4, {bad_src}, 0x7ffffff0")), 64, **VADD_NC_I32_BINDING)
+    # 4. Invalid destination
+    rejects("Unverified ALU operand", aot.lower,
+            variant(VADD_NC_I32, ("v4, v3, 0x7ffffff0", "v256, v3, 0x7ffffff0")), 64, **VADD_NC_I32_BINDING)
+    # 5. Other spellings (_e32 / _e64)
+    for bad_op in ("v_add_nc_i32_e32", "v_add_nc_i32_e64"):
+        rejects(f"Unsupported compute instruction: {bad_op} v4, v3, 0x7ffffff0", aot.lower,
+                variant(VADD_NC_I32, ("v_add_nc_i32 v4, v3, 0x7ffffff0", f"{bad_op} v4, v3, 0x7ffffff0")),
+                64, **VADD_NC_I32_BINDING)
+    for bad_op in ("v_sub_nc_i32_e32", "v_sub_nc_i32_e64"):
+        rejects(f"Unsupported compute instruction: {bad_op} v5, s5, v3", aot.lower,
+                variant(VADD_NC_I32, ("v_sub_nc_i32 v5, s5, v3", f"{bad_op} v5, s5, v3")),
+                64, **VADD_NC_I32_BINDING)
+
+
+def vadd_nc_i32_binary(directory, assembler, objcopy, library):
+    """The assembled VADD_NC_I32 program decodes to its text and lowers to the same translation."""
+    decoded = aot.labelled(disassemble(assemble(directory, assembler, objcopy, VADD_NC_I32), library, offsets=True))
+    assert [line for line in decoded if line.startswith(("v_add_nc_i32", "v_sub_nc_i32"))] == [
+        line for line in VADD_NC_I32 if line.startswith(("v_add_nc_i32", "v_sub_nc_i32"))], decoded
+    assert aot.lower(decoded, 64, **VADD_NC_I32_BINDING) == aot.lower(VADD_NC_I32, 64, **VADD_NC_I32_BINDING)
+
+
+def vadd_nc_i32_draw(directory, compiler, renderer, backend):
+    src, cso, case = [directory / x for x in ("vadd_nc_i32.hlsl", "vadd_nc_i32.cso", "vadd_nc_i32.case")]
+    source = aot.lower(VADD_NC_I32, 64, **VADD_NC_I32_BINDING)
+    src.write_text(source, encoding="ascii")
+    subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", cso, src], check=True)
+    cmd = [renderer, backend, "--compute-store-case", cso, case]
+    expected = vadd_nc_i32_words()
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    result = subprocess.run(cmd)
+    if result.returncode:
+        return result.returncode
+    off = list(expected)
+    off[64] ^= 1
+    for label, reference, word in (
+            ("add as sub", vadd_nc_i32_words(add_op=lambda a, b: (a - b) & 0xffffffff), 0),
+            ("sub as add", vadd_nc_i32_words(sub_op=lambda a, b: (a + b) & 0xffffffff), 0),
+            ("signed clamp instead of wrap",
+             vadd_nc_i32_words(
+                 add_op=lambda a, b: _clamp32(_signed32(a & 0xffffffff) + _signed32(b & 0xffffffff)),
+                 sub_op=lambda a, b: _clamp32(_signed32(a & 0xffffffff) - _signed32(b & 0xffffffff))), 0),
+            ("sentinel past group", off, 64)):
+        assert next(i for i, (a, b) in enumerate(zip(expected, reference)) if a != b) == word, label
+        case.write_bytes(struct.pack("<321I", 1, *reference))
+        bad = subprocess.run(cmd, capture_output=True, text=True)
+        if bad.returncode != 1 or f"word={word} expected=" not in bad.stderr:
+            raise AssertionError(f"vadd_nc_i32: reference '{label}' escaped detection\n{bad.stderr}")
+    case.write_bytes(struct.pack("<321I", 1, *expected))
+    for label, mutated in (
+            ("add replaced by sub", source.replace("+ 0x7ffffff0u)", "- 0x7ffffff0u)")),
+            ("sub replaced by add", source.replace("0x80000001u - tid.x", "0x80000001u + tid.x")),
+            ("literal off by one", source.replace("0x7ffffff0u", "0x7ffffff1u"))):
+        if mutated == source:
+            raise AssertionError(f"vadd_nc_i32: mutation '{label}' did not change the source")
+        msrc, mcso = directory / "mutated.hlsl", directory / "mutated.cso"
+        msrc.write_text(mutated, encoding="ascii")
+        subprocess.run([compiler, "-T", "cs_6_0", "-E", "main", "-Fo", mcso, msrc], check=True)
+        bad = subprocess.run([*cmd[:3], mcso, case], capture_output=True, text=True)
+        if bad.returncode != 1 or "Compute readback differs" not in bad.stderr:
+            raise AssertionError(f"vadd_nc_i32: mutation '{label}' escaped detection")
     return 0
 
 
@@ -4253,6 +4381,7 @@ def binary(directory, assembler, objcopy, library):
     scalar_alu_binary(directory, assembler, objcopy, library)
     mbcnt_binary(directory, assembler, objcopy, library)
     bcnt_exec_binary(directory, assembler, objcopy, library)
+    vadd_nc_i32_binary(directory, assembler, objcopy, library)
     cvt_u32_f32_binary(directory, assembler, objcopy, library)
     ff1_exec_binary(directory, assembler, objcopy, library)
     writelane_binary(directory, assembler, objcopy, library)
@@ -7010,6 +7139,7 @@ if __name__ == "__main__":
                  "draw-cvt-u32-f32": cvt_u32_f32_draw,
                  "draw-mbcnt": mbcnt_draw,
                  "draw-bcnt-exec": bcnt_exec_draw,
+                 "draw-vadd_nc_i32": vadd_nc_i32_draw,
                  "draw-ff1-exec": ff1_exec_draw,
                  "draw-writelane": writelane_draw,
                  "draw-mtbuf-store": mtbuf_store_draw,

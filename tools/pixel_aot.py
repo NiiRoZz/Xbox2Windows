@@ -1313,6 +1313,8 @@ DPP_CVT = {
     "cvt_off_f32_i4": (False, "(float(asint({0} << 28) >> 28) * 0.0625f)", None),
     "cvt_i32_f32": (True, "asfloat(cvt_i32_f32({0}))", "cvt_i32_f32"),
     "cvt_u32_f32": (True, "asfloat(cvt_u32_f32({0}))", "cvt_u32_f32"),
+    "cvt_flr_i32_f32": (True, "asfloat(cvt_flr_i32_f32({0}))", "cvt_flr_i32_f32"),
+    "cvt_rpi_i32_f32": (True, "asfloat(cvt_rpi_i32_f32({0}))", "cvt_rpi_i32_f32"),
 }
 DPP_INT32 = {
     "not_b32": (1, "(~{0})", None),
@@ -1403,6 +1405,11 @@ DPP_MOVREL_PATTERN = re.compile(rf"({'|'.join(DPP_MOVREL)}) (.+)")
 # The plain VOP1 (e32) and VOP3 (e64) encodings of the same four moves, as LLVM 15 prints them for gfx1013 and
 # gfx1030 (two VGPR operands; the VOP3 form takes no clamp, omod or source modifier in that spelling).
 PLAIN_MOVREL_PATTERN = re.compile(r"(v_movreld_b32|v_movrels_b32|v_movrelsd_b32|v_movrelsd_2_b32)_e(?:32|64) (v\d+), (v\d+)")
+# Their SDWA encodings (#1917): the source selection applies to the indexed source word and the destination
+# selection to each indexed destination, as v_mov_b32_sdwa applies them.
+SDWA_MOVREL_PATTERN = re.compile(r"(v_movreld_b32|v_movrels_b32|v_movrelsd_b32|v_movrelsd_2_b32)_sdwa (v\d+), "
+                                 r"(sext\()?(v\d+)(\))? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) "
+                                 r"dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)")
 
 
 def scalar_const_u32(token, scalar, pending):
@@ -5436,8 +5443,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif (m := DPP_MOVREL_PATTERN.fullmatch(line)) or (plain := PLAIN_MOVREL_PATTERN.fullmatch(line)):
-            # The plain forms index exactly as the DPP forms do, each lane reading its own VGPRs (no swizzle).
+        elif ((m := DPP_MOVREL_PATTERN.fullmatch(line)) or (plain := PLAIN_MOVREL_PATTERN.fullmatch(line))
+              or (sdwa := SDWA_MOVREL_PATTERN.fullmatch(line))):
+            # The plain and SDWA forms index exactly as the DPP forms do, each lane reading its own VGPRs (no swizzle).
+            sdwa_sel = None
             if m:
                 op, rest = m.groups()
                 if mask != "entry":
@@ -5445,11 +5454,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 ops, perm, _ = parse_dpp(rest, 2)
                 if not all(re.fullmatch(r"v\d+", t) for t in ops):
                     raise ValueError(f"Expected two VGPR operands without modifiers for {op}")
-            else:
+            elif plain:
                 op, *ops = plain.groups()
                 perm = None
                 if mask != "entry":
                     raise ValueError(f"Invalid {op} outside entry mask")
+            else:
+                op, dst_tok, sext, src_tok, close, dst_sel, unused, src_sel = sdwa.groups()
+                ops, perm = [dst_tok, src_tok], None
+                if mask != "entry":
+                    raise ValueError(f"Invalid {op}_sdwa outside entry mask")
+                if bool(sext) != bool(close):
+                    raise ValueError(f"Unbalanced sext in {op}_sdwa")
+                if unused == "UNUSED_SEXT":
+                    raise ValueError("UNUSED_SEXT is not lowered")
+                sdwa_sel = (src_sel, bool(sext), dst_sel, unused)
             kind = op if op.endswith("_dpp") else f"{op}_dpp"  # the indexing rule is the same for both encodings
             dst_base, src_base = int(ops[0][1:]), int(ops[1][1:])
             if not (0 <= dst_base <= 255 and 0 <= src_base <= 255):
@@ -5507,8 +5526,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 lines.append(f"    precise float dpp_src{i} = asfloat({sel});")
                 swizzled = (f"asuint(dpp_src{i})" if perm is None
                             else emit_quad_swizzle_u32(lines, i, f"dpp_src{i}", perm))
+            if sdwa_sel:
+                swizzled = sdwa_source(swizzled, sdwa_sel[0], sdwa_sel[1])
             if len(dst_offsets) == 1:
                 dst_reg = f"v{dst_base + dst_offsets[0]}"
+                if sdwa_sel:
+                    swizzled = sdwa_dest(swizzled, sdwa_sel[2], sdwa_sel[3], vector.get(dst_reg))
                 vector[dst_reg] = f"alu{i}"
                 lines.append(f"    precise float alu{i} = asfloat({swizzled});")
             else:
@@ -5517,8 +5540,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 lines.append(f"    uint dpp_doff{i} = {doff_expr};")
                 for k, prev in prev_dsts:
                     dst_reg = f"v{dst_base + k}"
+                    written = (sdwa_dest(f"dpp_val{i}", sdwa_sel[2], sdwa_sel[3], prev) if sdwa_sel
+                               else f"dpp_val{i}")
                     vector[dst_reg] = f"alu{i}_{k}"
-                    lines.append(f"    precise float alu{i}_{k} = (dpp_doff{i} == {k}u) ? asfloat(dpp_val{i}) : {prev};")
+                    lines.append(f"    precise float alu{i}_{k} = (dpp_doff{i} == {k}u) ? asfloat({written}) : {prev};")
         elif m := match(r"v_swaprel_b32 (v\d+), (v\d+)"):
             # VGPR[vdst + m0[25:16]] and VGPR[vsrc + m0[9:0]] exchange their values (#1795), with the m0 rules of
             # the movrel forms: both sides are read before either is written, so a pair naming one register is
@@ -5584,6 +5609,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 helpers.add(helper)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {template.format(bits)};")
+        elif m := match(r"v_cvt_pkrtz_f16_f32_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 compressed-export pack: src0 is swizzled across the quad,
+            # src1 stays on the current lane, DPP16 allows abs/neg on either source, and the
+            # destination holds the same (lo, hi) compressed-export pair as v_cvt_pkrtz_f16_f32_e32.
+            dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid pack DPP operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 2)
+            s0_val, abs0, neg0 = dpp_vgpr(tokens[0], vector, sample_dest, allow_mods=not is_dpp8)
+            s1_val, abs1, neg1 = dpp_vgpr(tokens[1], vector, sample_dest, allow_mods=not is_dpp8)
+            s0_bits = emit_quad_swizzle_u32(lines, i, s0_val, perm)
+            if abs0:
+                s0_bits = f"({s0_bits} & 0x7fffffffu)"
+            if neg0:
+                s0_bits = f"({s0_bits} ^ 0x80000000u)"
+            s1_bits = f"asuint({s1_val})"
+            if abs1:
+                s1_bits = f"({s1_bits} & 0x7fffffffu)"
+            if neg1:
+                s1_bits = f"({s1_bits} ^ 0x80000000u)"
+            lines.append(f"    precise float alu{i}_lo = asfloat({s0_bits});")
+            lines.append(f"    precise float alu{i}_hi = asfloat({s1_bits});")
+            vector[dst] = (f"alu{i}_lo", f"alu{i}_hi")
         elif m := match(rf"({'|'.join(DPP_EXTRA)}) (v\d+), (.+)"):
             op, dst, rest = m.groups()
             if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
