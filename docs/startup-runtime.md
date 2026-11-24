@@ -405,6 +405,16 @@ It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment 
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
 socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not).
 
+The file hooks that offline mode needs are always armed. The gaming-runtime call hooks
+(`QueryApiImpl`, `InitializeApiImpl*`, `XErrorReport`) and the movie-player call hooks (open,
+close, next frame, frame buffers, pause, skip) are armed only with `--trace-calls 1`
+(`run.ps1 -TraceCalls`), because every hooked call stops the whole process under the debugger.
+Without it those calls are not written to `files.txt`, and the movie-player report at the end of
+`<log>.out` (call counts, movie header, frame buffers and the luma-plane PNG) is absent; with it both
+are as before. The summary states `call tracing: on` or `off`. `startup_debug` checks that a
+source-built DLL loaded under the movie-player module name is not hooked by default and that each of
+its 7 export calls is counted with `--trace-calls 1`.
+
 A process that Windows creates under a debugger normally gets the debug heap: the loader sets the
 heap tail-check, free-check and parameter-validation flags and the low-fragmentation heap is not
 used, so every allocation and free costs more. The debugger starts the process with
@@ -613,15 +623,16 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
-| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running. Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` and no manifest; `X2W_FXC=` (empty) skips compilation and publishes the manifest alone. |
+| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running. Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
+| `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
-| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds and stick or trigger values: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
+| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
@@ -695,6 +706,138 @@ ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|
 
 It exits 77 (skip) after the parser checks when XInput pad 0 is connected, because that pad's
 values merge into every reading.
+
+### Waiting for the presented picture
+
+Fixed times drift when a run gets slower or faster. A script can instead wait until the presented
+picture changes, and time the items after the wait from the moment it completes:
+
+| Item | Effect |
+|---|---|
+| `wait[=<settle>[/<timeout>[/stop\|/go]]][@<s>]` | takes the presented picture at the moment the wait begins, waits until it changes and then until it has not changed for `<settle>` seconds (default 1). After `<timeout>` seconds (default 120) it logs a timeout and the script goes on (`go`, the default) or stops (`stop`). Empty fields keep their default: `wait=/30`. |
+| `mark[=<label>][@<s>]` | logs the script time and the present number, for picking frames afterwards. The label is up to 32 letters, digits, `_`, `-` or `.`; the default is `mark<item index>`. |
+| `@+<s>` | in place of `@<s>` on any timed item: `<s>` seconds after the previous timed item started (after a wait: after it completed). Without an earlier timed item it counts from 0. |
+
+`wait` and `mark` without `@` mean `@+0`, so a wait begins when the previous item starts, before
+the picture can react to that press. Items after a wait are shifted by the time the wait blocked and
+never start before it completes. An absolute `@<s>` after a wait must not be earlier than the wait;
+`@+` is the form to use there. A hold that started before a wait runs its length in real time.
+A wait cannot take a `+<duration>`.
+
+Wait for a new screen, pause 2 s, press down, pause 0.5 s, press accept, and repeat (about 5 s
+per screen when each screen takes about 2.5 s to appear and settle):
+
+```text
+wait,80@+2,4@+0.5,mark=menu1@+0,wait,80@+2,4@+0.5,mark=menu2@+0
+```
+
+The picture signal comes from the D3D12 stand-in in render mode (`X2W_D3D12_RENDER=1`,
+`run.ps1 -Render`). Sampling is opt-in: it starts only after a script with at least one `wait` has
+asked for it (the GameInput stand-in sets a request field in the signature block and logs
+`x2w-input script: picture signature requested`), so ordinary render runs record no extra GPU work.
+`X2W_PRESENT_SIGNATURE_EVERY=<n>` samples every `n` presents from the start without a request, and
+`0` turns the signature off. While sampling, every fourth present (or every `n`) it
+copies 18 evenly spaced single rows of the presented surface into a small readback buffer on the
+presenting queue, never the whole surface and never waiting for the copy, and on a later present
+reduces them to 32 x 18 cells of mean luma. Command lists do not hold the resources they use, so the
+sampler holds its own reference to the presented surface until the copy's fence has passed; a title
+may release the surface right after the present. If `Signal` fails after the copy was submitted,
+sampling stops and the surface, command list and readback buffer stay referenced for the rest of the
+process. It publishes them in a named block,
+`Local\x2w_present_signature_<process id>`, so other tools can read it too
+(`src/startup_stubs/present_signature.h` describes the layout). The 8-bit and 10:10:10:2 colour
+formats are read; for others it logs
+`x2w-present picture signature: surface format <n> is not sampled` once. Two pictures differ when
+at least 16 cells differ by more than 12 levels, so a blinking cursor does not count as a new screen.
+Without a presenter every wait times out and says so.
+
+Log lines, each once per item:
+
+```text
+x2w-input script: <n> waits, <m> marks; picture signal from Local\x2w_present_signature_<pid>
+x2w-input script: picture signature requested
+x2w-present picture signature: Local\x2w_present_signature_<pid>, every <k> presents once a script wait asks for it|from the start (X2W_PRESENT_SIGNATURE_EVERY)
+x2w-input script wait item <i> begun at <s> s[ (no presenter signal yet)]
+x2w-input script wait item <i>: picture changed at <s> s, <e> s after the wait began
+x2w-input script wait item <i> done at <s> s after <e> s
+x2w-input script wait item <i> timed out at <s> s after <e> s[ (no presenter signal)]; the script goes on|stops
+x2w-input script mark <label> at <s> s (item <i>, present <n>|no presenter signal)
+x2w-present picture signature: first sample published at present <n> in Local\x2w_present_signature_<pid> (every <k> presents)
+x2w-present picture signature: Signal failed after a copy was submitted; sampling stopped, its surface stays referenced
+```
+
+Times are seconds on the script's time base. The rejection reasons of waits and marks are `bad wait option`,
+`bad label`, `duration not allowed on wait or mark` and `time before the preceding wait`. A script
+without `wait`, `mark` or `@+` plays exactly as before. One exception: `@+<s>` used to be read as
+the absolute time `<s>`.
+
+#### Change sensitivity, regions and the fine grid
+
+Options after `;` on a wait (`wait=<settle>/<timeout>;<option>;...`, or `wait;<option>` with no
+settle or timeout) set what counts as a change for that wait only:
+
+| Option | Effect |
+|---|---|
+| `cells=<n>` | at least `n` cells must differ (default 16) |
+| `level=<n>` | a cell differs when its mean luma moves by more than `n` levels of 255 (default 12) |
+| `region=<x0>:<y0>:<x1>:<y1>` | watch only the cells whose centre lies in this rectangle, in fractions of the picture width and height (0:0 is the top left; default the whole picture) |
+| `fine` | compare the fine 64 x 72 grid instead of the 32 x 18 one |
+
+The default grid samples one row in the middle of each eighteenth of the picture, so anything less
+than about 5.6 % of the picture height can fall between two sampled rows. A list highlight is often
+that thin. The WARP check moves a 60 x 4 texel bar (30 % x 3.3 %, 1 % of a 200 x 120 picture) between
+two sampled rows: the default grid sees 0 changed cells, the fine grid 40. The fine grid samples 72
+rows (one every 1.4 % of the height) and 64 columns. The presenter copies its rows only once a script
+with a `fine` wait has asked for them: the GameInput stand-in sets a request field in the signature
+block and logs `x2w-input script: fine picture signature (64 x 72) requested`. Measured CPU-side cost
+of one sampled present at 3840 x 2160 on WARP (release build, every fourth present by default):
+0.16 ms with the default grid (18 rows, 270 KiB copied) and 0.56 ms with the fine grid (90 rows,
+1,350 KiB), against 32,400 KiB for the whole frame; the WARP check prints both.
+
+Rejected options log `bad wait option`, `bad region`, `empty region` (no cell centre inside) or
+`cells larger than the region`.
+
+#### Groups
+
+`group[=<label>]` and `end` bracket a run of items. When a wait inside the group times out, the
+rest of the group is skipped, and the script goes on after `end`, timed from the timeout: the script
+time jumps to that of `end`, so an item `@+<s>` after `end` starts `<s>` seconds after the timeout.
+Later groups run normally. A `/stop` wait inside a group still stops the whole script. Groups do not
+nest. The default label is `group<item index>`. The timeout line then ends in
+`; group <label> is skipped from here`, followed by
+
+```text
+x2w-input script group <label> (items <group>-<end>) failed at step item <i>: rest of the group skipped, the script goes on after item <end> from <s> s
+```
+
+Rejected group items log `nested group` (and its `end` logs `end of a rejected nested group`),
+`end without group`, `group not closed` (its items then run ungrouped), `group and end take no time`,
+`bad label`, and `time before the end of the preceding group` for an absolute time after `end` that
+is earlier than the group's last timed item.
+
+A two-entry list on the left of the screen, where each press must visibly move the highlight: wait
+for the screen; press down and check that the highlight moved; press up and check that it moved back;
+then accept. If a press shows no change within 2 s, the rest of the list steps is skipped and the
+script waits for the next screen:
+
+```text
+wait,group=list,80@+1,wait=0.5/2;fine;cells=4;level=8;region=0.05:0.3:0.45:0.6,40@+0.5,wait=0.5/2;fine;cells=4;level=8;region=0.05:0.3:0.45:0.6,4@+0.5,end,wait=1/30
+```
+
+The timeline is in `src/startup_stubs/input_script.h` and the sampler in
+`src/startup_stubs/present_signature_sampler.h`. The timeline cases run with a controllable clock
+and picture signal; two cases run through the stand-in with the check process publishing the
+pictures. The WARP check presents two different pictures and repeated identical ones, and compares
+the published cells with a CPU reduction of the same rows. The held-source check runs under the
+D3D12 debug layer: it stalls the queue on a fence, lets the sampler record its copy, releases the
+caller's only reference to the surface, then releases the queue, and requires the correct signature
+and no debug-layer error; it also makes `Signal` fail after submission and requires the sampler to
+keep the surface. Its control repeats the stall with a copy that does not hold its source and passes
+only when the debug layer reports the released surface:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_(gameinput_script_syntax|present_signature_(warp|held_source_warp|unheld_source_control_warp))$' -V
+```
 
 ## Game saves
 
@@ -858,6 +1001,14 @@ These are measured on one executable; treat them as hypotheses for others.
   high halves of one VGPR and reads mip zero. The packed form requires one address VGPR without an
   NSA extension. Plain loads refuse an empty `dmask`, `r128`, `lwe`, `d16`, `tfe` and reserved bits.
   The source-built startup mip-load check covers this translation on Linux.
+- **Packed 2D sample coordinates.** Plain 2D `image_sample` and `image_sample_lz` with `a16` unpack two
+  IEEE binary16 coordinates from one VGPR (`float2(f16tof32(p), f16tof32(p >> 16))`) without an NSA
+  extension, and both the offline and runtime cache keys advance to `x2w-startup-shader-6` so pre-fix
+  two-VGPR translations are not reused. Non-1D `image_sample` and `image_sample_lz` accept cache-policy
+  flags (`glc`, `slc`, `dlc`) and refuse `unorm`, `r128`, `tfe`, `lwe`, `d16`, reserved bits, an empty
+  `dmask`, wrong address-register counts, fake NSA extensions, and `a16` on 3D or 2D-array images
+  (`ctest --preset dev --no-tests=error -R "^startup_image_sample_a16_" -V`). `image_sample_l` and 3D /
+  2D-array `a16` stay refused.
 - **2D array images.** `image_sample`, `image_sample_lz`, `image_sample_l` and `image_load` with
   `dim:SQ_RSRC_IMG_2D_ARRAY` use a `Texture2DArray<float4>` (manifest kind `tex2da`). The slice is
   the third address component, as `float3(u, v, slice)` for a sample and `int4(x, y, slice, 0)`

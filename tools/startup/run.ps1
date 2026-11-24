@@ -26,7 +26,8 @@ param(
     [switch]$FakeUser,                         # answer the user API for one local user
     [switch]$GpuMirror,                        # map CPU-view pages into the paired GPU-view reservation
     [switch]$HostCpu,                          # rewrite instructions the host processor lacks (X2W_HOST_CPU)
-    [switch]$StartupBelow40                    # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
+    [switch]$StartupBelow40,                   # place the 0x283 large-page startup blocks below 2^40 (X2W_XMEM_STARTUP_BELOW_40)
+    [switch]$TraceCalls                        # also break on runtime and movie-player calls (--trace-calls 1; slows the process)
 )
 $ErrorActionPreference = "Stop"
 $repo = Resolve-Path (Join-Path $PSScriptRoot "..\..")
@@ -56,8 +57,10 @@ if ($Render) {
 New-Item -ItemType Directory -Force $LogDir | Out-Null
 $python = Join-Path $repo "out\pe-env\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python)) { $python = "python" }
+$traceArgs = @()
+if ($TraceCalls) { $traceArgs = @("--trace-calls", "1") }
 & $python -B (Join-Path $PSScriptRoot "debug_launch.py") $Exe $DataDir $LogDir --timeout $Seconds --memory-gib $MemoryGiB `
-    --trace-files 1 --continue-asserts $ContinueAsserts *> "$LogDir.out"
+    --trace-files 1 --continue-asserts $ContinueAsserts @traceArgs *> "$LogDir.out"
 $debuggerExit = $LASTEXITCODE
 Get-Content "$LogDir.out" -TotalCount 5
 exit $debuggerExit

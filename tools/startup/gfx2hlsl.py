@@ -5,10 +5,12 @@ Scalar registers are also tracked symbolically at translation time so that point
 values (tables, vertex-buffer table, root buffers) turn into HLSL resources instead of arithmetic.
 The output is HLSL for both stages plus a manifest that tells the runtime what to bind where.
 """
+from contextlib import suppress
 import os
 import re
 import struct
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
 import disasm_rdna2 as D  # noqa: E402
@@ -313,6 +315,15 @@ def smem_mods(mods):
     return imm
 
 
+# Each conversion uses only its input bits (including byte extraction for ubyte0).
+# Multiply, fused multiply-add (including the literal form), and reciprocal use only
+# local arithmetic. Move copies its input bits. None reads a lane ID or another lane.
+UNIFORM_VALU = frozenset((
+    'v_cvt_u32_f32', 'v_cvt_i32_f32', 'v_cvt_f32_ubyte0', 'v_mul_f32',
+    'v_fma_f32', 'v_fmaak_f32', 'v_rcp_f32', 'v_mov_b32',
+))
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -440,7 +451,8 @@ class Stage:
         self.lines.append(text)
 
     def set_v(self, n, expr):
-        self.uniform_v.discard(n)
+        if hasattr(self, 'uniform_v'):
+            self.uniform_v.discard(n)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
@@ -469,8 +481,33 @@ class Stage:
             expr = 'saturate(%s)' % expr
         self.set_v(n, 'U(%s)' % expr)
 
-    def set_s(self, n, expr, sym=None, scc=None):
+    def scalar_expr_uniform(self, expr):
+        # These identifiers are runtime inputs in the scalar expressions emitted below.
+        # In particular, a compare can carry a lane mask into an otherwise scalar select.
+        for token in re.findall(r'\b(?:s\d+|v\d+|vcc|exec|m0|scc)\b', expr):
+            if token == 'scc':
+                if not self.scc_uniform:
+                    return False
+            elif not self.uniform_source(token):
+                return False
+        return True
+
+    def set_scc(self, expr, proof=None):
+        """Emit an SCC assignment and track its uniformity from `proof` (an expression over the
+        sources) when the emitted text names a register, such as m0, that the proof cannot judge."""
+        if self.tracks_uniformity():
+            self.scc_uniform = self.scalar_expr_uniform(expr if proof is None else proof)
+        self.emit('scc = %s;' % expr)
+
+    def set_s(self, n, expr, sym=None, scc=None, uniform=None):
         """Assign scalar register n at run time and/or symbolically."""
+        if self.tracks_uniformity() and (sym is None or sym[0] == 'const'):
+            if uniform is None:
+                uniform = self.scalar_expr_uniform(expr)
+            if uniform:
+                self.varying_s.discard(n)
+            else:
+                self.varying_s.add(n)
         if sym is not None:
             self.sym[n] = sym
             if sym[0] != 'const':
@@ -480,7 +517,7 @@ class Stage:
         self.used_s.add(n)
         self.emit('s%d = %s;' % (n, expr))
         if scc:
-            self.emit('scc = %s;' % scc.replace('$', 's%d' % n))
+            self.set_scc(scc.replace('$', 's%d' % n))
 
     def descriptor(self, tok):
         """Resource key for a descriptor operand like s[8:11]: (source, byte offset or None)."""
@@ -522,6 +559,8 @@ class Stage:
                 targets.add(int(parse(asm)[1][0].split('_')[1], 16))
         self.blocks = []          # (offset, [lines], terminator)
         self.uniform_v = set()
+        self.varying_s = set()
+        self.scc_uniform = True
         self.has_branches = bool(targets)
         start = 0
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
@@ -548,9 +587,54 @@ class Stage:
         if self.lines:
             self.blocks.append((start, self.lines, None))
 
+    def tracks_uniformity(self):
+        return all(hasattr(self, name) for name in ('uniform_v', 'varying_s', 'scc_uniform'))
+
+    def uniform_source(self, tok):
+        r = reg_range(tok)
+        if r:
+            kind, lo, hi = r
+            if lo != hi:
+                return False
+            if kind == 'v':
+                return lo in self.uniform_v
+            if lo in getattr(self, 'masks', ()):
+                return False
+            sym = self.sym.get(lo)
+            if sym:
+                return sym[0] in ('const', 'ud', 'fixed_buffer_word')
+            return lo not in self.varying_s
+        if tok in FLOATS:
+            return True
+        try:
+            int(tok, 0)
+        except ValueError:
+            return False
+        return True
+
     def one(self, name, asm):
         _, ops, mods = parse(asm)
         base = re.sub(r'_e(32|64)$', '', name)
+        # Compute the proof before lowering, since a destination can also be a source.
+        dst = None
+        # Unit probes build a Stage without __init__: without the tracking state, prove nothing.
+        if (base in UNIFORM_VALU and ops and self.tracks_uniformity() and
+                not getattr(self, 'has_branches', True) and getattr(self, 'exec_known', False) and
+                (not mods or (base in VEC_F or base in VEC_U_TO_F) and
+                 all(m in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods))):
+            candidate = reg_range(ops[0])
+            if candidate and candidate[0] == 'v' and candidate[1] == candidate[2]:
+                sources = ops[1:]
+                if base in VEC_F:
+                    sources = [re.sub(r'^-(?=[^\d.])', '', tok).strip('|') for tok in sources]
+                if sources and all(self.uniform_source(tok) for tok in sources):
+                    dst = candidate[1]
+        term = self.lower(base, asm, ops, mods)
+        if dst is not None:
+            self.uniform_v.add(dst)
+        return term
+
+    def lower(self, base, asm, ops, mods):
         if getattr(self, 'fetched', False):  # unit probes build a Stage without __init__
             # Behind a fetch call the definite-assignment guard relies on exec_known: every exec write must clear it.
             # s_wqm of exec into itself only adds lanes, so it stays a no-op; other s_wqm forms (a no-op here) and
@@ -561,7 +645,13 @@ class Stage:
                     ops[0] == 'exec_hi' or not (base in SCA or base.startswith('v_cmp') or
                                                 (base in ('s_cselect_b32', 's_cselect_b64') and ops[0] == 'exec'))):
                 raise Unsupported('%s into %s after a fetch call' % (base, ops[0]))
-        if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f', 's_wqm_b64', 's_wqm_b32',
+        if base in ('s_wqm_b32', 's_wqm_b64'):
+            if hasattr(self, 'uniform_v'):
+                self.uniform_v.clear()
+            if hasattr(self, 'scc_uniform'):
+                self.scc_uniform = False  # the hardware SCC result is not modelled
+            return None
+        if base in ('s_inst_prefetch', 's_waitcnt', 's_nop', 'v_nop', 's_clause', 's_sopp_0f',
                     's_setreg_imm32_b32', 's_code_end', 's_setprio'):
             return None
         if base == 's_endpgm':
@@ -664,6 +754,8 @@ class Stage:
     # scalar ALU with descriptor-word bookkeeping
     def scalar(self, base, ops):
         text, scc = SCA[base]
+        if base in SCC_UNMODELLED and self.tracks_uniformity():
+            self.scc_uniform = False
         dst = reg_range(ops[0])
         pair = base.endswith('_b64')
         srcs = ops[1:]
@@ -674,14 +766,22 @@ class Stage:
         srcs = [low(t) for t in srcs]
         dname = low(ops[0])
         word_complement = base in ('s_nand_b32', 's_nor_b32', 's_xnor_b32')
-        if word_complement:
-            # A lane mask here is the whole wave's mask, and SCC is set when any bit of the
-            # complemented 32-bit result is; the per-lane projection below cannot show that.
+        word_pack = base == 's_pack_hh_b32_b16'
+        if word_complement or word_pack:
+            # The per-lane mask cannot supply the full word needed by these operations.
             def lane_mask(t):
                 r = reg_range(t)
-                return t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or bool(r and r[0] == 's' and r[1] in self.masks)
+                return (t in ('exec', 'exec_lo', 'exec_hi', 'vcc', 'vcc_lo', 'vcc_hi')
+                        or bool(r and r[0] == 's' and r[1] in self.masks))
             if lane_mask(dname) or any(lane_mask(t) for t in srcs):
                 raise Unsupported('%s on a lane mask' % base)
+        if word_pack:
+            if dname != 'm0' and (dst is None or dst[0] != 's' or dst[1] > 105):
+                raise Unsupported('%s destination %s' % (base, dname))
+            for source in srcs:
+                reg = reg_range(source)
+                if reg and (reg[0] != 's' or reg[1] > 105):
+                    raise Unsupported('%s source %s' % (base, source))
         if pair and ('m0' in srcs or dname == 'm0'):
             raise Unsupported('64-bit scalar operand m0')
         def src_sym(t):
@@ -691,8 +791,12 @@ class Stage:
             return self.sym.get(r[1]) if r and r[0] == 's' else None
         syms = [src_sym(t) for t in srcs]
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
+            if scc and self.tracks_uniformity():
+                self.scc_uniform = False  # nothing is emitted here, so the run-time scc is stale
             if word_complement:
                 raise Unsupported('scc from descriptor data')
+            if word_pack:
+                raise Unsupported('%s on descriptor data' % base)
             if dname == 'm0':
                 if scc:
                     raise Unsupported('scc from descriptor data')
@@ -706,10 +810,12 @@ class Stage:
                 self.sym[d] = syms[0]
                 if pair:
                     hi = self.sym.get(reg_range(ops[1])[2])
-                    if hi:
+                    if hi and hi[0] in ('desc', 'descnum', 'ptr', 'ptrhi', 'const', 'ud'):
                         self.sym[d + 1] = hi
                     else:
                         self.sym.pop(d + 1, None)
+                        if self.tracks_uniformity():
+                            self.varying_s.add(d + 1)
             elif own and own[0] in ('desc', 'ptr', 'ptrhi') and any(s == own for s in syms):
                 if own[0] == 'desc':
                     self.pipe.modified.add((own[1], own[2]))
@@ -722,18 +828,23 @@ class Stage:
             self.sym.pop('m0', None)
             self.emit('m0 = %s;' % expr)
             if scc:
-                self.emit('scc = %s;' % scc.replace('$', 'm0'))
+                # Through set_scc, so an SCC derived from a lane mask (s_and_b32 m0, vcc_lo, -1)
+                # is tracked as varying like any other scalar result.
+                self.set_scc(scc.replace('$', 'm0'), proof=scc.replace('$', '(%s)' % expr))
             return None
         if dname in ('exec', 'exec_lo', 'vcc', 'vcc_lo'):
             var = dname[:4].rstrip('_') if dname.startswith('exec') else 'vcc'
             if var == 'exec':
                 copy = base in ('s_mov_b64', 's_mov_b32') and self.exec_known and (syms[0] == ('execcopy',))
                 if copy:
+                    # A restored copy can re-activate lanes a WQM added: drop every VGPR proof.
+                    if hasattr(self, 'uniform_v'):
+                        self.uniform_v.clear()
                     return None
                 self.exec_known = False
             self.emit('%s = (%s) & 1;' % (var, expr))
             if scc:
-                self.emit('scc = %s;' % scc.replace('$', var))
+                self.set_scc(scc.replace('$', var))
             return None
         d = reg_range(dname)[1]
         is_mask = pair or any(t in ('exec', 'exec_lo', 'vcc', 'vcc_lo') or (reg_range(t) and reg_range(t)[0] == 's' and reg_range(t)[1] in self.masks)
@@ -751,18 +862,26 @@ class Stage:
             self.masks.add(d)
             if pair:
                 self.sym.pop(d + 1, None)
+                if self.tracks_uniformity():
+                    self.varying_s.add(d + 1)
             return None
         if is_mask:
             expr = '(%s) & 1' % expr
             self.masks.add(d)
         else:
             self.masks.discard(d)
+        if base == 's_mov_b64':
+            r = reg_range(ops[1])
+            high = r[2] if r and r[1] != r[2] else None
+            # Classify the source high word before a destination write can change its status.
+            high_source = 's%d' % high if high is not None else srcs[0]
+            high_uniform = (self.tracks_uniformity() and high != d and
+                            self.uniform_source(high_source))
         self.set_s(d, expr, scc=scc)
         if pair and base != 's_mov_b64':
             self.set_s(d + 1, '0u')
         elif pair:
-            r = reg_range(ops[1])
-            self.set_s(d + 1, self.S(r[2]) if r and r[1] != r[2] else '0u')
+            self.set_s(d + 1, self.S(high) if high is not None else '0u', uniform=high_uniform)
         return None
 
     def op_s_and_saveexec_b64(self, ops, mods, text='exec & {0}'):
@@ -775,6 +894,8 @@ class Stage:
         self.masks.add(d)
         self.exec_known = False
         self.emit('exec = (%s) & 1; scc = exec != 0;' % text.format(self.u(src)))
+        if hasattr(self, 'scc_uniform'):
+            self.scc_uniform = False
 
     op_s_and_saveexec_b32 = op_s_and_saveexec_b64
 
@@ -794,6 +915,8 @@ class Stage:
         src = ops[1] if not reg_range(ops[1]) else 's%d' % reg_range(ops[1])[1]
         self.exec_known = False
         self.emit('exec = (%s & ~exec) & 1; scc = exec != 0;' % self.u(src))
+        if hasattr(self, 'scc_uniform'):
+            self.scc_uniform = False
         self.set_s(d, 'exec')
         self.masks.add(d)
 
@@ -957,8 +1080,10 @@ class Stage:
             if sreg and offset == ('s%d' % sreg[1]) and dst[1] <= sreg[1] < dst[2]:
                 self.emit('a = %s;' % offset)
                 offset = 'a'
+        # All words use the original offset, even when a destination overwrites its register.
+        uniform = self.tracks_uniformity() and self.uniform_source(token)
         for i in range(count):
-            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i))
+            self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i), uniform=uniform)
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
 
@@ -1143,11 +1268,31 @@ class Stage:
             mip = self.u(cs[axes]) if how == 'load_mip' else '0'
             call = '%s.Load(int%d(%s))' % (tex, axes + 1, ', '.join(address + [mip]))
         else:
+            packed_2d = False
+            if not one and how in ('sample', 'lz'):
+                op_name = 'image_sample' if how == 'sample' else 'image_sample_lz'
+                packed_2d = dim == 'SQ_RSRC_IMG_2D' and 'a16' in mods
+                allowed = ('dlc', 'glc', 'slc') + (('a16',) if packed_2d else ())
+                for m in mods:
+                    if not (m.startswith(('dim:', 'dmask:')) or m in allowed):
+                        raise Unsupported('%s modifier %s' % (op_name, m))
+                if not dmask:
+                    raise Unsupported('%s with an empty dmask' % op_name)
+                expected = 1 if packed_2d else (3 if three else 2)
+                if len(cs) != expected:
+                    raise Unsupported('%s with %d address registers' % (op_name, len(cs)))
             heap = self.heap_sampler(ops[3])
             words = None if heap else self.const_words(ops[3])
             smp = heap or self.pipe.sampler(tuple(words) if words else self.descriptor(ops[3]))
-            uv = (self.f(cs[0]) if one else 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2])) if three
-                  else 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1])))
+            if packed_2d:
+                packed = self.u(cs[0])
+                uv = 'float2(f16tof32(%s), f16tof32(%s >> 16))' % (packed, packed)
+            elif one:
+                uv = self.f(cs[0])
+            elif three:
+                uv = 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
+            else:
+                uv = 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1]))
             if how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
             elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
@@ -1287,19 +1432,37 @@ class Stage:
             raise Unsupported('v_cvt_i32_f32 with modifiers')
         dst = reg_range(ops[0])[1]
         self.set_v(dst, 'uint(int(F(%s)))' % self.u(ops[1]))
-        src = reg_range(ops[1])
-        if self.exec_known and src and src[0] == 's' and self.sym.get(src[1]) == ('fixed_buffer_word',):
-            self.uniform_v.add(dst)
 
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
-        if (mods or self.has_branches or not self.exec_known or not dst or dst[0] != 's' or
-                not src or src[0] != 'v' or src[1] not in self.uniform_v):
+        if (mods or not self.tracks_uniformity() or getattr(self, 'has_branches', True) or
+                not getattr(self, 'exec_known', False) or not dst or dst[0] != 's' or dst[1] != dst[2] or
+                not src or src[0] != 'v' or src[1] != src[2] or src[1] not in self.uniform_v):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
         self.set_s(reg_range(ops[0])[1], self.u(ops[1]))
 
     def op_v_mov_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
+
+    def op_v_swap_b32(self, ops, mods):
+        # VOP1 only (llvm-mc rejects the e64, DPP and SDWA spellings for gfx1013). Both registers exchange
+        # their old values, so one is read into a temporary before either is written. The ISA allows no
+        # input or output modifier and no scalar or constant operand: both operands are plain VGPRs.
+        if mods:
+            raise Unsupported('v_swap_b32 with %s' % mods)
+        if len(ops) != 2:
+            raise Unsupported('v_swap_b32 with %d operands, expected 2' % len(ops))
+        regs = [reg_range(o) for o in ops]
+        if any(not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255 for r in regs):
+            raise Unsupported('v_swap_b32 operands %s, %s: expected two single VGPRs' % (ops[0], ops[1]))
+        dst, src = regs[0][1], regs[1][1]
+        body = '{ uint t = v%d; v%d = v%d; v%d = t; }' % (dst, dst, src, src)
+        # Uniformity travels with the value; under an unknown exec mask neither register keeps the proof.
+        uniform = (dst in self.uniform_v and self.exec_known, src in self.uniform_v and self.exec_known)
+        for reg, flag in zip((src, dst), uniform):
+            (self.uniform_v.add if flag else self.uniform_v.discard)(reg)
+        self.used_v.update((dst, src))
+        self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
     def op_v_cndmask_b32(self, ops, mods):
         # The select takes no output modifier: a clamp or mul on it would change the value, so a
@@ -1311,6 +1474,8 @@ class Stage:
                    '(%s & 1) ? %s : %s' % (mask, self.u_src(ops[2]), self.u_src(ops[1])))
 
     def op_v_interp_p1_f32(self, ops, mods):
+        if hasattr(self, 'uniform_v'):
+            self.uniform_v.discard(reg_range(ops[0])[1])
         self.note_attr(ops[2], 'linear')
 
     def op_v_interp_p2_f32(self, ops, mods):
@@ -1389,8 +1554,9 @@ class Stage:
         low, high = self.i64_words(ops[2])
         body = '{ uint2 t = %s(%s, %s, %s); v%d = t.x; v%d = t.y; }' % (
             helper, low, high, amount, dst[1], dst[2])
-        self.uniform_v.discard(dst[1])
-        self.uniform_v.discard(dst[2])
+        if hasattr(self, 'uniform_v'):
+            self.uniform_v.discard(dst[1])
+            self.uniform_v.discard(dst[2])
         self.used_v.update((dst[1], dst[2]))
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
@@ -1691,6 +1857,12 @@ VEC_U = {
     'v_bfrev_b32': (1, 'reversebits({0})'),
 }
 # scalar ops: (expression over uint sources, SCC rule with $ for the result or None)
+# Scalar ops that write SCC on the hardware (carry, overflow, or which source was selected) but have
+# no SCC template here: the emitted scc keeps its previous value, so the uniformity proof stops
+# trusting it.
+SCC_UNMODELLED = frozenset(('s_add_i32', 's_add_u32', 's_sub_i32', 's_sub_u32',
+                            's_min_i32', 's_min_u32', 's_max_i32', 's_max_u32'))
+
 SCA = {
     's_mov_b32': ('{0}', None), 's_mov_b64': ('{0}', None), 's_movk_i32': ('{0}', None),
     's_and_b32': ('{0} & {1}', '$ != 0'), 's_or_b32': ('{0} | {1}', '$ != 0'), 's_xor_b32': ('{0} ^ {1}', '$ != 0'),
@@ -1706,6 +1878,7 @@ SCA = {
     's_min_i32': ('uint(min(int({0}), int({1})))', None), 's_max_i32': ('uint(max(int({0}), int({1})))', None),
     's_bfe_u32': ('({0} >> ({1} & 31)) & ((1u << (({1} >> 16) & 127)) - 1)', '$ != 0'),
     's_brev_b32': ('reversebits({0})', None),
+    's_pack_hh_b32_b16': ('({0} >> 16) | ({1} & 0xffff0000u)', None),
     # s_bfm_b32: a mask of S0[4:0] ones shifted left by S1[4:0]; SCC unchanged.
     's_bfm_b32': ('(((1u << ({0} & 31)) - 1) << ({1} & 31))', None),
 }
@@ -1713,7 +1886,7 @@ for _name, _op in (('eq', '=='), ('lg', '!='), ('gt', '>'), ('ge', '>='), ('lt',
     for _typ, _cast in (('i32', 'int({0}) %s int({1})'), ('u32', '{0} %s {1}')):
         def _make(op=_op, cast=_cast):
             def handler(self, ops, mods):
-                self.emit('scc = %s;' % (cast % op).format(self.u(ops[0]), self.u(ops[1])))
+                self.set_scc((cast % op).format(self.u(ops[0]), self.u(ops[1])))
             return handler
         setattr(Stage, 'op_s_cmp_%s_%s' % (_name, _typ), _make())
         setattr(Stage, 'op_s_cmpk_%s_%s' % (_name, _typ), _make())
@@ -1976,7 +2149,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-5'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-6'))))
     return fnv(layout, key) if layout else key
 
 
@@ -2010,6 +2183,13 @@ def find_fxc():
     return shutil.which('fxc.exe')
 
 
+def has_bytecode(path):
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) > 0
+    except OSError:
+        return False
+
+
 def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_formats=(), rtv_request='', vs_fetch=None):
     """Writes <key>.vs.hlsl, <key>.ps.hlsl and <key>.txt (last), or <key>.fail with the reason.
 
@@ -2031,18 +2211,41 @@ def translate_to(out_dir, key, vs_code, ps_code, root_blob, check=True, rtv_form
         message = 'fxc.exe not found (X2W_FXC=%s): set X2W_FXC to its path or install the Windows SDK' % os.environ.get('X2W_FXC', '<unset>')
         open(name + '.fail', 'w').write(message + '\n')
         return message
+    manifest_path = name + '.txt'
+    write_manifest = True
     if fxc:
         import subprocess
-        for stage, profile in (('vs', 'vs_5_1'), ('ps', 'ps_5_1')):
-            r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', name + '.%s.cso' % stage, name + '.%s.hlsl' % stage],
-                               capture_output=True, text=True)
-            if r.returncode:
-                open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, r.stderr[-2000:]))
-                return 'fxc %s failed: %s' % (stage, r.stderr.strip().splitlines()[-1] if r.stderr.strip() else '?')
-    temporary = '%s.txt.%d.tmp' % (name, os.getpid())
-    with open(temporary, 'w') as result:
-        result.write(manifest)
-    os.replace(temporary, name + '.txt')
+        # An existing manifest can already point at these paths. Publish only bytecode from a successful pair.
+        with tempfile.TemporaryDirectory(prefix='.fxc-', dir=out_dir) as staging:
+            for stage, profile in (('vs', 'vs_5_1'), ('ps', 'ps_5_1')):
+                bytecode = os.path.join(staging, stage + '.cso')
+                r = subprocess.run([fxc, '/nologo', '/T', profile, '/E', 'main', '/Fo', bytecode, name + '.%s.hlsl' % stage],
+                                   capture_output=True, text=True)
+                if r.returncode or not has_bytecode(bytecode):
+                    detail = r.stderr.strip() or ('?' if r.returncode else 'no bytecode produced')
+                    open(name + '.fail', 'w').write('fxc %s: %s\n' % (stage, detail[-2000:]))
+                    return 'fxc %s failed: %s' % (stage, detail.splitlines()[-1])
+            with suppress(FileNotFoundError, UnicodeError):
+                with open(manifest_path) as existing:
+                    write_manifest = existing.read() != manifest
+            # If the bindings changed, withdraw the old manifest before publishing new bytecode.
+            if write_manifest:
+                with suppress(FileNotFoundError):
+                    os.remove(manifest_path)
+            for stage in ('vs', 'ps'):
+                os.replace(os.path.join(staging, stage + '.cso'), name + '.%s.cso' % stage)
+    if write_manifest:
+        temporary = '%s.%d.tmp' % (manifest_path, os.getpid())
+        try:
+            with open(temporary, 'w') as result:
+                result.write(manifest)
+            os.replace(temporary, manifest_path)
+        finally:
+            with suppress(FileNotFoundError):
+                os.remove(temporary)
+    if fxc:
+        with suppress(FileNotFoundError):
+            os.remove(name + '.fail')
     return 'ok'
 
 
@@ -2308,13 +2511,12 @@ def main():
             for ext, blob in (('.a', a), ('.b', b), ('.root', root)):
                 open(os.path.join(out_dir, 'req_%016x%s' % (key, ext)), 'wb').write(blob)
             print('pso %x -> request %016x' % (w & 0xffffff, key))
-    # translate every request that has no result yet
-    for name in sorted(os.listdir(out_dir)):
-        m = re.fullmatch(r'req_([0-9a-f]{16})\.(?:a|rtv)', name)
-        if not m:
-            continue
-        key = int(m.group(1), 16)
-        if os.path.exists(os.path.join(out_dir, '%016x.txt' % key)):
+    manifest_only = os.environ.get('X2W_FXC') == ''
+    for key in request_keys(out_dir):
+        name = os.path.join(out_dir, '%016x' % key)
+        if os.path.isfile(name + '.txt') and (
+            manifest_only or (has_bytecode(name + '.vs.cso') and has_bytecode(name + '.ps.cso'))
+        ):
             continue
         print('%016x: %s' % (key, translate_request(out_dir, key)))
 

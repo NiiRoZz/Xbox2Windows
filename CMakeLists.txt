@@ -500,6 +500,19 @@ target_include_directories(startup_gameinput_script_syntax PRIVATE src)
 target_compile_features(startup_gameinput_script_syntax PRIVATE cxx_std_17)
 add_test(NAME startup_gameinput_script_syntax COMMAND startup_gameinput_script_syntax "$<TARGET_FILE:startup_stub_gameinput>")
 set_tests_properties(startup_gameinput_script_syntax PROPERTIES RUN_SERIAL TRUE SKIP_RETURN_CODE 77)
+add_executable(startup_present_signature tests/startup_present_signature.cpp)
+target_include_directories(startup_present_signature PRIVATE src)
+target_compile_features(startup_present_signature PRIVATE cxx_std_17)
+target_link_libraries(startup_present_signature PRIVATE d3d12 dxgi)
+add_test(NAME startup_present_signature_warp COMMAND startup_present_signature)
+set_tests_properties(startup_present_signature_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+# The sampler holds the presented surface until its copy has finished: a stalled queue, the caller's
+# release after the present, then the signature, all under the debug layer. The control repeats the
+# stall with a copy that does not hold its source and passes only if the debug layer reports it.
+add_test(NAME startup_present_signature_held_source_warp COMMAND startup_present_signature held_source)
+set_tests_properties(startup_present_signature_held_source_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+add_test(NAME startup_present_signature_unheld_source_control_warp COMMAND startup_present_signature unheld_control)
+set_tests_properties(startup_present_signature_unheld_source_control_warp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
 add_executable(startup_placement_alloc tests/startup_placement_alloc.cpp)
 target_compile_features(startup_placement_alloc PRIVATE cxx_std_17)
 target_include_directories(startup_placement_alloc PRIVATE src)
@@ -738,6 +751,9 @@ target_compile_features(startup_launch_probe PRIVATE cxx_std_17)
 # Input for the startup debugger's diagnostics check (tests/startup_debug_check.py).
 add_executable(startup_debug_probe tests/startup_debug_probe.cpp)
 target_compile_features(startup_debug_probe PRIVATE cxx_std_17)
+# The DLL the probe calls for the debugger's call-hook case (--trace-calls).
+add_library(startup_debug_calls SHARED tests/startup_debug_calls.cpp)
+add_dependencies(startup_debug_probe startup_debug_calls)
 # Input for tests/startup_inflate_check.py: the DirectStorage stand-in's zlib decoder on one stream.
 add_executable(startup_inflate_probe tests/startup_inflate_probe.cpp)
 target_compile_features(startup_inflate_probe PRIVATE cxx_std_17)
@@ -1184,6 +1200,26 @@ target_compile_features(startup_plane_size_check PRIVATE cxx_std_17)
 add_test(NAME startup_plane_size COMMAND startup_plane_size_check)
 add_test(NAME startup_plane_size_packed_control COMMAND startup_plane_size_check --mutate packed)
 set_tests_properties(startup_plane_size_packed_control PROPERTIES WILL_FAIL TRUE)
+# Device slot 41: the indirect argument types desktop D3D12 cannot create
+# (src/startup_stubs/command_signature_filter.h); the mutated runs are negative controls.
+add_executable(startup_command_signature_filter_check tests/startup_command_signature_filter_check.cpp)
+target_include_directories(startup_command_signature_filter_check PRIVATE src)
+target_compile_features(startup_command_signature_filter_check PRIVATE cxx_std_17)
+add_test(NAME startup_command_signature_filter COMMAND startup_command_signature_filter_check)
+foreach(mutation IN ITEMS off-by-one first-only)
+    add_test(NAME startup_command_signature_filter_${mutation}_control COMMAND startup_command_signature_filter_check --mutate ${mutation})
+    set_tests_properties(startup_command_signature_filter_${mutation}_control PROPERTIES WILL_FAIL TRUE)
+endforeach()
+# Device slot 41 through the startup device wrapper with the debug layer on: a desktop-valid argument
+# list is created, a console type gets the placeholder, and the debug layer reports no error for either.
+add_executable(startup_command_signature tests/startup_command_signature.cpp)
+target_compile_features(startup_command_signature PRIVATE cxx_std_17)
+target_link_libraries(startup_command_signature PRIVATE d3d12_xs_shim d3d12 dxgi)
+foreach(backend IN ITEMS warp hardware)
+    add_test(NAME startup_command_signature_${backend} COMMAND startup_command_signature ${backend})
+    set_tests_properties(startup_command_signature_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+        ENVIRONMENT "X2W_D3D12_PERMISSIVE=1;X2W_D3D12_DEBUG=1")
+endforeach()
 # GameInput stand-in timestamps: a performance-counter reading in microseconds without a product
 # that wraps (src/startup_stubs/qpc_microseconds.h); the mutated run is the negative control.
 add_executable(startup_qpc_microseconds_check tests/startup_qpc_microseconds_check.cpp)
@@ -2164,6 +2200,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # gfx2hlsl refuses a binary32 or integer vector operation with a source too few or too many.
     add_test(NAME startup_gfx2hlsl_operand_count COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_operand_count_check.py")
+    # gfx2hlsl lowers v_swap_b32 (VOP1): CPU evaluation of the translated text, refusals of every form llvm-mc rejects.
+    add_test(NAME startup_gfx2hlsl_swap COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_swap_check.py")
     # VOP1/VOP2 sub-dword addressing (SDWA) in the translator (#1141), checked against the pixel AOT
     # lowering of the same selections.
     add_test(NAME startup_gfx2hlsl_sdwa COMMAND "${INTAKE_PYTHON}" -B
@@ -2278,6 +2317,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_image_2d_array_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
+    # gfx2hlsl packed 2D A16 image_sample / image_sample_lz coordinates and modifier validation.
+    add_test(NAME startup_image_sample_a16_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_image_sample_a16_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_image_sample_a16_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_image_sample_a16_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_image_sample_a16_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl flat parameters keep the exported words (#1259): translation controls, then a desktop
     # draw of the translated pair with FXC 5_1 (the --pending path) and DXC 6_0.
     add_test(NAME startup_flat_param_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -2388,7 +2436,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_launch_check.py" "$<TARGET_FILE:startup_launch_probe>")
     set_tests_properties(startup_launch PROPERTIES TIMEOUT 120)
     add_test(NAME startup_debug COMMAND "${INTAKE_PYTHON}" -B
-        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>")
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_debug_check.py" "$<TARGET_FILE:startup_debug_probe>"
+        "$<TARGET_FILE:startup_debug_calls>")
     set_tests_properties(startup_debug PROPERTIES TIMEOUT 300)
 
     add_test(NAME startup_stream_request_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
@@ -2489,6 +2538,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: the SMEM offset 'off' is the literal 0; m0 and other operands keep their handling (#1674).
     add_test(NAME startup_gfx2hlsl_smem_offset COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_smem_offset_check.py")
+    # Startup shader translator: uniform sources of v_readfirstlane_b32 in straight-line code (#1723).
+    add_test(NAME startup_gfx2hlsl_readfirstlane_uniform COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_readfirstlane_uniform_check.py")
     # Startup shader translator: read-only census of every refusal site (--refusals).
     add_test(NAME startup_gfx2hlsl_refusals COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_refusals_check.py")
@@ -6806,6 +6858,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_mimg_float_store_check.py" --draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_gfx1013_image_store_${adapter} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
+        add_test(NAME compute_store_aot_gfx1013_image_atomics_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_image_atomics_gfx1013_check.py" --draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_gfx1013_image_atomics_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+            ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_gfx1013_image_atomics_${adapter}.txt")
         add_test(NAME compute_store_aot_mimg_store_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mimg-store "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -6896,6 +6953,11 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mubuf-format-store-xyz "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_mubuf_store_format_xyz_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77)
+        add_test(NAME compute_store_aot_descriptor_store_format_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-descriptor-store-format "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(compute_store_aot_descriptor_store_format_${adapter} PROPERTIES TIMEOUT 60
+            SKIP_RETURN_CODE 77)
         add_test(NAME compute_store_aot_mtbuf_store_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mtbuf-store "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})

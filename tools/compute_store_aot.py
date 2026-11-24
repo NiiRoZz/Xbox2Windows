@@ -265,12 +265,196 @@ MUBUF_D16_SOURCE_FORMAT = "BUF_FMT_16_16_16_16_UINT"
 MUBUF_D16_TEXEL_BYTES = 8
 MUBUF_SOURCE_TEXELS = {MUBUF_SOURCE_FORMAT: MUBUF_TEXEL_BYTES, MUBUF_D16_SOURCE_FORMAT: MUBUF_D16_TEXEL_BYTES}
 
+# GFX10 SQ_BUF_RSRC_WORD3. Identity DST_SEL is SQ_SEL_X/Y/Z/W (4, 5, 6, 7). FORMAT is bits
+# 18:12. RESOURCE_LEVEL (bit 24) is 1 for that encoding and 0 for the legacy DFMT/NFMT field
+# in the same bits: NFMT[14:12], DFMT[18:15] (Mesa sid.h). Every other bit, including
+# ADD_TID_ENABLE, index stride, OOB and type, has to match or the format is not one we read.
+DESCRIPTOR_FORMAT_SHIFT = 12
+DESCRIPTOR_FORMAT_MASK = 0x7F
+DESCRIPTOR_FIXED_MASK = 0xFFF80FFF
+DESCRIPTOR_IDENTITY_SEL = 0xFAC
+DESCRIPTOR_GFX10_FIXED = DESCRIPTOR_IDENTITY_SEL | (1 << 24)
+DESCRIPTOR_LEGACY_FIXED = DESCRIPTOR_IDENTITY_SEL
+# GFX10 BUF_FMT code -> (packer, channel count). The packer consumes binary32 bits, or the
+# raw VGPR bits for raw32 and the 16-bit integer forms. A d16 opcode converts each half to
+# binary32 first. 16-bit UINT/SINT with d16 is not a defined conversion, so those stores
+# are skipped rather than guessed. Codes absent from this table are refused the same way.
+DESCRIPTOR_STORE_FORMATS = {
+    20: ("raw32", 1), 22: ("raw32", 1),
+    62: ("raw32", 2), 64: ("raw32", 2),
+    72: ("raw32", 3), 74: ("raw32", 3),
+    75: ("raw32", 4), 77: ("raw32", 4),
+    56: ("unorm8", 4), 23: ("unorm16x2", 2), 44: ("unorm10", 4),
+    29: ("f16x2", 2), 71: ("f16x4", 4),
+    7: ("unorm16", 1), 8: ("snorm16", 1),
+    11: ("uint16", 1), 12: ("sint16", 1), 13: ("f16", 1),
+}
+# Legacy (DFMT << 3) | NFMT for the same packers. DFMT: 16=2, 32=4, 16_16=5, 10_10_10_2=8,
+# 8_8_8_8=10, 32_32=11, 16_16_16_16=12, 32_32_32=13, 32_32_32_32=14.
+# NFMT: UNORM=0, SNORM=1, UINT=4, SINT=5, FLOAT=7.
+def _legacy_field(dfmt, nfmt):
+    return (dfmt << 3) | nfmt
+
+
+LEGACY_DESCRIPTOR_FORMATS = {
+    _legacy_field(4, 4): 20, _legacy_field(4, 7): 22,
+    _legacy_field(11, 4): 62, _legacy_field(11, 7): 64,
+    _legacy_field(13, 4): 72, _legacy_field(13, 7): 74,
+    _legacy_field(14, 4): 75, _legacy_field(14, 7): 77,
+    _legacy_field(10, 0): 56, _legacy_field(5, 0): 23, _legacy_field(8, 0): 44,
+    _legacy_field(5, 7): 29, _legacy_field(12, 7): 71,
+    _legacy_field(2, 0): 7, _legacy_field(2, 1): 8,
+    _legacy_field(2, 4): 11, _legacy_field(2, 5): 12, _legacy_field(2, 7): 13,
+}
+_DESCRIPTOR_KIND_ORDER = ("raw32", "unorm8", "unorm16x2", "unorm10", "f16x2", "f16x4",
+                          "unorm16", "snorm16", "uint16", "sint16", "f16")
+
+
+def decode_buffer_descriptor_format(word):
+    """Return (gfx10 code, packer, channels) for one handled V# word 3.
+
+    Raises ValueError when the fixed bits or the format field are not a handled store.
+    """
+    if not isinstance(word, int) or isinstance(word, bool) or not 0 <= word <= 0xffffffff:
+        raise ValueError("Unsupported buffer descriptor format")
+    fixed = word & DESCRIPTOR_FIXED_MASK
+    field = (word >> DESCRIPTOR_FORMAT_SHIFT) & DESCRIPTOR_FORMAT_MASK
+    if fixed == DESCRIPTOR_GFX10_FIXED:
+        code = field
+    elif fixed == DESCRIPTOR_LEGACY_FIXED:
+        code = LEGACY_DESCRIPTOR_FORMATS.get(field)
+    else:
+        code = None
+    kind = DESCRIPTOR_STORE_FORMATS.get(code)
+    if kind is None:
+        raise ValueError("Unsupported buffer descriptor format")
+    return code, kind[0], kind[1]
+
+
+def descriptor_format_word(code, *, legacy=False):
+    """Identity V# word 3 for one handled GFX10 format code."""
+    if code not in DESCRIPTOR_STORE_FORMATS:
+        raise ValueError("Unsupported buffer descriptor format")
+    if legacy:
+        field = next(item for item, gfx in LEGACY_DESCRIPTOR_FORMATS.items() if gfx == code)
+        fixed = DESCRIPTOR_LEGACY_FIXED
+    else:
+        field, fixed = code, DESCRIPTOR_GFX10_FIXED
+    return fixed | (field << DESCRIPTOR_FORMAT_SHIFT)
+
+
+def descriptor_store_hlsl():
+    """One store function shared by every descriptor-format opcode.
+
+    An unmatched format, a channel-count mismatch, a misaligned dword store, or d16
+    combined with a 16-bit integer format writes nothing.
+
+    UNORM and SNORM use the Direct3D float conversion: scale into the integer range,
+    add 0.5 for a non-negative value or subtract 0.5 for a negative one, then drop
+    the fraction (half away from zero). HLSL round() is ties-to-even and disagrees
+    on an exact tie. The RDNA ISA does not state the MUBUF format unit's tie break.
+    LLVM's AMDGPU packed conversions (v_cvt_pk_*) are ties-to-even on a different
+    unit, so this choice follows the Direct3D rule and is unverified on gfx1013.
+    """
+    legacy = []
+    for field, code in sorted(LEGACY_DESCRIPTOR_FORMATS.items()):
+        keyword = "if" if not legacy else "else if"
+        legacy.append(f"        {keyword} (field == {field}u) format = {code}u;")
+    grouped = {}
+    for code, (kind, channels) in DESCRIPTOR_STORE_FORMATS.items():
+        grouped.setdefault((kind, channels), []).append(code)
+    bodies = {
+        ("raw32", 1): "        outputData.Store(addr, e0);",
+        ("raw32", 2): "        outputData.Store2(addr, uint2(e0, e1));",
+        ("raw32", 3): "        outputData.Store3(addr, uint3(e0, e1, e2));",
+        ("raw32", 4): "        outputData.Store4(addr, uint4(e0, e1, e2, e3));",
+        ("unorm8", 4): (
+            "        uint packed = descriptor_unorm(e0, 255.0) | (descriptor_unorm(e1, 255.0) << 8u)"
+            " | (descriptor_unorm(e2, 255.0) << 16u) | (descriptor_unorm(e3, 255.0) << 24u);\n"
+            "        outputData.Store(addr, packed);"),
+        ("unorm16x2", 2): (
+            "        uint packed = descriptor_unorm(e0, 65535.0) | (descriptor_unorm(e1, 65535.0) << 16u);\n"
+            "        outputData.Store(addr, packed);"),
+        ("unorm10", 4): (
+            "        uint packed = descriptor_unorm(e0, 1023.0) | (descriptor_unorm(e1, 1023.0) << 10u)"
+            " | (descriptor_unorm(e2, 1023.0) << 20u) | (descriptor_unorm(e3, 3.0) << 30u);\n"
+            "        outputData.Store(addr, packed);"),
+        ("f16x2", 2): (
+            "        uint packed = descriptor_f16(e0) | (descriptor_f16(e1) << 16u);\n"
+            "        outputData.Store(addr, packed);"),
+        ("f16x4", 4): (
+            "        uint lo = descriptor_f16(e0) | (descriptor_f16(e1) << 16u);\n"
+            "        uint hi = descriptor_f16(e2) | (descriptor_f16(e3) << 16u);\n"
+            "        outputData.Store2(addr, uint2(lo, hi));"),
+        ("unorm16", 1): "        descriptor_rmw16(addr, descriptor_unorm(e0, 65535.0));",
+        ("snorm16", 1): "        descriptor_rmw16(addr, descriptor_snorm16(e0));",
+        ("uint16", 1): "        descriptor_rmw16(addr, e0);",
+        ("sint16", 1): "        descriptor_rmw16(addr, e0);",
+        ("f16", 1): "        descriptor_rmw16(addr, descriptor_f16(e0));",
+    }
+    arms = []
+    for kind in _DESCRIPTOR_KIND_ORDER:
+        for channels in range(1, 5):
+            codes = grouped.get((kind, channels))
+            if not codes:
+                continue
+            test = " || ".join(f"format == {code}u" for code in sorted(codes))
+            integer_d16 = " && d16 == 0u" if kind in ("uint16", "sint16") else ""
+            aligned = "" if kind in ("unorm16", "snorm16", "uint16", "sint16", "f16") else " && (addr & 3u) == 0u"
+            keyword = "if" if not arms else "else if"
+            arms.append(f"    {keyword} (({test}) && channels == {channels}u{integer_d16}{aligned}) {{\n"
+                        f"{bodies[(kind, channels)]}\n    }}")
+    fixed = f"{DESCRIPTOR_FIXED_MASK:#x}u"
+    return (
+        "uint descriptor_unorm(uint bits, float scale) {\n"
+        "    precise float saturated = saturate(asfloat(bits));\n"
+        "    precise float scaled = saturated * scale;\n"
+        "    return (uint)floor(scaled + 0.5);\n"
+        "}\n"
+        "uint descriptor_snorm16(uint bits) {\n"
+        "    precise float saturated = clamp(asfloat(bits), -1.0, 1.0);\n"
+        "    precise float scaled = saturated * 32767.0;\n"
+        "    precise float rounded = scaled >= 0.0 ? floor(scaled + 0.5) : ceil(scaled - 0.5);\n"
+        "    return (uint)(int)rounded;\n"
+        "}\n"
+        "uint descriptor_f16(uint bits) { return f32tof16(asfloat(bits)); }\n"
+        "uint descriptor_expand(uint packed, uint high) {\n"
+        "    uint half = high != 0u ? (packed >> 16u) : (packed & 0xffffu);\n"
+        "    return asuint(f16tof32(half));\n"
+        "}\n"
+        "void descriptor_rmw16(uint addr, uint half) {\n"
+        "    if ((addr & 1u) != 0u) return;\n"
+        "    uint base = addr & 0xfffffffcu;\n"
+        "    uint shift = (addr & 2u) << 3u;\n"
+        "    uint clear = ~(0xffffu << shift);\n"
+        "    outputData.InterlockedAnd(base, clear);\n"
+        "    outputData.InterlockedOr(base, (half & 0xffffu) << shift);\n"
+        "}\n"
+        "void store_descriptor_format(uint formatWord, uint addr, uint channels, uint d16, "
+        "uint c0, uint c1, uint c2, uint c3) {\n"
+        f"    uint fixedBits = formatWord & {fixed};\n"
+        f"    uint field = (formatWord >> {DESCRIPTOR_FORMAT_SHIFT}u) & {DESCRIPTOR_FORMAT_MASK:#x}u;\n"
+        "    uint format = 0u;\n"
+        f"    if (fixedBits == {DESCRIPTOR_GFX10_FIXED:#x}u) {{\n"
+        "        format = field;\n"
+        f"    }} else if (fixedBits == {DESCRIPTOR_LEGACY_FIXED:#x}u) {{\n"
+        + "\n".join(legacy) + "\n"
+        "    }\n"
+        "    uint e0 = d16 != 0u ? descriptor_expand(c0, 0u) : c0;\n"
+        "    uint e1 = d16 != 0u ? descriptor_expand(c0, 1u) : c1;\n"
+        "    uint e2 = d16 != 0u ? descriptor_expand(c1, 0u) : c2;\n"
+        "    uint e3 = d16 != 0u ? descriptor_expand(c1, 1u) : c3;\n"
+        + "\n".join(arms) + "\n"
+        "}\n"
+    )
+
 
 def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=None, stride=None,
           image_srv_descriptor=None, constant_descriptor=None, group_reg_y=None, group_reg_z=None, source_descriptor=None,
           source_stride=None, source_format=None, output_format=None, image_descriptor=None, image_format=None,
           image_uav_mip=None, image_float_domain=None, cpu="gfx1013", lds_bytes=0,
-          lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None, rsrc2=None, wave_size=None):
+          lds_f32_mode=None, lds_f64_mode=None, mubuf_d16_xyz_mode=None,
+          descriptor_format_constant=None, rsrc2=None, wave_size=None):
     """v0, v1 and v2 are local X, Y and Z; group_reg, group_reg_y and group_reg_z are the group IDs.
 
     rsrc2 is the program's COMPUTE_PGM_RSRC2. When given, it places the group IDs
@@ -282,6 +466,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     source t0; source_stride is the t0 byte stride that indexed reads use. source_format declares
     the MUBUF source descriptor format, and output_format declares the u0 descriptor format
     for formatted MUBUF stores. Both declarations require identity channel selectors.
+    descriptor_format_constant lists one b0 word index per formatted MUBUF store, in program
+    order. Each index must already have been read from the constant descriptor. The word is
+    V# word 3. An unknown format or a channel count that does not match the opcode does not store.
     gfx1013 uses RGBA32 FLOAT for full-mask image_store or image_load_mip. When
     both are used, image_srv_descriptor supplies the separate t0 descriptor.
     mubuf_d16_xyz_mode opts into a caller-verified W-preserving RGBA16 store.
@@ -320,8 +507,11 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("The R32_UINT MSAA image binding requires gfx1030")
     image_atomic_type = IMAGE_ATOMIC_TYPES.get(image_format) if image_output else None
     rgba32_float_image = cpu == "gfx1013" and image_format == RGBA32_FLOAT
+    # gfx1013 takes the shared image atomic lowering on an R32_UINT UAV only (add, umax, cmpswap; see lower()).
+    gfx1013_image_atomic = cpu == "gfx1013" and image_atomic_type is not None and image_format == "R32_UINT"
     if image_output:
-        if ((cpu != "gfx1030" and not rgba32_float_image) or descriptor_offset is not None or stride is not None
+        if ((cpu != "gfx1030" and not rgba32_float_image and not gfx1013_image_atomic)
+                or descriptor_offset is not None or stride is not None
                 or image_descriptor is None
                 or (image_format not in IMAGE_FORMATS and not image_atomic_type and not rgba32_float_image)
                 or (image_atomic_type and image_uav_mip != 0)
@@ -375,6 +565,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Invalid group register")
     if stride is not None and (not group_regs or not 4 <= stride <= 0x3fff or stride % 4):
         raise ValueError("Indexed stores require a group register and aligned stride")
+    if descriptor_format_constant is not None and output_format is not None:
+        raise ValueError("Descriptor format constants conflict with an output format")
     if output_format is not None and (output_format not in MUBUF_OUTPUT_FORMATS or cpu != "gfx1030"
                                       or stride is None):
         raise ValueError("Unsupported formatted output binding")
@@ -383,6 +575,13 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     if mubuf_d16_xyz_mode is not None and (mubuf_d16_xyz_mode != "preserve-w"
                                            or output_format != MUBUF_D16_OUTPUT_FORMATS[4] or cpu != "gfx1030"):
         raise ValueError("D16 XYZ mode requires a gfx1030 RGBA16 UINT output binding")
+    format_words = None
+    if descriptor_format_constant is not None:
+        format_words = tuple(descriptor_format_constant)
+        if (constant_descriptor is None or not format_words
+                or any(not isinstance(index, int) or isinstance(index, bool)
+                       or index not in range(CONSTANT_WORDS) for index in format_words)):
+            raise ValueError("Invalid buffer descriptor format constant")
     scalar = {table_reg: "table"}
     for axis, reg in group_regs.items():
         scalar[reg] = ("group", axis)
@@ -392,6 +591,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
     # they enter vector only at s_waitcnt vmcnt(0).
     loading = {}
     stores = []
+    format_store_index = 0
     atomic_update = False
     # DS operations and image loads can consume each other's temporaries. Keep them in instruction order.
     staged_steps = []
@@ -1529,6 +1729,9 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                                r"dmask:0x(?P<mask>[0-9a-f]+) dim:SQ_RSRC_IMG_2D(?: unorm)?", line):
             op = m["op"]
             signed = op in ("smin", "smax")
+            # gfx1013 is limited to the forms its draws cover; the lowering itself is the gfx1030 one.
+            if cpu == "gfx1013" and op not in ("add", "umax", "cmpswap"):
+                raise ValueError("gfx1013 image atomics require add, umax or cmpswap")
             if (image_atomic_type != ("int" if signed else "uint") or image_float != (op in IMAGE_FLOAT_ATOMIC_OPS)
                     or guard_span is not None or stores):
                 raise ValueError("Unsupported image atomic target or binding")
@@ -1773,28 +1976,52 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if m["typed"] and (cpu != "gfx1030" or not idxen or offen or m["format"] != fmt):
                 raise ValueError("Unsupported typed buffer store format, target or address mode")
             formatted = channels is not None and not m["typed"]
+            descriptor_store = False
+            format_index = None
             if formatted:
-                if cpu != "gfx1030" or not idxen or offen:
+                if not idxen or offen:
                     raise ValueError("Unsupported formatted buffer store target or address mode")
-                if output_format is None:
-                    raise ValueError("Formatted buffer stores require an output format")
-                if packed and components == 3 and mubuf_d16_xyz_mode != "preserve-w":
-                    raise ValueError("Formatted D16 XYZ store requires an explicit W-preservation contract")
-                expected = MUBUF_D16_OUTPUT_FORMATS[format_components] if packed else MUBUF_UINT_FORMATS[components - 1]
-                if output_format != expected:
-                    raise ValueError("Formatted buffer store width does not match output format")
+                if format_words is not None:
+                    if format_store_index >= len(format_words):
+                        raise ValueError("Formatted buffer store is missing a format constant")
+                    format_index = format_words[format_store_index]
+                    format_store_index += 1
+                    if not any(tag == ("constant_word", format_index) and reg not in pending
+                               for reg, tag in scalar.items()):
+                        raise ValueError("Formatted buffer store format constant is not ready")
+                    descriptor_store = True
+                else:
+                    if cpu != "gfx1030":
+                        raise ValueError("Unsupported formatted buffer store target or address mode")
+                    if output_format is None:
+                        raise ValueError("Formatted buffer stores require an output format")
+                    if packed and components == 3 and mubuf_d16_xyz_mode != "preserve-w":
+                        raise ValueError("Formatted D16 XYZ store requires an explicit W-preservation contract")
+                    expected = (MUBUF_D16_OUTPUT_FORMATS[format_components] if packed
+                                else MUBUF_UINT_FORMATS[components - 1])
+                    if output_format != expected:
+                        raise ValueError("Formatted buffer store width does not match output format")
             first, *last = map(int, re.findall(r"\d+", m["data"]))
             base, high = int(m["base"]), int(m["high"])
             offset = int(m["offset"] or 0)
+            # A descriptor-format element may begin on a halfword. The byte offset selects
+            # which 16-bit lane a single-channel store updates.
+            align = 2 if descriptor_store else width
             if (last != ([] if count == 1 else [first + count - 1])
                     or (formatted and first + count > 256)
-                    or high != base + 3 or base % 4 or offset % width or offset > 4095
+                    or high != base + 3 or base % 4 or offset % align or offset > 4095
                     or pending.intersection(range(base, high + 1))
                     or any(scalar.get(base + i) != ("uav", i) for i in range(4))):
                 raise ValueError("Unverified raw UAV store")
             byte_shift = (offset % 4) * 8
-            # Reserve and address the containing DWORD for a subword store.
-            offset &= ~3
+            # Reserve and address the containing DWORD for a subword store. A descriptor-format
+            # store keeps its byte offset so a halfword element is not moved to the low lane.
+            if not descriptor_store:
+                offset &= ~3
+            # The format word is not known here, so a descriptor store reserves four bytes per
+            # channel. d16_xyzw is two VGPRs and sixteen bytes. The caller-declared UINT path
+            # still reserves one DWORD per data VGPR.
+            span = 4 * (components if descriptor_store else count)
             address = f"{offset}u"
             addr = m["addr"]
             addr_regs = list(map(int, re.findall(r"\d+", addr)))
@@ -1803,7 +2030,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 store_layout = ("fixed",)
                 covered = set()
             elif (stride is not None and idxen and not offen and len(addr_regs) == 1
-                    and isinstance(tags[0], tuple) and tags[0][0] == "thread" and offset + 4 * count <= stride):
+                    and isinstance(tags[0], tuple) and tags[0][0] == "thread" and offset + span <= stride):
                 # One index axis: every other group dimension must be one, so no two
                 # invocations of a group share an address.
                 index = tags[0][1]
@@ -1815,7 +2042,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     and tags[0][0] == "thread" and tags[1][0] == "thread_bytes" and tags[0][1] != tags[1][1]):
                 # idxen offen: address = index * stride + byte offset + instruction offset.
                 (_, index), (_, column, shift) = tags
-                if (offset + 4 * count > 1 << shift or dims[column] << shift > stride):
+                if (offset + span > 1 << shift or dims[column] << shift > stride):
                     raise ValueError("Store leaves its element or row")
                 store_layout = ("index_offset", index, column, shift)
                 covered = {index, column}
@@ -1826,7 +2053,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                     and tags[0][1] not in (tags[1][1], tags[1][3])):
                 # Three axes: index * stride + (row << row_shift) + (column << shift) + instruction offset.
                 (_, index), (_, row, row_shift, column, shift) = tags
-                if (offset + 4 * count > 1 << shift or dims[column] << shift > 1 << row_shift
+                if (offset + span > 1 << shift or dims[column] << shift > 1 << row_shift
                         or dims[row] << row_shift > stride):
                     raise ValueError("Store leaves its element, row or plane")
                 store_layout = ("index_plane", index, row, row_shift, column, shift)
@@ -1840,7 +2067,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 _, row, pitch, column, shift = tags[0]
                 # A group's rows start on a 24-bit-aligned power-of-two boundary, so masking keeps them
                 # consecutive; their pitches must not wrap the 32-bit address onto each other.
-                if (offset + 4 * count > 1 << shift or dims[column] << shift > pitch
+                if (offset + span > 1 << shift or dims[column] << shift > pitch
                         or dims[row] * pitch > 1 << 32):
                     raise ValueError("Store leaves its element or row")
                 store_layout = ("pitch", row, pitch, column, shift)
@@ -1853,7 +2080,7 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if layout not in (None, store_layout):
                 raise ValueError("Stores use different address layouts")
             layout = store_layout
-            span_end = offset + 4 * count
+            span_end = offset + span
             if any(lo < span_end and offset < hi for lo, hi in written_spans):
                 raise ValueError("Overlapping raw UAV stores")
             written_spans.append((offset, span_end))
@@ -1868,18 +2095,26 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
                 source_shift = 16 if m["store_hi"] else 0
                 words[0] = (f"((outputData.Load({address}) & {keep:#x}u) | "
                             f"((({words[0]} >> {source_shift}u) & {mask:#x}u) << {byte_shift}u))")
-            elif partial:
+            elif partial and not descriptor_store:
                 # Reserve the entire final DWORD, including the untouched high half. The indexed
                 # layout, aligned stride and overlap checks give that word a single writer.
                 final_address = address if count == 1 else f"{address} + 4u"
                 words[-1] = f"((outputData.Load({final_address}) & 0xffff0000u) | ({words[-1]} & 0xffffu))"
-            words = ", ".join(words)
-            arg = words if count == 1 else f"uint{count}({words})"
-            stores.append(f"    outputData.Store{count if count > 1 else ''}({address}, {arg});")
+            if descriptor_store:
+                supplied = words + ["0u"] * (4 - len(words))
+                stores.append("    store_descriptor_format("
+                              f"{hlsl_word(('constant_word', format_index))}, {address}, {components}u, "
+                              f"{int(packed)}u, {', '.join(supplied)});")
+            else:
+                text = ", ".join(words)
+                arg = text if count == 1 else f"uint{count}({text})"
+                stores.append(f"    outputData.Store{count if count > 1 else ''}({address}, {arg});")
         else:
             raise ValueError(f"Unsupported compute instruction: {line}")
     if ds_wait:
         raise ValueError("Expected immediate s_waitcnt lgkmcnt(0) after DS")
+    if format_words is not None and format_store_index != len(format_words):
+        raise ValueError("Unused buffer descriptor format constant")
     if not stores:
         raise ValueError("Expected at least one observable store")
     if guard is not None and guard["label"] is not None and not guard["at_label"]:
@@ -1916,7 +2151,10 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         cbuffer += CVT_U32_F32_HELPER
     uav_texel_type = image_atomic_type or ("float4" if rgba32_float_image else "uint4")
     uav = f"RWTexture2D<{uav_texel_type}>" if image_output else "RWByteAddressBuffer"
-    return (f"{cbuffer}{uav} outputData : register(u0);\n[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
+    # The helper reads outputData, so it follows the UAV declaration.
+    descriptor_hlsl = descriptor_store_hlsl() if "store_descriptor_format(" in body else ""
+    return (f"{cbuffer}{uav} outputData : register(u0);\n{descriptor_hlsl}"
+            f"[numthreads({dims[0]},{dims[1]},{dims[2]})]\n"
             f"void main(uint3 tid : SV_DispatchThreadID{local}) {{\n{body}\n}}\n")
 
 
@@ -1947,6 +2185,8 @@ def main():
                         help="Caller-declared MUBUF t0 descriptor format with identity channel selectors")
     parser.add_argument("--output-format", choices=MUBUF_OUTPUT_FORMATS,
                         help="Caller-declared MUBUF u0 descriptor format with identity channel selectors")
+    parser.add_argument("--descriptor-format-constant", action="append", type=lambda n: int(n, 0),
+                        help="b0 word index holding V# word 3 for one formatted store, in program order")
     parser.add_argument("--mubuf-d16-xyz-mode", choices=("preserve-w",),
                         help="Experimental RGBA16 UINT store with caller-verified preservation of W")
     parser.add_argument("--image-descriptor", type=lambda n: int(n, 0),
@@ -1984,7 +2224,8 @@ def main():
                    cpu=args.cpu, lds_bytes=args.lds_bytes,
                    lds_f32_mode=args.lds_f32_mode, lds_f64_mode=args.lds_f64_mode,
                    mubuf_d16_xyz_mode=args.mubuf_d16_xyz_mode, image_srv_descriptor=args.image_srv_descriptor,
-                   rsrc2=args.rsrc2, wave_size=args.wave_size)
+descriptor_format_constant=args.descriptor_format_constant,
+rsrc2=args.rsrc2, wave_size=args.wave_size)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(source, encoding="ascii")
     print(json.dumps({"container_sha256": hashlib.sha256(blob).hexdigest(),

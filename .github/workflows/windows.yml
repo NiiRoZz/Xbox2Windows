@@ -65,6 +65,7 @@ jobs:
               (["tests/pixel_attribute_sampled_check.py", *COMMON_LLVM], {}),
               (["tests/compute_mimg_msaa_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "libLLVM-15.so.1"], {}),
               (["tests/compute_mimg_float_store_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
+              (["tests/compute_image_atomics_gfx1013_check.py", "--binary", "llvm-mc-15", "llvm-objcopy-15", "--llvm", "libLLVM-15.so.1"], {}),
               (["tests/mesh_indexed_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_multi_check.py", *COMMON_LLVM], {}),
               (["tests/mesh_descriptor_swap_check.py", *COMMON_LLVM], {}),
@@ -80,9 +81,12 @@ jobs:
               (["tests/startup_image_3d_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_image_load_mip_check.py", "--llvm-mc", "llvm-mc-15"], {}),
               (["tests/startup_image_2d_array_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_image_sample_a16_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_image_sample_a16_check.py", "decode", "libLLVM-15.so.1"], {}),
               (["tests/startup_flat_param_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_bit_alu_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_mad_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_gfx2hlsl_swap_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_shift64_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_vopc_sdwa_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_gfx2hlsl_vopc_sdwa_check.py", "decode", "libLLVM-15.so.1"], {}),
@@ -95,6 +99,7 @@ jobs:
               (["tests/startup_inline_sampler_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/startup_smem_address_check.py", "binary", "llvm-mc-15"], {}),
               (["tests/compute_entry_layout_check.py", "binary", "llvm-mc-15"], {}),
+              (["tests/startup_ngg_slice_check.py", "binary", "llvm-mc-15"], {}),
           ]
 
           def run_one(item):
@@ -193,6 +198,7 @@ jobs:
             tests/startup_image_load_mip_check.py \
             tests/startup_gfx2hlsl_operand_count_check.py \
             tests/startup_image_2d_array_check.py \
+            tests/startup_image_sample_a16_check.py \
             tests/startup_host_cpu_check.py \
             tests/startup_live_telemetry_check.py \
             tests/startup_gfx2hlsl_cvt_alu_check.py \
@@ -202,11 +208,13 @@ jobs:
             tests/startup_gfx2hlsl_smem_offset_check.py \
             tests/startup_gfx2hlsl_refusals_check.py \
             tests/startup_gfx2hlsl_scalar_m0_check.py \
+            tests/startup_gfx2hlsl_readfirstlane_uniform_check.py \
             tests/startup_triage_run_check.py \
             tests/startup_run_ps1_check.py \
             tests/startup_flat_param_check.py \
             tests/startup_gfx2hlsl_bit_alu_check.py \
             tests/startup_gfx2hlsl_mad_check.py \
+            tests/startup_gfx2hlsl_swap_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py \
             tests/startup_gfx2hlsl_sop2_complement_check.py \
