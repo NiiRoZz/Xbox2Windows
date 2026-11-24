@@ -34,8 +34,10 @@ inline bool interval(uint8_t eab, uint8_t q, uint16_t sym, uint32_t& f, uint32_t
 }
 
 // One flushed fragment (header + payload); false when a symbol has no interval or the payload is too long.
+// With split, the same rANS stream is written as unflushed fragments of random lengths instead: the lane
+// state then carries across fragment headers.
 inline bool encode_fragment(uint8_t ab, uint8_t narrow, uint8_t q, const uint16_t* values, size_t count,
-                            bool trim, std::vector<uint8_t>& out) {
+                            bool trim, std::vector<uint8_t>& out, Rng* split = nullptr) {
     const uint8_t eab = static_cast<uint8_t>(ab - narrow);
     uint64_t state = 1u << 24;
     std::vector<uint8_t> emitted;
@@ -51,10 +53,35 @@ inline bool encode_fragment(uint8_t ab, uint8_t narrow, uint8_t q, const uint16_
         state = ((state / f) << 16) + state % f + start;
     }
     size_t omit = 0;
-    if (trim) {
+    if (trim && !split) {
         while (omit < 2 && omit < last_emitted && emitted[omit] == 0) ++omit;
     }
     const size_t payload = 4 + emitted.size() - omit;
+    if (split) {
+        std::vector<uint8_t> bytes;
+        for (int b = 3; b >= 0; --b) bytes.push_back(static_cast<uint8_t>(state >> (8 * b)));
+        for (size_t k = emitted.size(); k > 0; --k) bytes.push_back(emitted[k - 1]);
+        // The last fragment must start at or before the last byte that precedes the final zero bytes:
+        // a lane that decodes its last symbol after its budget ran out finishes in DRAIN and never
+        // reads a later fragment (the decoder then sees those bytes as trailing data).
+        const size_t last_start = bytes.size() - last_emitted - 1;
+        for (size_t at = 0; at < bytes.size();) {
+            size_t len = 1 + split->below(300);
+            if (at + len > last_start) len = bytes.size() - at;
+            const uint8_t header = static_cast<uint8_t>((narrow << 6) | q);
+            if (len <= 256) {
+                out.push_back(header);
+                out.push_back(static_cast<uint8_t>(len - 1));
+            } else {
+                out.push_back(header | 0x20);
+                out.push_back(static_cast<uint8_t>(len - 257));
+                out.push_back(static_cast<uint8_t>((len - 257) >> 8));
+            }
+            out.insert(out.end(), bytes.begin() + at, bytes.begin() + at + len);
+            at += len;
+        }
+        return true;
+    }
     if (payload > 65792) return false;
     const uint8_t header = static_cast<uint8_t>((narrow << 6) | 0x10 | q);
     if (payload <= 256) {
@@ -144,6 +171,7 @@ struct Options {
     bool uniform = false;         // uniform symbols instead of the fragment model's distribution
     bool narrow = true;           // random alphabet narrowing in the headers
     bool trim = true;             // randomly omit the trailing zero bytes of a fragment
+    bool unflushed = false;       // code about half of the lanes as one stream cut into unflushed fragments
     int bc7_lane = -1;            // lane whose symbol pairs must form a valid BC7 control code
     size_t padding = 0;           // trailing zero bytes
     size_t window = 8;            // bytes served per cycle; only the negative control changes it
@@ -158,7 +186,8 @@ inline bool make_stream(const uint8_t* ab, size_t n, size_t target, Rng& rng, co
         size_t at = 0;
         while (at < target) {
             const bool control = static_cast<int>(l) == o.bc7_lane;
-            size_t count = 1 + rng.below(o.max_fragment);
+            const bool whole = o.unflushed && !control && at == 0 && (rng.next() & 1);
+            size_t count = whole ? target : 1 + rng.below(o.max_fragment);
             if (control) count = 2 * ((count + 1) / 2);  // keep code pairs inside one fragment
             if (count > target - at) count = target - at;
             uint8_t narrow = (o.narrow && !control) ? static_cast<uint8_t>(rng.below(ab[l] < 3 ? ab[l] + 1 : 4)) : 0;
@@ -196,7 +225,7 @@ inline bool make_stream(const uint8_t* ab, size_t n, size_t target, Rng& rng, co
                 }
             }
             const bool trim = o.trim && (rng.next() & 1);
-            if (!encode_fragment(ab[l], narrow, q, v, count, trim, lane_bytes[l])) {
+            if (!encode_fragment(ab[l], narrow, q, v, count, trim, lane_bytes[l], whole ? &rng : nullptr)) {
                 if (count == 1) return false;
                 // payload over the long-header limit: retry with fewer symbols
                 for (size_t k = 0; k < count; ++k) v[k] = 0;

@@ -174,11 +174,12 @@ std::vector<Stream> streams(const std::string& dir, bool bench, bool large) {
     }
     if (!bench) list.push_back({ "mode6", 7, 1, from_hex(MODE6_HEX), {}, 0, false });
     bcpack_test::Rng rng{ bench ? 7u : 1139u };
-    auto add = [&](unsigned format, size_t blocks, uint32_t fragment, bool uniform, size_t padding) {
+    auto add = [&](unsigned format, size_t blocks, uint32_t fragment, bool uniform, size_t padding, bool unflushed = false) {
         bcpack_test::Options o;
         o.max_fragment = fragment;
         o.uniform = uniform;
         o.padding = padding;
+        o.unflushed = unflushed;
         o.bc7_lane = format == 7 ? 15 : -1;
         Stream s{ "", format, blocks, {}, {}, 0, false };
         std::vector<uint16_t> symbols;
@@ -186,6 +187,7 @@ std::vector<Stream> streams(const std::string& dir, bool bench, bool large) {
         if (!bcpack_test::make_stream(format == 7 ? AB7 : AB1, n, target, rng, o, s.bytes, symbols)) std::abort();
         char name[96];
         std::snprintf(name, sizeof name, "BC%u %zu blocks, fragments <= %u%s", format, blocks, fragment, uniform ? ", uniform" : "");
+        if (unflushed) std::strcat(name, ", unflushed lanes");
         s.name = name;
         list.push_back(s);
     };
@@ -202,6 +204,7 @@ std::vector<Stream> streams(const std::string& dir, bool bench, bool large) {
             add(format, 300, 150, false, 0);
             add(format, 300, 150, true, 1);
             add(format, 300, 4096, false, 0);
+            add(format, 200, 150, false, 0, true);
         }
         // Each stream with one block more or fewer, and with the other format's lane table.
         const size_t base_count = list.size();
@@ -229,6 +232,7 @@ std::vector<Stream> streams(const std::string& dir, bool bench, bool large) {
             bcpack_test::Options o;
             o.max_fragment = 1 + rng.below(200);
             o.padding = rng.below(2);
+            o.unflushed = (rng.next() & 1) != 0;
             Stream s{ "", 0, 0, {}, ab, 1 + rng.below(160), false };
             std::vector<uint16_t> symbols;
             if (!bcpack_test::make_stream(ab.data(), ab.size(), s.target, rng, o, s.bytes, symbols)) std::abort();

@@ -1,6 +1,7 @@
 // Round trip of the test-only BCPack encoder (tests/bcpack_encoder.h) through decode_lanes and
 // decode_bcpack: random BC1- and BC7-shaped streams with short and long fragment headers, narrowed
-// alphabets, trimmed flushed fragments, uniform and model-distributed symbols and zero padding.
+// alphabets, trimmed flushed fragments, unflushed fragments, uniform and model-distributed symbols and
+// zero padding.
 // --mutate window interleaves with a 7-byte instead of an 8-byte cycle budget; the decoder must then
 // disagree, which shows the check depends on the shared-stream arbitration (negative control).
 #include "bcpack_encoder.h"
@@ -33,6 +34,7 @@ int main(int argc, char** argv) {
         bcpack_test::Options o;
         o.max_fragment = 1 + rng.below(t % 3 == 0 ? 600 : 150);  // long fragments need three-byte headers
         o.uniform = t % 5 == 0;
+        o.unflushed = t % 4 >= 2;
         o.bc7_lane = bc7 ? 15 : -1;
         o.padding = rng.below(3);
         if (mutate) o.window = 7;
