@@ -24,6 +24,7 @@
 #include "startup_stubs/depth_state_apply.h"
 #include "startup_stubs/d16_image_format.h"
 #include "startup_stubs/heap_indexed_root.h"
+#include "startup_stubs/list_dispatch.h"
 #include "startup_stubs/bc7_4k_s.h"
 #include "startup_stubs/bc64_chain.h"
 #include "startup_stubs/address_texture.h"
@@ -2658,6 +2659,26 @@ void __stdcall list_root_cbv(Wrapper* self, UINT parameter, u64 address)
     }
     pass.root_address[parameter] = (address && readable_window(address, 1)) ? address : 0;
 }
+// List slot 14, Dispatch. Forwarded only with a desktop compute pipeline and root bound and group counts within the limit.
+void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
+{
+    auto* list = recording(self);
+    x2w_startup::ListDispatch request;
+    request.list_open = list != nullptr;
+    if (list) request.type = list->GetType();
+    const Pass& pass = pass_of(self);
+    request.compute_pipeline = pass.compute_pipeline;
+    request.compute_root = pass.compute_root;
+    request.x = x, request.y = y, request.z = z;
+    const x2w_startup::DispatchDecision decision = x2w_startup::decide_dispatch(request);
+    if (decision != x2w_startup::DispatchDecision::forward) {
+        static LONG refusals;
+        if (first_calls(refusals, 16))
+            log("x2w-render Dispatch(%u, %u, %u) refused: %s", x, y, z, x2w_startup::dispatch_reason(decision));
+        return;
+    }
+    list->Dispatch(x, y, z);
+}
 extern LONG translated_draws, untranslated_draws, frame_number;
 bool draw_translated(Wrapper* self, bool indexed, UINT count, UINT instances, UINT start, INT base_vertex, UINT start_instance);
 // List slot 12, DrawInstanced.
@@ -4100,6 +4121,7 @@ void build_tables()
         list_typed[139] = reinterpret_cast<ListTyped>(&list_reset);
         list_typed[148] = reinterpret_cast<ListTyped>(&list_allocate_upload);
         list_typed[12] = reinterpret_cast<ListTyped>(&list_draw);
+        list_typed[14] = reinterpret_cast<ListTyped>(&list_dispatch);
         list_typed[20] = reinterpret_cast<ListTyped>(&list_topology);
         list_typed[21] = reinterpret_cast<ListTyped>(&list_viewports);
         list_typed[22] = reinterpret_cast<ListTyped>(&list_scissors);
