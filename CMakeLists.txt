@@ -611,6 +611,15 @@ add_test(NAME startup_storage_consumer_pair_accept_refused_control
 set_tests_properties(startup_storage_consumer_pair startup_storage_consumer_pair_accept_refused_control PROPERTIES TIMEOUT 60)
 set_tests_properties(startup_storage_consumer_pair_accept_refused_control PROPERTIES PASS_REGULAR_EXPRESSION
     "FAIL: after both fences: R destination taken as data differs from the stream prefix in 4096 byte\\(s\\), first at 0xf000")
+# Test-only BCPack encoder (tests/bcpack_encoder.h): random synthetic streams must decode back to their
+# symbols. Interleaving with a 7-byte cycle budget is the negative control.
+add_executable(bcpack_encoder_check tests/bcpack_encoder_check.cpp)
+target_compile_features(bcpack_encoder_check PRIVATE cxx_std_17)
+target_include_directories(bcpack_encoder_check PRIVATE src)
+add_test(NAME bcpack_encoder_roundtrip COMMAND bcpack_encoder_check)
+add_test(NAME bcpack_encoder_window_control COMMAND bcpack_encoder_check --mutate window)
+set_tests_properties(bcpack_encoder_roundtrip bcpack_encoder_window_control PROPERTIES TIMEOUT 120)
+set_tests_properties(bcpack_encoder_window_control PROPERTIES WILL_FAIL TRUE)
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
 # The test compiles the stand-in's source into itself so it can redirect CreateThread and operator new.
