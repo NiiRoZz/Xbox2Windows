@@ -25,6 +25,7 @@
 #include "startup_stubs/derived_blend.h"
 #include "startup_stubs/placement_publish.h"
 #include "startup_stubs/placed_build.h"
+#include "startup_stubs/placed_buffer_range.h"
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_buffer.h"
 
@@ -33,6 +34,7 @@
 #include <d3d12.h>
 #include "command_list_slot_names.h"
 #include "console_plane_size.h"
+#include "descriptor_heap_type.h"
 #include "small_texture_4k.h"
 #include "null_binding_cause.h"
 #include "null_texture_view.h"
@@ -291,16 +293,7 @@ void log(const char* format, ...)
     line[n++] = '\r';
     line[n++] = '\n';
     x2w_trap::write_all(GetStdHandle(STD_ERROR_HANDLE), line, static_cast<DWORD>(n));
-    wchar_t log_path[MAX_PATH];
-    const DWORD length = GetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path, MAX_PATH);
-    if (length && length < MAX_PATH) {
-        HANDLE out = CreateFileW(log_path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (out != INVALID_HANDLE_VALUE) {
-            x2w_trap::write_all(out, line, static_cast<DWORD>(n));
-            CloseHandle(out);
-        }
-    }
+    x2w_trap::append_log(line, static_cast<DWORD>(n), false);
 }
 
 void guid_text(const GUID* g, char* out, std::size_t size)
@@ -323,7 +316,7 @@ void hex_text(const void* data, std::size_t bytes, char* out, std::size_t size)
     for (std::size_t i = 0; i < bytes && used + 4 < size; ++i) used += std::snprintf(out + used, size - used, "%02x ", p[i]);
 }
 
-bool first_calls(LONG& counter, LONG limit = 3) { return InterlockedIncrement(&counter) <= limit; }
+bool first_calls(LONG& counter, LONG limit = 3) { return x2w_local::first_calls(counter, limit); }
 
 // X2W_D3D12_DEBUG=1: the desktop debug layer's messages are drained into the log after forwarded
 // calls, tagged with the call that preceded them, and a device removal is reported once with its reason.
@@ -1017,6 +1010,20 @@ void* __stdcall device_custom_heap_properties(void* a, void* b, UINT node_mask, 
 
 // Device slot 43, desktop GetAdapterLuid(), returned by value.
 
+// Device slot 15, desktop GetDescriptorHandleIncrementSize(type). A type desktop has is forwarded as before. Any
+// other value makes desktop answer 0 and the debug layer report an error (#870): the stand-in logs the value once
+// and answers 0 itself, with no increment made up for it.
+static_assert(x2w_startup::desktop_descriptor_heap_type_count == D3D12_DESCRIPTOR_HEAP_TYPE_NUM_TYPES);
+UINT __stdcall device_descriptor_increment_size(Wrapper* self, UINT type)
+{
+    if (!x2w_startup::is_valid_desktop_descriptor_heap_type(type)) {
+        static LONG calls;
+        if (first_calls(calls, 1)) log("x2w-d3d12 Device::slot15 out-of-range heap type 0x%x -> 0", type);
+        return 0;
+    }
+    return static_cast<UINT>(forward_slot<device_kind, 15>(self, type, 0, 0, 0, 0, 0, 0, 0));
+}
+
 // Device slots 34/35, desktop MakeResident/Evict(count, objects).
 template <int N>
 HRESULT __stdcall device_residency(Wrapper* self, UINT count, void* const* objects)
@@ -1501,7 +1508,7 @@ void read_back_presented(ID3D12CommandQueue* queue, ID3D12Resource* surface)
     const LONG count = InterlockedIncrement(&shown_frames);
     std::snprintf(shown_note, sizeof(shown_note), "surface %llux%u format %d, readback %ld, mean level %.2f/255",
                   desc.Width, desc.Height, desc.Format, count, sum / (3.0 * shown_width * shown_height));
-    if (count <= 3 || count % 40 == 0) log("x2w-render presented %s", shown_note);
+    if ((count > 0 && count <= 3) || count % 40 == 0) log("x2w-render presented %s", shown_note);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2360,7 +2367,7 @@ void __stdcall list_draw(Wrapper* self, UINT vertices, UINT instances, UINT firs
     if (list && pass.pipeline_real && pass.targets_bound && pass.topology_ok && pass.topology != 0x11 && (pass.srv_bound & 1)) {
         list->DrawInstanced(vertices, instances, first_vertex, first_instance);
         const LONG n = InterlockedIncrement(&render_draws);
-        if (n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
+        if (n > 0 && n <= 3) log("x2w-render DrawInstanced(%u, %u, %u, %u) recorded", vertices, instances, first_vertex, first_instance);
     } else {
         InterlockedIncrement(&render_draws_skipped);
     }
@@ -2954,6 +2961,7 @@ HRESULT __stdcall device_frame_event(Wrapper*, UINT type, UINT offset_us, void* 
 // title address; nothing translates title GPU addresses yet. Textures trap.
 std::mutex placed_mutex;
 std::vector<std::pair<void*, ID3D12Heap*>> existing_heaps;
+volatile LONG64 placed_buffer_calls, placed_buffer_region_info, placed_buffer_queries;  // five-second totals
 
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
@@ -3001,12 +3009,19 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         *out = w;
         return S_OK;
     }
-    MEMORY_BASIC_INFORMATION info{};
-    if (!address || VirtualQuery(address, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT) {
+    // The allocation holding the address, and whether every byte from its base to the end of the
+    // buffer is committed in it: one region-information call for a fully committed private
+    // allocation, otherwise a region walk that stops at the end of the buffer.
+    x2w_startup::PlacedBufferRange range;
+    const bool committed = x2w_startup::measure_placed_buffer(address, desc->Width, range);
+    InterlockedIncrement64(&placed_buffer_calls);
+    if (range.region_info) InterlockedIncrement64(&placed_buffer_region_info);
+    InterlockedAdd64(&placed_buffer_queries, range.queries);
+    if (!committed) {
         log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) address=%p not committed -> E_INVALIDARG", address);
         return E_INVALIDARG;
     }
-    void* base = info.AllocationBase;
+    void* base = range.base;
     const auto initial_state = state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE ||
         state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS ? static_cast<D3D12_RESOURCE_STATES>(state) : D3D12_RESOURCE_STATE_COMMON;
     if (initial_state != D3D12_RESOURCE_STATE_COMMON && !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
@@ -3017,13 +3032,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     // Desktop only accepts 64 KiB-aligned offsets, a private (VirtualAlloc) allocation, and a buffer
     // that lies inside that one allocation. Attempts that cannot succeed are skipped: each failure
     // throws inside D3D12Core.
-    MEMORY_BASIC_INFORMATION region{};
-    SIZE_T allocation_bytes = 0;
-    for (auto* cursor = static_cast<char*>(base);
-         VirtualQuery(cursor, &region, sizeof(region)) && region.AllocationBase == base && region.State == MEM_COMMIT;
-         cursor += region.RegionSize)
-        allocation_bytes += region.RegionSize;
-    if ((offset & 0xFFFF) || offset > allocation_bytes || desc->Width > allocation_bytes - offset || info.Type != MEM_PRIVATE ||
+    if ((offset & 0xFFFF) || !range.covered || range.type != MEM_PRIVATE ||
         initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) hr = E_INVALIDARG;
     if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
@@ -3125,7 +3134,7 @@ void dump_pipeline(const char* what, int slot, const void* desc, std::size_t byt
         return GetEnvironmentVariableA("X2W_D3D12_DUMP_PSO", value, sizeof(value)) && value[0] == '1';
     }();
     static LONG dumped[512];
-    if (!enabled || !desc || InterlockedIncrement(&dumped[slot & 511]) > 4) return;
+    if (!enabled || !desc || !first_calls(dumped[slot & 511], 4)) return;
     if (!x2w_local::readable(desc, bytes)) return;
     const auto* words = static_cast<const u64*>(desc);
     log("x2w-pso %s slot %d desc %p, %llu bytes", what, slot, desc, static_cast<unsigned long long>(bytes));
@@ -3581,8 +3590,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (now - last_report >= 5000) {
         last_report = now;
-        log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu", views_noted, views_distinct,
-            descriptors_copied, static_cast<u64>(heap_infos().size()));
+        log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed buffers %lld "
+            "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
+            static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
+            static_cast<long long>(placed_buffer_region_info), static_cast<long long>(placed_buffer_queries));
         {
             LARGE_INTEGER frequency;
             QueryPerformanceFrequency(&frequency);
@@ -3648,7 +3659,7 @@ void build_tables()
     enable_create<device_kind, 12, 4>();                 // CreateCommandList(node, type, allocator, pso, riid, ppv)
     enable_forward<device_kind, 13>();                   // CheckFeatureSupport
     tables[device_kind][14] = reinterpret_cast<void*>(&device_create_descriptor_heap);
-    enable_forward<device_kind, 15>();                   // GetDescriptorHandleIncrementSize
+    tables[device_kind][15] = reinterpret_cast<void*>(&device_descriptor_increment_size);  // GetDescriptorHandleIncrementSize(type)
     enable_create<device_kind, 16, 3>();                 // CreateRootSignature(node, blob, size, riid, ppv)
     tables[device_kind][17] = reinterpret_cast<void*>(&view_slot<17, 1>);  // CreateConstantBufferView(desc, dest)
     tables[device_kind][18] = reinterpret_cast<void*>(&view_slot<18, 2>);  // CreateShaderResourceView(res, desc, dest)

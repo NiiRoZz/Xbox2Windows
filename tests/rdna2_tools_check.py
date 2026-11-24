@@ -328,6 +328,11 @@ class TestRdna2Disasm(unittest.TestCase):
             # SMEM: register widths per op and soffset vs immediate offset
             ("01050cf4000000fa", "s_load_dwordx8", "s_load_dwordx8 s[20:27], s[2:3], 0x0"),
             ("01050cf445230100", "s_load_dwordx8", "s_load_dwordx8 s[20:27], s[2:3], s0 offset:0x12345"),
+            # SMEM OFFSET[20:0] is a signed 21-bit byte offset
+            ("000000f4ffff1ffa", "s_load_dword", "s_load_dword s0, s[0:1], -0x1"),
+            ("000000f4000010fa", "s_load_dword", "s_load_dword s0, s[0:1], -0x100000"),
+            ("000000f4ffff0ffa", "s_load_dword", "s_load_dword s0, s[0:1], 0xfffff"),
+            ("000000f4ffff1f00", "s_load_dword", "s_load_dword s0, s[0:1], s0 offset:-0x1"),
             ("420120f400000000", "s_buffer_load_dword", "s_buffer_load_dword s5, s[4:7], s0"),
             ("020528f4200000fa", "s_buffer_load_dwordx4", "s_buffer_load_dwordx4 s[20:23], s[4:7], 0x20"),
             ("420160f400000000", "s_buffer_store_dword", "s_buffer_store_dword s5, s[4:7], s0"),
@@ -1197,6 +1202,20 @@ class TestRdna2Disasm(unittest.TestCase):
         self.assertEqual(insns[0]["length"], 8)
         self.assertEqual(insns[0]["assembly"], "v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD")
         self.assertEqual(disasm_rdna2(sdwa[:4])[0]["opcode"], "vopc_truncated")
+
+        # VOPC DPP16, DPP8 and DPP8 FI extension dwords are consumed with the instruction, so the
+        # following s_endpgm stays at offset 8 (the operands are not decoded).
+        for raw_hex, opcode, form in (
+            ("fa02087c00010000", "vopc_dpp16", "DPP16"),
+            ("e902087c00010000", "vopc_dpp8", "DPP8"),
+            ("ea02087c00010000", "vopc_dpp8", "DPP8"),
+        ):
+            insns = disasm_rdna2(bytes.fromhex(raw_hex + "000081bf"))
+            self.assertEqual([i["opcode"] for i in insns], [opcode, "s_endpgm"], raw_hex)
+            self.assertEqual([i["offset"] for i in insns], [0, 8], raw_hex)
+            self.assertEqual(insns[0]["length"], 8, raw_hex)
+            self.assertEqual(insns[0]["assembly"], f"v_cmp_gt_f32_dpp <unsupported {form}>", raw_hex)
+        self.assertEqual(disasm_rdna2(bytes.fromhex("fa02087c"))[0]["opcode"], "vopc_truncated")
 
         # Truncated VOPC literal
         w0_lit = 0x7c000000 | (0x01 << 17) | (2 << 9) | 255
@@ -2764,6 +2783,54 @@ class TestRdna2Disasm(unittest.TestCase):
                 plain = disasm_rdna2(self._vop3_word(op, **kwargs))[0]["assembly"]
                 self.assertEqual(disasm_rdna2(self._vop3_word(op, op_sel=0xf, **kwargs))[0]["assembly"], plain)
 
+    # Issue #1890: the VINTRP (e32) v_interp_mov_f32 vsrc field is the parameter selector, not a VGPR.
+    # Assembled from these lines with LLVM 15.0.7 for gfx1013; llvm-objdump 15.0.7 prints the same text.
+    VINTRP_MOV_E32_VECTORS = (
+        ("000006c8", "v_interp_mov_f32_e32 v1, p10, attr0.x"),
+        ("01050ac8", "v_interp_mov_f32_e32 v2, p20, attr1.y"),
+        ("020a0ec8", "v_interp_mov_f32_e32 v3, p0, attr2.z"),
+        ("02ff1ec8", "v_interp_mov_f32_e32 v7, p0, attr63.w"),
+    )
+
+    def test_vintrp_interp_mov_selector_golden_vectors(self):
+        """Issue #1890: the e32 selector prints as p10, p20 or p0, as LLVM prints it."""
+        for encoding, assembly in self.VINTRP_MOV_E32_VECTORS:
+            with self.subTest(assembly=assembly):
+                record, = disasm_rdna2(bytes.fromhex(encoding))
+                self.assertEqual(record["assembly"], assembly)
+                self.assertEqual(record["opcode"], "v_interp_mov_f32_e32")
+                self.assertEqual(record["length"], 4)
+        # p1 and p2 keep their VGPR operand in the same field.
+        record, = disasm_rdna2(bytes.fromhex("020004c8"))
+        self.assertEqual(record["assembly"], "v_interp_p1_f32_e32 v1, v2, attr0.x")
+
+    def test_vintrp_interp_mov_selector_llvm_round_trip(self):
+        """Issue #1890: the e32 vectors assemble to these bytes and disassemble to these strings on LLVM."""
+        if not os.environ.get("LLVM_LIB"):
+            self.skipTest("LLVM_LIB environment variable not set; verified against golden vectors")
+        resolved_lib = resolve_llvm_lib(os.environ["LLVM_LIB"])
+        assembler = resolve_tool("LLVM_MC", ["llvm-mc-15", "llvm-mc"])
+        objcopy = resolve_tool("LLVM_OBJCOPY", ["llvm-objcopy-15", "llvm-objcopy"])
+        if not assembler or not objcopy:
+            self.fail(f"VINTRP round trip requires llvm-mc and llvm-objcopy (assembler={assembler}, objcopy={objcopy})")
+        source = [assembly for _, assembly in self.VINTRP_MOV_E32_VECTORS]
+        emitted = assemble_with_llvm_mc(source, assembler, objcopy)
+        self.assertEqual(emitted, bytes.fromhex("".join(encoding for encoding, _ in self.VINTRP_MOV_E32_VECTORS)))
+        decoded = [record["assembly"] for record in disasm_rdna2(emitted)]
+        self.assertEqual(decoded, llvm_disassemble(emitted, resolved_lib))
+        self.assertEqual(decoded, source)
+
+    def test_vintrp_interp_mov_selector_out_of_range_is_refused(self):
+        """Issue #1890: a selector LLVM prints as invalid_param_<n> is a four-byte unsupported record."""
+        end = struct.pack("<I", 0xbf810000)
+        for selector in (3, 128, 255):
+            with self.subTest(selector=selector):
+                records = disasm_rdna2(struct.pack("<I", 0xc8060000 | selector) + end)
+                self.assertEqual([r["length"] for r in records], [4, 4])
+                self.assertEqual(records[0]["opcode"], "v_interp_mov_f32_e32_unsupported")
+                self.assertIn("<unsupported VINTRP encoding>", records[0]["assembly"])
+                self.assertEqual(records[1]["opcode"], "s_endpgm")
+
     def test_vop3_mqsad_u32_u8_register_quads_stop_at_v255(self):
         """A destination or accumulator quad that would run past v255 is flagged, not printed as a register."""
         last_quad = disasm_rdna2(self._vop3_word(0x175, vdst=252, src2=0x100 + 252))[0]["assembly"]
@@ -3470,6 +3537,36 @@ class TestRdna2Disasm(unittest.TestCase):
         )
         self.assertIn("s_nop 0", res.stdout)
         self.assertIn("s_endpgm", res.stdout)
+
+    def test_cli_hex_output_and_input_errors(self):
+        script = Path(__file__).resolve().parents[1] / "tools" / "disasm_rdna2.py"
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "listing.txt"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), "--hex", "000080bf", "--output", str(out)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertIn("s_nop 0", out.read_text(encoding="utf-8"))
+
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), "--hex", "0000810"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 2)
+            self.assertNotIn("Traceback", res.stderr)
+            self.assertIn("--hex", res.stderr)
+
+            missing = Path(tmp) / "nonexist.bin"
+            res = subprocess.run(
+                [sys.executable, "-B", str(script), str(missing)],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(res.returncode, 1)
+            self.assertIn("not found", res.stderr)
 
     def test_llvm_comparison(self):
         llvm_lib_env = os.environ.get("LLVM_LIB")
@@ -4632,6 +4729,28 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertTrue(is_instruction_supported(f"{base}_e64 s52, -s44, |v18|"))
             self.assertTrue(is_instruction_supported(f"{base}_sdwa vcc_lo, s44, v18 src0_sel:DWORD src1_sel:DWORD"))
 
+    def test_vopc_sdwa_compare_forms_recognition(self):
+        """The 46 non-cmpx VOPC SDWA compares the translator lowers are recognized with every selection."""
+        from pixel_aot_check import SDWA_CMP_FORMS
+        for entry in SDWA_CMP_FORMS:
+            src0 = "sext(s44)" if entry["sext0"] else "s44"
+            src1 = "sext(v18)" if entry["sext1"] else "v18"
+            line = (f"{entry['form']} vcc_lo, {src0}, {src1} "
+                    f"src0_sel:{entry['sel0']} src1_sel:{entry['sel1']}")
+            self.assertTrue(is_instruction_supported(line), line)
+            self.assertTrue(is_instruction_supported(line.replace("vcc_lo", "s52")), line)
+        # VOPC SDWA takes no destination selection; the cmpx form and the 16-bit f/t predicates stay out.
+        for line in (
+            "v_cmp_eq_i32_sdwa vcc_lo, s44, v18 dst_sel:WORD_0 dst_unused:UNUSED_PAD "
+            "src0_sel:BYTE_0 src1_sel:DWORD",
+            "v_cmp_eq_i32_sdwa vcc_lo, s44, v18 src0_sel:WORD_2 src1_sel:DWORD",
+            "v_cmp_eq_i32_sdwa s[0:1], s44, v18 src0_sel:BYTE_0 src1_sel:DWORD",
+            "v_cmp_f_i16_sdwa vcc_lo, s44, v18 src0_sel:WORD_0 src1_sel:DWORD",
+            "v_cmp_lt_f16_sdwa vcc_lo, s44, v18 src0_sel:WORD_0",
+            "v_cmpx_lt_f16_sdwa vcc_lo, s44, v18 src0_sel:WORD_0 src1_sel:WORD_1",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+
     def test_binary_scan_recognizes_vopc_sdwa(self):
         """Issue #938: binary shaders with VOPC/VOPCX SDWA reach the scanner as decoded opcodes, not vopc_sdwa."""
         supported = bytes.fromhex(
@@ -4639,7 +4758,7 @@ class TestRdna2Scanner(unittest.TestCase):
             "000081bf"          # s_endpgm
         )
         unlowered = bytes.fromhex(
-            "f904887d01000506"  # v_cmp_gt_u32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD
+            "f904087c01000506"  # v_cmp_gt_f32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD
             "f904247c01001606"  # v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD
             "000081bf"          # s_endpgm
         )
@@ -4669,7 +4788,7 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(
             [d["raw"] for d in res_unl["unsupported_details"]],
             [
-                "v_cmp_gt_u32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD",
+                "v_cmp_gt_f32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD",
                 "v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD",
             ],
         )
@@ -4952,6 +5071,19 @@ class TestRdna2Scanner(unittest.TestCase):
                 stream.write(".long 0\n")
             result = scan()
             self.assertIn("Full Shaders Accepted by Translator:       0", result.stdout)
+
+    def test_parse_assembly_file_skips_bom_and_commented_labels(self):
+        """A UTF-8 BOM and llc-style commented labels are not instructions; a ':' in a comment keeps the line."""
+        from scan_unsupported_shaders import parse_assembly_file
+        with tempfile.TemporaryDirectory() as tmp:
+            bom = Path(tmp) / "bom.s"
+            bom.write_bytes(b"\xef\xbb\xbfs_endpgm\n")
+            self.assertEqual(parse_assembly_file(bom), ["s_endpgm"])
+            labels = Path(tmp) / "labels.s"
+            labels.write_text("pixel:                                  ; @pixel\n"
+                              ".LBB0_1:                                ; %bb.1\n"
+                              "s_endpgm ; done:\n", encoding="utf-8")
+            self.assertEqual(parse_assembly_file(labels), ["s_endpgm ; done:"])
 
     def test_binary_scan_recognizes_vop1_cvt_off_sat_pack_and_swap_opcodes(self):
         """The scan report names the four VOP1 forms instead of listing v_vop1_NN as unknown opcodes."""

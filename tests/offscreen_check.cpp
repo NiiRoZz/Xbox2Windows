@@ -1144,6 +1144,16 @@ OperationResult run_startup_composite_provenance(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-range-provenance: a draw over a bound buffer window reads the colour its producer wrote before the
+// fence that separated them, and a neighbouring, stale or unwritten window reads a different or zero colour
+// (#870).
+OperationResult run_startup_range_provenance(const OperationContext& ctx)
+{
+    if (check_startup_range_provenance(ctx.device) != 0)
+        return {OutcomeKind::fail, "range provenance differs from the model or a mutant matched"};
+    return {OutcomeKind::pass, nullptr};
+}
+
 template<bool Swapped>
 OperationResult run_startup_sampler_x(const OperationContext& ctx)
 {
@@ -1485,6 +1495,7 @@ const OperationSpec kOperations[] = {
     {"--startup-sampler-x-swapped", 3, 3, nullptr, kGateSm60BufferOps, run_startup_sampler_x<true>},
     {"--startup-cb-blend", 3, 3, nullptr, kNoGate, run_startup_cb_blend<false>},
     {"--startup-composite-provenance", 3, 3, nullptr, kNoGate, run_startup_composite_provenance},
+    {"--startup-range-provenance", 3, 3, nullptr, kNoGate, run_startup_range_provenance},
     {"--startup-cb-blend-swapped", 3, 3, nullptr, kNoGate, run_startup_cb_blend<true>},
     {"--wave-shuffle", 3, 3, nullptr, kGateWaveShuffle, run_wave_shuffle},
     {"--wave64-emulate", 3, 3, nullptr, kNoGate, run_wave64_emulate},

@@ -104,6 +104,8 @@ SCALAR64_SOURCE = r"(?:s\[\d+:\d+\]|0x[0-9a-f]{1,8}|-?\d+)"
 F16_PLAIN = r"(?:-?(?:\d+\.\d+|\d+)|0x[0-9a-f]{1,4}|[vs]\d+)"
 F16_MOD = rf"-?(?:\|{F16_PLAIN}\||abs\({F16_PLAIN}\)|{F16_PLAIN})"
 SDWA_SEL_PATTERN = r"(?:BYTE_[0-3]|WORD_[01]|DWORD)"
+PIXEL_SDWA_DST = r"(?:vcc(?:_lo)?|s\d+)"
+SDWA_CMP_SOURCE = rf"(?:sext\({INTEGER_SOURCE}\)|{INTEGER_SOURCE})"
 CVT_F32_E64_BASE = r"(?:[vs]\d+|0x[0-9a-f]{1,8})"
 CVT_F32_E64_ABS = rf"(?:\|{CVT_F32_E64_BASE}\||abs\({CVT_F32_E64_BASE}\))"
 CVT_F32_E64_SOURCE = rf"(?:neg\((?:{CVT_F32_E64_ABS}|{CVT_F32_E64_BASE})\)|-(?:{CVT_F32_E64_ABS}|[vs]\d+)|{CVT_F32_E64_ABS}|{CVT_F32_E64_BASE})"
@@ -223,10 +225,27 @@ if PIXEL_COMPARE:
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{cmp_ops})_f16_e64\s+{PIXEL_LANE_MASK},\s+{F16_MOD},\s+{F16_MOD}"
     )
+    # VOPC SDWA has only the two source selections; the destination is VCC or one SGPR.
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_(?:{cmp_ops})_f16_sdwa\s+{PIXEL_SDWA_DST},\s+{SDWA_CMP_SOURCE},\s+{SDWA_CMP_SOURCE}"
+        rf"\s+src0_sel:{SDWA_SEL_PATTERN}\s+src1_sel:{SDWA_SEL_PATTERN}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_class_(?:f16|f32)_sdwa\s+{PIXEL_SDWA_DST},\s+{SDWA_CMP_SOURCE},\s+{SDWA_CMP_SOURCE}"
+        rf"\s+src0_sel:{SDWA_SEL_PATTERN}\s+src1_sel:{SDWA_SEL_PATTERN}"
+    )
 if PIXEL_INT_COMPARE:
     icmp_ops = "|".join(map(re.escape, PIXEL_INT_COMPARE))
     SUPPORTED_INSTRUCTIONS_REGEX.append(
         rf"v_cmp_(?:{icmp_ops})_(?:i32|u32|i16|u16){PIXEL_VOPC_DST},\s+{INTEGER_SOURCE},\s+{INTEGER_SOURCE}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_(?:{icmp_ops})_(?:i32|u32)_sdwa\s+{PIXEL_SDWA_DST},\s+{SDWA_CMP_SOURCE},\s+{SDWA_CMP_SOURCE}"
+        rf"\s+src0_sel:{SDWA_SEL_PATTERN}\s+src1_sel:{SDWA_SEL_PATTERN}"
+    )
+    SUPPORTED_INSTRUCTIONS_REGEX.append(
+        rf"v_cmp_(?:eq|ne|lt|le|gt|ge)_(?:i16|u16)_sdwa\s+{PIXEL_SDWA_DST},\s+{SDWA_CMP_SOURCE},\s+{SDWA_CMP_SOURCE}"
+        rf"\s+src0_sel:{SDWA_SEL_PATTERN}\s+src1_sel:{SDWA_SEL_PATTERN}"
     )
     # 64-bit comparisons are checked by supports_int64_compare() below: the pair and inline ranges are numeric.
     INT64_COMPARE_PATTERN = re.compile(
@@ -732,7 +751,7 @@ def analyze_shader_instructions(shader_name: str, instructions: list[str], *,
 def parse_assembly_file(path: Path) -> list[str]:
     """Read assembly instructions from a text file (.s, .asm, .txt)."""
     lines = []
-    with path.open("r", encoding="utf-8", errors="replace") as f:
+    with path.open("r", encoding="utf-8-sig", errors="replace") as f:
         for line in f:
             stripped = line.strip()
             if not stripped or stripped.startswith(("//", ";", "#", "@")):
@@ -740,7 +759,8 @@ def parse_assembly_file(path: Path) -> list[str]:
             # Symbol metadata emits no instruction. Keep data and alignment directives visible.
             if stripped == ".text" or stripped.split(None, 1)[0] in (".globl", ".global", ".type", ".size"):
                 continue
-            if stripped.endswith(":") and " " not in stripped:
+            code = re.split(r"//|[;#]", stripped)[0].strip()  # same comment rule as extract_opcode
+            if code.endswith(":") and " " not in code:
                 continue
             lines.append(stripped)
     return lines

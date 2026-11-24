@@ -1029,7 +1029,8 @@ VOP3_RESTRICTED_MODIFIERS = {
     "v_interp_mov_f32_e64": (True, True),
 }
 
-# The v_interp_mov_f32_e64 parameter selector (src1 field): p10, p20 and p0.
+# The v_interp_mov_f32 parameter selector (VINTRP vsrc field, VOP3A src1 field): p10, p20 and p0.
+# LLVM prints any other value as invalid_param_<n> and its assembler accepts none of them.
 VINTRP_MOV_PARAMS = ("p10", "p20", "p0")
 
 
@@ -2545,6 +2546,8 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         op_name, comment = op_info
         length = 4
         literal = None
+        if src0 in (233, 234, 250):
+            return _vop_extension(data, offset, "vopc", op_name, src0)
         if src0 in (249, 255):
             extension = "SDWA" if src0 == 249 else "literal"
             if offset + 8 > len(data):
@@ -2623,8 +2626,14 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
         vsrc = w0 & 0xff
         op_names = {0: "v_interp_p1_f32_e32", 1: "v_interp_p2_f32_e32", 2: "v_interp_mov_f32_e32"}
         op_name = op_names.get(op, f"v_interp_{op}")
-        asm = f"{op_name} v{vdst}, v{vsrc}, attr{attr}.{chan}"
         comment = f"Parameter interpolation stage {op+1} for attribute {attr}.{chan}"
+        if op == 2:
+            # The mov form's vsrc field is the parameter selector, not a VGPR.
+            if vsrc >= len(VINTRP_MOV_PARAMS):
+                return (4, f"{op_name}_unsupported", f"{op_name} <unsupported VINTRP encoding>",
+                        f"v_interp_mov_f32 parameter selector {vsrc} is not p10, p20 or p0")
+            return (4, op_name, f"{op_name} v{vdst}, {VINTRP_MOV_PARAMS[vsrc]}, attr{attr}.{chan}", comment)
+        asm = f"{op_name} v{vdst}, v{vsrc}, attr{attr}.{chan}"
         return (4, op_name, asm, comment)
 
     # 9. EXP: 64-bit [31:26] == 0b111110 (0xf8000000)
@@ -2688,12 +2697,16 @@ def decode_instruction(data: bytes, offset: int) -> tuple[int, str, str, str]:
             sbase_str = f"s[{sbase}:{sbase + base_width - 1}]"
         soffset = (w1 >> 25) & 0x7f
         imm_offset = w1 & 0x1fffff
+        if imm_offset & 0x100000:
+            # GFX9+ SMEM OFFSET[20:0] is a signed 21-bit byte offset (LLVM sign-extends it)
+            imm_offset -= 0x200000
+        imm_str = f"-0x{-imm_offset:x}" if imm_offset < 0 else f"0x{imm_offset:x}"
         if soffset == 125:
-            off_str = f"0x{imm_offset:x}"
+            off_str = imm_str
         else:
             off_str = decode_s_reg(soffset)
             if imm_offset:
-                off_str += f" offset:0x{imm_offset:x}"
+                off_str += f" offset:{imm_str}"
         mods = []
         if (w0 >> 16) & 1:
             mods.append("glc")
@@ -3198,17 +3211,22 @@ def main():
 
     args = parser.parse_args()
 
+    all_listings = []
+    missing = False
+
     # Hex decode mode
     if args.hex:
-        raw_bytes = bytes.fromhex(args.hex.replace(" ", ""))
+        try:
+            raw_bytes = bytes.fromhex(args.hex.replace(" ", ""))
+        except ValueError as exc:
+            parser.error(f"--hex: {exc}")
         insns = disassemble_binary(raw_bytes, "hex_input")
         print_disassembly("hex_input", insns)
-        return 0
-
-    if not args.targets:
+        all_listings.append(("hex_input", insns))
+        args.targets = []
+    elif not args.targets:
         parser.error("Specify targets or provide hex via --hex")
 
-    all_listings = []
     for target in args.targets:
         if target.is_file():
             data = target.read_bytes()
@@ -3223,6 +3241,9 @@ def main():
                 insns = disassemble_binary(data, f.name)
                 print_disassembly(f.name, insns)
                 all_listings.append((f.name, insns))
+        else:
+            print(f"error: {target}: not found", file=sys.stderr)
+            missing = True
 
     if args.output and all_listings:
         with args.output.open("w", encoding="utf-8") as out_f:
@@ -3233,7 +3254,7 @@ def main():
                 out_f.write("\n")
         print(f"[+] Disassembly saved to: {args.output}")
 
-    return 0
+    return 1 if missing else 0
 
 
 if __name__ == "__main__":

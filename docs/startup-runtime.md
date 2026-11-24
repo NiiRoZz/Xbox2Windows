@@ -560,18 +560,32 @@ ctest --preset release --no-tests=error -R '^startup_dstorage_destination$' -V
 ## Local switches, logging, and memory probing
 
 `tests/startup_local_log_check.cpp` (device-free ctest `startup_local_log`, with negative
-control `startup_local_log_guard_drop_control`) verifies `src/startup_stubs/local_log.h`:
-`env_on` (a leading `1` in values up to three characters, preserving `GetLastError`), atomic
-`first_calls` countdowns, `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
+controls `startup_local_log_guard_drop_control`, `startup_local_log_reopen_control`,
+`startup_local_log_cache_failure_control` and `startup_local_log_wrap_control`) verifies
+`src/startup_stubs/local_log.h`: `env_on` (a leading `1` in values up to three characters,
+preserving `GetLastError`), the atomic `first_calls` gate (true for the first N calls; the
+counter stops at N, so a counter that a consumer polling in a loop drives past 2^31 cannot turn
+negative and let every call log again; the wrap control shows the old counting gate doing that
+from a counter set near the wrap point), `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
 truncation, `MAX_PATH` boundary behavior, and `GetLastError` preservation on file-open failure),
+the shared `x2w_trap::append_log` (one `X2W_TRAP_LOG` open per module: in a child process, 8
+threads write 2,000 lines each, every line must arrive intact and the open count must be 1; the
+reopen control respells the path after the first line so each line reopens the file, and passes
+only when the open count is its sole failure; a failed open is not kept: while no handle is kept,
+ordinary lines retry the open at most once per 250 ms and are dropped in between, and trap lines
+always retry. Child processes check that a first open into a missing directory, or of a file held
+without sharing, recovers once the path is usable, that an unusable path costs at most one open
+attempt per 250 ms, and that a trap line opens the log during the wait; the cache-failure control
+is built from a generated copy of `trap.h` that keeps a failed open forever and passes only when
+the two recovery checks are its sole failures),
 `probe_readable` (invalid-pointer and zero-length refusals, multi-page reads, `PAGE_NOACCESS` /
 `MEM_RESERVE` prefix truncation, and `PAGE_GUARD` re-arming verified by `VirtualQuery` and a
 second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
 `PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`. No GPU is required:
 
 ```powershell
-cmake --build --preset dev --target startup_local_log_check
-ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?$' -V
+cmake --build --preset dev --target startup_local_log_check startup_local_log_cache_failure_check
+ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control|_reopen_control|_cache_failure_control)?$' -V
 ```
 
 ## Trap-by-default header check
@@ -607,7 +621,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
-| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries)$'`) |
+| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds and stick or trigger values: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
@@ -629,6 +643,58 @@ requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
 then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
+For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).
+
+## Input script
+
+`X2W_INPUT_SCRIPT` (`run.ps1 -InputScript`) drives the virtual gamepad of the `GameInput.dll`
+stand-in. It is a comma-separated list; empty items and blanks around an item are ignored. Each
+item is one of:
+
+| Item | Effect |
+|---|---|
+| `<mask>@<s>[+<d>]` | sets the GameInput button bits `<mask>` (hexadecimal, `0x` optional; 4 = A, 8 = B, 1 = Menu) from second `<s>` for `<d>` seconds, default 0.3 |
+| `<axis>=<value>@<s>[+<d>]` | sets one axis from second `<s>` for `<d>` seconds, default 0.3. `lx`, `ly`, `rx`, `ry` are the thumbsticks in [-1, 1] (+1 is right or up); `lt`, `rt` are the triggers in [0, 1]. These are the units of the GameInput gamepad state. |
+| `base=poll` or `base=start` | time base of every entry; first item only. `poll` (the default) counts seconds from the first input poll of the process, `start` from process start. |
+
+Entries that are active at the same time combine: button masks are OR-ed; for one axis the later
+item wins. When an axis entry ends the axis returns to 0. Keyboard and XInput values still merge
+in (buttons OR-ed, for an axis the larger magnitude wins). Examples:
+
+```text
+4@60,1@70,20@80                  A, Menu, then Y for 0.3 s each, counted from the first poll
+4@60+2,8@61                      A held 2 s; B pressed at 61 s while A is still held (mask 0xC)
+base=start,lx=-1@40+1.5,rt=1@41  left stick fully left for 1.5 s and the right trigger at 41 s after process start
+```
+
+A script that was valid before holds and axes (`<mask>@<s>` items only) keeps its meaning: the
+same buttons at the same times on the first-poll base.
+
+Up to 256 timed entries and 4,095 characters are accepted, as before. A longer value is ignored
+as a whole and logged as `x2w-input X2W_INPUT_SCRIPT ignored: <n> characters, at most 4095`. When
+any item is rejected, the stand-in logs
+`x2w-input X2W_INPUT_SCRIPT: <used> of <items> entries used (<malformed> malformed, at most 256)`.
+When it is created it also logs
+`x2w-input script: <n> entries accepted, <m> rejected, time base first-poll|process-start` and, for
+each of the first 32 rejected items,
+`x2w-input script item <index> rejected (<reason>): "<item>"` (index 1 is the first non-empty item).
+Reasons: `missing @<seconds>`, `bad time`, `bad duration`, `trailing text`, `bad mask`, `bad value`,
+`value out of range [-1, 1]` or `[0, 1]`, `unknown token`, `base= must be the first item`,
+`unknown base (use poll or start)` and `over 256 entries`. At the first poll it logs
+`x2w-input script time base <base>: first poll at <s> s, first entry at <s> s since process start`,
+and once the script time passes the end of the last entry
+`x2w-input script time passed its last entry (<n> entries, ended at <s> s on the script time base)`.
+
+The parser and playback are in `src/startup_stubs/input_script.h`. The check reads the stand-in
+through `IGameInput::GetCurrentReading` with the script clock set by `X2W_INPUT_CLOCK_MS`
+(milliseconds since process start; a test seam, not for runs):
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$' -V
+```
+
+It exits 77 (skip) after the parser checks when XInput pad 0 is connected, because that pad's
+values merge into every reading.
 
 ## Game saves
 
@@ -815,7 +881,9 @@ These are measured on one executable; treat them as hypotheses for others.
   exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
   constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
   ([#1259](https://github.com/R0Y00/Xbox2Windows/issues/1259)). Colour exports of constant integer
-  words still go through `float4` and have the same loss. Reproduce with
+  words still go through `float4` and have the same loss. Only the `p0` selector is lowered;
+  `p10` and `p20` are refused in both encodings
+  ([#1890](https://github.com/R0Y00/Xbox2Windows/issues/1890)). Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_flat_param_"`.
 - **Non-fused multiply-add.** The gfx1013 `v_mad_f32`, `v_mac_f32`, `v_madmk_f32`,
   `v_madak_f32` and `v_mad_legacy_f32` forms round the product before the sum and flush
@@ -1074,9 +1142,11 @@ routing and sample format.
 With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConnect`
 and `XApuDisconnect`, refuses null outputs (`E_POINTER`) and unknown or disconnected
 handles (`E_HANDLE`), and queues one completion entry per `XApuEnqueueCommand` call so
-`XApuGetResultCount` and `XApuDequeueResult` retire commands cleanly (zeroing the
-`0x58`-byte result buffer without fabricating unmeasured fields, and returning `E_FAIL`
-when the queue is empty). The all-zero result is a placeholder: its type field (`+0`) is not a measured
+`XApuGetResultCount` and `XApuDequeueResult` can retire commands. A successful dequeue zeroes the
+`0x58`-byte result buffer. An empty queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves
+the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
+
+The all-zero result is a placeholder: its type field (`+0`) is not a measured
 completion value, and no caller has been observed consuming it. Entries are counters only, so memory does
 not grow per command. Handles are never reused. Default non-permissive mode still traps on every export
 (`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
@@ -1183,7 +1253,7 @@ debugger round trip.
 | `CLWB m8` | `CLFLUSHOPT m8` (one ModRM bit); one `NOP` of the same length once a `CLFLUSHOPT` has faulted on this host |
 | `MONITORX`, `MWAITX` | a 3-byte `NOP`; `PAUSE` and `NOP` (the wait may end at any time) |
 | `CLZERO` | a jump to a stub that stores 64 zero bytes at `rax & ~63` |
-| `INSERTQ xmm, xmm, len, idx`, `EXTRQ xmm, len, idx` (xmm0-7) | a jump to a stub that does the field move in integer registers |
+| `INSERTQ xmm, xmm, len, idx`, `INSERTQ xmm, xmm`, `EXTRQ xmm, len, idx`, `EXTRQ xmm, xmm` | a jump to a stub that does the field move in integer registers (xmm0-15) |
 | `MOVNTSS m32, xmm`, `MOVNTSD m64, xmm` | `MOVSS`, `MOVSD` stores (one opcode byte; the non-temporal hint is dropped) |
 | `RDPRU` | `RDTSC`; `NOP` (the time-stamp counter stands in for MPERF and APERF, so their ratio reads 1) |
 | `RDPID r64` | a jump to a stub that runs `RDTSCP` and moves its `ecx` to the register |
@@ -1192,10 +1262,10 @@ debugger round trip.
 The stubs keep the other registers and the flags. Instructions that the 5-byte jump overwrites
 are re-encoded behind the stub with iced-x86. `events.txt` names the first 40 rewritten sites and
 the summary counts them by instruction. `tools/startup/host_cpu.py` lists the forms that are
-refused (register-count `INSERTQ`/`EXTRQ`, xmm8-15, fields past bit 63).
+refused (memory operands, non-zero `ModRM.reg` on immediate `EXTRQ`, malformed prefixes, fields past bit 63).
 
 `python -B tests/startup_host_cpu_check.py` assembles source-built functions, patches them the same
-way and calls them on the host: 288 `INSERTQ`/`EXTRQ` results against a model, `CLZERO` with a
+way and calls them on the host: 1162 `INSERTQ`/`EXTRQ` results against a model, `CLZERO` with a
 moved `lea` and a moved rip-relative load, and decoded `CLWB` and wait rewrites, including the
 `NOP` form for every addressing mode. The fall-back from `CLFLUSHOPT` to `NOP` in the debugger is
 not exercised here: it needs a host without `CLFLUSHOPT`. Stubs that zero 56
@@ -1221,20 +1291,29 @@ memory spent rather than by elapsed time. A physical page holds a slot from its 
 or a DirectStorage write) until its grant is released; `xmem.dll` publishes that count through the
 experimental `x2w_xmem_page_stats` export.
 
-The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab is
-created with the default `CreateFileMappingW` commit behaviour, so all of it is charged to commit when it is
-created, and it is closed only when the process ends: freeing pages returns slots, not commit. A released
-slot is reused lowest first. The experimental `x2w_xmem_slab_stats` export reports the slabs open, the slots
-in use and the slots free in the open slabs, which are the units that matter for commit now. This only
-reports; it does not change when commit is charged. `xmem_slab_slots` checks the bookkeeping on any platform
-without Windows calls. The heartbeat also prints while the request counters are unchanged
+The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab reserves
+its capacity with `SEC_RESERVE`. Each slot commits on the first mapping or write. A freed slot remains
+committed, is zeroed on reuse, and is chosen before a fresh slot. The experimental `x2w_xmem_slab_stats`
+export reports open slabs and used and free slots. `xmem_slab_slots` checks the bookkeeping without Windows
+calls. `xmem_mapped_pages_commit` measures commit for a small map, and `xmem_mapped_pages_commit_failure`
+injects a commitment failure and checks that the reservation and slab counts are unchanged and the pages
+can be mapped on retry. Caller-owned placeholders must already match the requested view size. The
+heartbeat also prints while the request counters are unchanged
 when either memory value changed, so the cost of a stalled load is visible. Each report is followed
 by a line of failed requests by cause and a line of page-destination requests by end (see
 DirectStorage failure causes and DirectStorage page-request ends under Findings).
 
+The live log window also shows DirectStorage heartbeat lines and `x2w-render totals` as they
+arrive. It reports frame counts and FPS from the graphics heartbeat without inferring whether
+draws were executed. Network refusals are shown when observed; the window does not establish
+that all network activity is blocked. To check this presentation with generated logs, run
+`python -B tests/startup_live_telemetry_check.py`. See [#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)
+for memory accounting and [#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281) for
+the launcher's concurrent-hook limitation.
+
 ```powershell
 cmake --build --preset release --target xmem_shim startup_stub_xcrdapi xmem_slab_slots_check
-ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|startup_heartbeat_commit)$' -V
+ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|xmem_mapped_pages_commit(_failure)?|startup_heartbeat_commit)$' -V
 ```
 
 The `startup_heartbeat_commit` check starts the heartbeat before loading the page provider, then
@@ -1420,6 +1499,41 @@ is not affected: section-backed pages already took the committed, not-aliased pa
 - `ctest --preset release --no-tests=error -R '^xmem_page_runs_device_' -V` places a buffer
   (slot 133) inside one view and across three kinds of boundary: two mapping calls, two backing
   sections, and single-page views.
+
+## Placed buffer allocation walk (device slot 133)
+
+Slot 133 aliases a buffer only when every byte from the base of the allocation holding the address
+to the end of the buffer is committed in that allocation, and the memory is private. It used to
+measure the whole committed run from the base with one `VirtualQuery` per region and compare the
+buffer with that length. `VirtualQuery` scans page-table entries from the queried address to the end
+of the run of identical attributes, so on a large private region with touched pages each call costs
+milliseconds (about 5 ms per GiB with one touched page per 64 KiB, measured on Windows 10 19045).
+
+`src/startup_stubs/placed_buffer_range.h` first asks `QueryVirtualMemoryInformation`
+(`MemoryRegionInfo`, Windows 10 1607 and later, resolved at run time) for the allocation's base, size
+and committed bytes, which come from the allocation's bookkeeping without that scan. When the
+allocation is private and its committed bytes equal its size, every page is committed, so the full
+walk's run is the whole allocation and the decision follows from base and size. Otherwise (a partly
+committed or mapped allocation, a free address, the call missing) it walks the regions from the base
+and stops at the end of the buffer, because regions after it cannot change the answer. The alias or
+refusal is the same as before; nothing is remembered between placements, so a page decommitted,
+released or replaced directly through the Windows API is seen by the next placement. The alignment,
+memory-type and state rules are unchanged. The five-second `x2w-d3d12 views noted` line in
+`stderr.txt` reports `placed buffers <n> (region-information proofs <n>, region queries <n>)`.
+
+- `ctest --preset release --no-tests=error -R '^startup_placed_buffer_range$' -V` compares every
+  decision with the full walk on the same memory: 256 buffers spread over a 64 MiB private block
+  whose alternating 64 KiB pages have different protections (it prints the region queries per
+  placement of both walks); a middle page decommitted under a buffer, before a buffer and five pages
+  before a buffer, then committed again; a block released and replaced by a 1 MiB block at the same
+  base; a mapped view; a reservation committed in two steps; and a placeholder piece replaced by
+  committed private memory. Each case places a buffer before changing the memory, so state kept
+  between placements would show up as a mismatch. A 512 MiB committed block with one touched page per
+  64 KiB must be proven without any `VirtualQuery` call; the check prints the time per placement of
+  the full walk, the bounded walk and the proof. `_region_only_control` trusts the allocation size
+  without the committed-bytes check and must fail only in the partly committed cases;
+  `_walk_only_control` never uses the region information and must fail only that call count. A
+  refused allocation or mapping is a capability skip (77) in the controls.
 
 ## Buffer memory SRVs (device slot 70)
 
