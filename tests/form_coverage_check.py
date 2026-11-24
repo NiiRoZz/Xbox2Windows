@@ -1324,6 +1324,40 @@ def check_pk_fmac_coverage():
         assert ("VOP2", "v_pk_fmac_f16") not in fc.gfx_forms(stripped, reference), name
 
 
+def check_sdwa_cmp_coverage():
+    """The 46 non-cmpx VOPC SDWA comparisons count in both references, and their non-SDWA
+    neighbours do not: the isolated fixture accepts only the selected forms and its own mask/ALU
+    support instructions. This is the coverage half of the negative control; the draw carries the
+    selection and signedness mismatches."""
+    import pixel_aot_check as pixel
+    wanted = {("SDWA", entry["form"]) for entry in pixel.SDWA_CMP_FORMS}
+    assert len(wanted) == 46
+    saved = set(pixel.ACCEPTED)
+    pixel.ACCEPTED.clear()
+    try:
+        pixel.translate_int(pixel.uncompressed_export(pixel.sdwa_cmp_body()))
+        accepted = set(pixel.ACCEPTED)
+    finally:
+        pixel.ACCEPTED.clear()
+        pixel.ACCEPTED.update(saved)
+    for name in ("gfx1013.tsv", "rdna2.tsv"):
+        reference = fc.load_reference(name)
+        assert wanted <= reference, (name, sorted(wanted - reference))
+        covered = fc.gfx_forms(accepted, reference)
+        assert wanted <= covered, (name, sorted(wanted - covered))
+        # Non-SDWA neighbours and the exec-writing cmpx forms are not in this fixture's record.
+        assert not {("VOPC", f"v_cmp_{op}_f16") for op in pixel.PREDICATES} & covered, name
+        assert not {("VOPC", f"v_cmp_{op}_f32") for op in pixel.PREDICATES} & covered, name
+        assert not {("VOPC", f"v_cmp_{op}_{kind}") for op in pixel.INT_PREDICATES
+                    for kind in ("i32", "u32")} & covered, name
+        assert not {("VOPC", f"v_cmp_{op}_{kind}") for op in ("eq", "ne", "lt", "le", "gt", "ge")
+                    for kind in ("i16", "u16")} & covered, name
+        assert not {("SDWA", f"v_cmpx_{op}_f16_sdwa") for op in pixel.PREDICATES} & covered, name
+        # Control: removing one accepted SDWA word removes exactly that form from the count.
+        stripped = accepted - {"v_cmp_lt_f16_sdwa"}
+        assert ("SDWA", "v_cmp_lt_f16_sdwa") not in fc.gfx_forms(stripped, reference), name
+
+
 if __name__ == "__main__":
     check_denominators()
     check_example()
@@ -1346,6 +1380,7 @@ if __name__ == "__main__":
     check_f16_to_int16_forms()
     check_swap_coverage()
     check_pk_fmac_coverage()
+    check_sdwa_cmp_coverage()
     check_sopk_wait_forms()
     check_s_version_form()
     check_parsing()

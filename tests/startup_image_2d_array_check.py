@@ -140,6 +140,31 @@ MIP_INSTRUCTION_NSA = 'image_load_mip v[0:3], [v0, v1, v3, v2], s[16:23] dmask:0
 MIP_FIXTURES = {'mip 0': (1, 0), 'mip 1': (1, 1), 'mip 2': (0, 2)}
 
 
+def check_compare_modifiers():
+    """image_sample_c needs exactly one dim and one dmask; anything else is refused by name.
+
+    No machine code and no device: the refusal is decided from the modifier list alone, so a bare
+    stage is enough. The legal list is checked to reach a *different* failure, which proves the
+    guard is not simply raising for every input.
+    """
+    base = 'image_sample_c'
+    for mods in (['dim:SQ_RSRC_IMG_2D'], ['dmask:0x1'],
+                 ['dim:SQ_RSRC_IMG_2D', 'dim:SQ_RSRC_IMG_2D', 'dmask:0x1']):
+        stage = G.Stage.__new__(G.Stage)
+        try:
+            stage.image_compare(['v1', 'v2', 'v3', 's4'], mods, 'c')
+        except G.Unsupported as error:
+            assert str(error) == '%s without exactly one dim and dmask' % base, (mods, error)
+        else:
+            raise AssertionError('%s accepted modifiers %s' % (base, mods))
+    stage = G.Stage.__new__(G.Stage)
+    try:
+        stage.image_compare(['v1', 'v2', 'v3', 's4'], ['dim:SQ_RSRC_IMG_2D', 'dmask:0x1'], 'c')
+    except G.Unsupported as error:
+        assert 'without exactly one dim and dmask' not in str(error), error
+    except AttributeError:
+        pass  # past the guard: the bare stage has none of the state the lowering needs
+
 def mip_words(x, mip, image=MIP_IMAGE):
     return (bytes.fromhex('04040cf4000000fa' + MIP_X[x] + '8002027e' '0902047e' '0211047e' + MIP_LEVEL[mip] + '7fc08cbf')
             + image + bytes.fromhex('703f8cbf' '0f1800f800010203' '000081bf'))
@@ -239,6 +264,7 @@ def mip_controls():
 
 
 def controls():
+    check_compare_modifiers()
     # image_sample: a Texture2DArray, with the slice as the third component of the coordinate.
     pipe = translate(SAMPLE_WORDS)
     ps, manifest = pipe.hlsl_ps(), pipe.manifest()

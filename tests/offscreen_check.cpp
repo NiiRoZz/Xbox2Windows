@@ -4,10 +4,12 @@
 #include <wrl/client.h>
 #include <algorithm>
 #include <charconv>
+#include <cmath>
 #include <cstdio>
 #include <cwchar>
 #include <fstream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -20,6 +22,7 @@
 #include "dispatch_index_cs.h"
 #include "group_index_cs.h"
 #include "desktop_gpu.h"
+#include "dxr_opacity_reference.h"
 
 void check_spirv_window_atomic(ID3D12Device* device, const char* shader_path);
 void check_spirv_window_signed(ID3D12Device* device, const char* shader_path);
@@ -839,6 +842,12 @@ OperationResult run_mesh_amplified(const OperationContext& ctx)
                                                    ctx.argv[6]));
 }
 
+OperationResult run_mesh_multi(const OperationContext& ctx)
+{
+    return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], false,
+                                               MeshConstantBinding::root, MeshDrawMode::multi_primitive));
+}
+
 OperationResult run_mesh_indexed(const OperationContext& ctx)
 {
     return skip_if_false(check_mesh_entry_draw(ctx.device, ctx.argv[3], ctx.argv[4], ctx.argv[5], true));
@@ -982,14 +991,43 @@ OperationResult run_dxr_facing_pipeline(const OperationContext& ctx)
     return skip_if_false(check_dxr_facing(ctx.device, true));
 }
 
+std::optional<float> parse_dxr_opacity_tmin(int argc, char** argv)
+{
+    if (argc == 3) return dxr_opacity::defaultTMin;
+    if (argc != 5 || std::string_view(argv[3]) != "--tmin") return std::nullopt;
+
+    const std::string_view text = argv[4];
+    const char* const last = text.data() + text.size();
+    // Check the interval before rounding to the float stored in the ray buffer.
+    double value = 0;
+    const auto [end, error] = std::from_chars(text.data(), last, value);
+    if (error != std::errc{} || end != last || !std::isfinite(value) || value < 0 || value > dxr_opacity::maxTMin)
+        return std::nullopt;
+
+    const float nearT = static_cast<float>(value);
+    if (nearT == 0) return value == 0 ? std::optional<float>{0.0f} : std::nullopt;
+    return nearT;
+}
+
+bool validate_dxr_opacity_args(int argc, char** argv)
+{
+    return parse_dxr_opacity_tmin(argc, argv).has_value();
+}
+
+OperationResult run_dxr_opacity_fixture(const OperationContext& ctx, bool use_pipeline)
+{
+    const float nearT = parse_dxr_opacity_tmin(ctx.argc, ctx.argv).value();
+    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", use_pipeline, nearT));
+}
+
 OperationResult run_dxr_opacity(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", false));
+    return run_dxr_opacity_fixture(ctx, false);
 }
 
 OperationResult run_dxr_opacity_pipeline(const OperationContext& ctx)
 {
-    return skip_if_false(check_dxr_opacity(ctx.device, ctx.mode == "warp", true));
+    return run_dxr_opacity_fixture(ctx, true);
 }
 
 OperationResult run_ray_query(const OperationContext& ctx)
@@ -1178,6 +1216,48 @@ OperationResult run_startup_packed_position(const OperationContext& ctx)
     return {OutcomeKind::pass, nullptr};
 }
 
+// --startup-pixel-words <vs.cso> <ps.cso> <width> <height> <expected.bin>: draws a full-screen pair over a
+// width x height R32G32B32A32_FLOAT target (tests/startup_flat_param.cpp; a discarded pixel keeps the clear
+// value -1.0) and compares every pixel's four words with the file: width * height * 4 little-endian words,
+// row by row. Reports the first differing pixel and the number of differing pixels.
+OperationResult run_startup_pixel_words(const OperationContext& ctx)
+{
+    unsigned long width = 0, height = 0;
+    try {
+        width = std::stoul(ctx.argv[5]);
+        height = std::stoul(ctx.argv[6]);
+    } catch (const std::exception&) {
+        return {OutcomeKind::fail, "width and height must be numbers"};
+    }
+    if (width == 0 || height == 0 || width > 64 || height > 64)
+        return {OutcomeKind::fail, "width and height must be 1..64"};
+    std::vector<std::uint32_t> expected(size_t(width) * height * 4);
+    std::ifstream file(ctx.argv[7], std::ios::binary);
+    file.read(reinterpret_cast<char*>(expected.data()), std::streamsize(expected.size() * sizeof(std::uint32_t)));
+    if (!file || file.peek() != std::char_traits<char>::eof())
+        return {OutcomeKind::fail, "expected file does not hold width * height * 4 words"};
+    std::vector<std::uint32_t> pixels(expected.size());
+    check_startup_flat_param(ctx.device, ctx.argv[3], ctx.argv[4], pixels.data(), UINT(width), UINT(height));
+    unsigned long differing = 0;
+    for (unsigned long y = 0; y < height; ++y) {
+        for (unsigned long x = 0; x < width; ++x) {
+            const std::uint32_t* want = &expected[(y * width + x) * 4];
+            const std::uint32_t* got = &pixels[(y * width + x) * 4];
+            if (std::memcmp(want, got, 4 * sizeof(std::uint32_t)) == 0) continue;
+            if (differing++ == 0) {
+                std::fprintf(stderr, "pixel mismatch (%lu,%lu): expected %08x,%08x,%08x,%08x actual %08x,%08x,%08x,%08x\n",
+                             x, y, want[0], want[1], want[2], want[3], got[0], got[1], got[2], got[3]);
+            }
+        }
+    }
+    if (differing) {
+        std::fprintf(stderr, "%lu of %lu pixels differ\n", differing, width * height);
+        return {OutcomeKind::fail, "pixel readback differs"};
+    }
+    std::printf("all %lu pixels matched\n", width * height);
+    return {OutcomeKind::pass, nullptr};
+}
+
 // --startup-flat-param <vs.cso> <ps.cso> <expected words>: draws one pixel with a gfx2hlsl vertex and
 // pixel stage pair (tests/startup_flat_param.cpp). The expected value is four 8-digit hex words,
 // comma separated.
@@ -1308,6 +1388,7 @@ const OperationSpec kOperations[] = {
     {"--startup-image-2d-array-mips", 7, 8, nullptr, kNoGate, run_startup_image_3d},
     {"--startup-packed-position", 5, 5, nullptr, kNoGate, run_startup_packed_position},
     {"--startup-flat-param", 6, 6, nullptr, kNoGate, run_startup_flat_param},
+    {"--startup-pixel-words", 8, 8, nullptr, kNoGate, run_startup_pixel_words},
     // <cso> <groups 1|2> <UAV bytes> <out.bin>: whole raw UAV after one dispatch (#775 GVN parity).
     {"--raw-uav-dump", 7, 7, nullptr, kGateSm60RawUavDump, run_raw_uav_dump},
     {"--raw-uav-dump-sm62", 7, 7, nullptr, kGateSm62RawUavDump, run_raw_uav_dump},
@@ -1360,6 +1441,7 @@ const OperationSpec kOperations[] = {
     {"--mesh-entry", 6, 7, validate_mesh_entry_args, kNoGate, run_mesh_entry},
     {"--mesh-amplified", 7, 7, nullptr, kNoGate, run_mesh_amplified},
     {"--mesh-indexed", 6, 6, nullptr, kNoGate, run_mesh_indexed},
+    {"--mesh-multi", 6, 6, nullptr, kNoGate, run_mesh_multi},
     {"--mesh-indexed-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_indexed_fallback},
     {"--mesh-textured-fallback", 7, 7, nullptr, kGateSm60MeshFallback, run_mesh_textured_fallback},
     {"--mesh-entry-table", 6, 7, validate_mesh_entry_table_args, kNoGate, run_mesh_entry_table},
@@ -1384,8 +1466,8 @@ const OperationSpec kOperations[] = {
     {"--dxr-update-pipeline", 3, 3, nullptr, kNoGate, run_dxr_update_pipeline},
     {"--dxr-facing", 3, 3, nullptr, kNoGate, run_dxr_facing},
     {"--dxr-facing-pipeline", 3, 3, nullptr, kNoGate, run_dxr_facing_pipeline},
-    {"--dxr-opacity", 3, 3, nullptr, kNoGate, run_dxr_opacity},
-    {"--dxr-opacity-pipeline", 3, 3, nullptr, kNoGate, run_dxr_opacity_pipeline},
+    {"--dxr-opacity", 3, 5, validate_dxr_opacity_args, kNoGate, run_dxr_opacity},
+    {"--dxr-opacity-pipeline", 3, 5, validate_dxr_opacity_args, kNoGate, run_dxr_opacity_pipeline},
     {"--ray-query", 3, 3, nullptr, kNoGate, run_ray_query},
     {"--dxr-address-ranges", 3, 3, nullptr, kNoGate, run_dxr_address_ranges},
     {"--dxr-placed-build", 3, 3, nullptr, kNoGate, run_dxr_placed_build},
@@ -1561,7 +1643,7 @@ int run_self_test()
 
     // (a) CLI validation rejects unknown --*, bad argc, bad flags, and bad positional draw argc with usage_error (exit 2).
     auto check_cli = [&](std::vector<const char*> args, CliAction expected_action,
-                         std::string_view expected_err_substr = {}) {
+                         std::string_view expected_err_substr = {}, std::optional<float> expected_tmin = {}) {
         std::vector<char*> mut_argv;
         std::vector<std::string> storage;
         storage.reserve(args.size());
@@ -1574,8 +1656,24 @@ int run_self_test()
             !require(err.find(expected_err_substr) != std::string::npos, "expected stderr substring")) {
             return false;
         }
-        return true;
+        return !expected_tmin || require(parse_dxr_opacity_tmin(static_cast<int>(mut_argv.size()), mut_argv.data()) ==
+                                         expected_tmin, "effective opacity TMin");
     };
+
+    for (const char* op : {"--dxr-opacity", "--dxr-opacity-pipeline"}) {
+        if (!check_cli({"offscreen_check", "warp", op}, CliAction::operation, {}, 0.25f) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0"}, CliAction::operation, {}, 0.0f) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0.25"}, CliAction::operation, {}, 0.25f) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0.5"}, CliAction::operation, {}, 0.5f)) return 1;
+        if (!check_cli({"offscreen_check", "warp", op, "--tmin"}, CliAction::usage_error) ||
+            !check_cli({"offscreen_check", "warp", op, "--other", "0.25"}, CliAction::usage_error) ||
+            !check_cli({"offscreen_check", "warp", op, "--tmin", "0", "--tmin", "0.5"}, CliAction::usage_error))
+            return 1;
+        for (const char* value : {"", "-0.1", "0.51", "0.50000001", "1", "nan", "inf", "1e999", "1e-100", "0,25", "0.25x"}) {
+            if (!check_cli({"offscreen_check", "warp", op, "--tmin", value}, CliAction::usage_error)) return 1;
+        }
+    }
+    if (!check_cli({"offscreen_check", "warp", "--dual-uav", "--tmin", "0.25"}, CliAction::usage_error)) return 1;
 
     if (!check_cli({"offscreen_check", "warp", "--bvh-wave"}, CliAction::usage_error,
                    "Unknown GPU operation or invalid arguments: --bvh-wave")) return 1;

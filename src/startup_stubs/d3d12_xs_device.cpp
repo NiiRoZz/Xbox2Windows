@@ -25,6 +25,7 @@
 #include "startup_stubs/derived_blend.h"
 #include "startup_stubs/placement_publish.h"
 #include "startup_stubs/placed_build.h"
+#include "startup_stubs/placed_buffer_range.h"
 #include "startup_stubs/memory_srv_report.h"
 #include "startup_stubs/memory_srv_buffer.h"
 
@@ -40,11 +41,13 @@
 #include "state_block_blend.h"
 #include "title_heap_memory.h"
 #include <d3d12sdklayers.h>
+#include <d3d12shader.h>
 #include <d3dcompiler.h>
 #include <dxgi1_4.h>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -81,6 +84,13 @@ const char* const kind_names[kind_count] = {
 // state lives in front of the object, out of the title's reach, and the zero-filled area behind the
 // vtable pointer is sized per kind (64 KiB for command lists).
 struct Wrapper;
+enum class IndirectCommand { none, dispatch, draw, draw_indexed, dispatch_mesh };
+struct IndirectGraphicsPipeline {
+    ID3D12RootSignature* root{};
+    DXGI_FORMAT target_format{};
+    bool mesh{};
+};
+
 struct alignas(16) WrapperOwn {
     IUnknown* real;
     LONG refs;
@@ -95,10 +105,13 @@ struct alignas(16) WrapperOwn {
     bool tiled_address_srv; // Resource backed by 4 KiB tiled guest memory for translated draws.
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     bool compute_pipeline;   // PipelineState: a desktop compute pipeline
+    bool root_without_bindings; // RootSignature: decoded and has no parameters or static samplers
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
-    Wrapper* dispatch_signature_device;   // CommandSignature: owner of the supported single-Dispatch shape
+    Wrapper* signature_device; // CommandSignature: owner of the supported single-command shape
+    IndirectCommand indirect_command;
+    IndirectGraphicsPipeline indirect_graphics;
     UINT list_node_mask;
 };
 static_assert(sizeof(WrapperOwn) % 16 == 0, "the title-visible object must stay 16-byte aligned");
@@ -901,12 +914,21 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
                                               u64 iid, u64 out)
 {
     const u64 result = create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
-    if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && !root &&
-        desc->ByteStride == sizeof(D3D12_DISPATCH_ARGUMENTS) && desc->NumArgumentDescs == 1 &&
-        desc->pArgumentDescs[0].Type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
+    if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && !root && desc->NumArgumentDescs == 1) {
         auto* signature = *reinterpret_cast<Wrapper**>(out);
-        if (signature && signature->own().kind == command_signature_kind)
-            signature->own().dispatch_signature_device = self;
+        if (signature && signature->own().kind == command_signature_kind) {
+            auto& state = signature->own();
+            const auto type = desc->pArgumentDescs[0].Type;
+            if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH && desc->ByteStride == sizeof(D3D12_DISPATCH_ARGUMENTS))
+                state.indirect_command = IndirectCommand::dispatch;
+            if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW && desc->ByteStride == sizeof(D3D12_DRAW_ARGUMENTS))
+                state.indirect_command = IndirectCommand::draw;
+            if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED && desc->ByteStride == sizeof(D3D12_DRAW_INDEXED_ARGUMENTS))
+                state.indirect_command = IndirectCommand::draw_indexed;
+            if (type == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH && desc->ByteStride == sizeof(D3D12_DISPATCH_MESH_ARGUMENTS))
+                state.indirect_command = IndirectCommand::dispatch_mesh;
+            if (state.indirect_command != IndirectCommand::none) state.signature_device = self;
+        }
     }
     static LONG failures;
     if (FAILED(static_cast<HRESULT>(result)) && desc && first_calls(failures, 8)) {
@@ -1075,6 +1097,10 @@ struct DesktopAllocator {
     // A submit whose completion fence could not be created or signalled: the GPU may still run it
     // and nothing would say when it ends, so the allocator is never reset or reused again.
     bool untracked;
+    // A command list recorded on this allocator failed Close(). Do not open another list on it
+    // until it is idle and Reset(); hardware drivers can fault if a second recording starts on
+    // an allocator whose failed recording is still attached.
+    bool close_failed;
 };
 struct TitleAllocator {
     std::vector<DesktopAllocator*> pool;
@@ -1092,7 +1118,7 @@ TitleAllocator& title_allocator(Wrapper* allocator)
 {
     TitleAllocator& title = title_allocators[allocator];
     if (!title.current) {
-        title.current = new DesktopAllocator{static_cast<ID3D12CommandAllocator*>(allocator->own().real), 0, {}, false};
+        title.current = new DesktopAllocator{static_cast<ID3D12CommandAllocator*>(allocator->own().real), 0, {}, false, false};
         title.pool.push_back(title.current);
     }
     return title;
@@ -1124,7 +1150,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
             ID3D12CommandAllocator* created = nullptr;
             hr = device_of(the_device)->CreateCommandAllocator(title.type, IID_PPV_ARGS(&created));
             if (SUCCEEDED(hr)) {
-                next = new DesktopAllocator{created, 0, {}, false};
+                next = new DesktopAllocator{created, 0, {}, false, false};
                 title.pool.push_back(next);
                 InterlockedIncrement(&allocator_creates);
             }
@@ -1134,6 +1160,7 @@ HRESULT __stdcall allocator_reset(Wrapper* self)
         hr = next->real->Reset();
         if (SUCCEEDED(hr)) {
             next->submits.clear();
+            next->close_failed = false;
             if (next != title.current) InterlockedIncrement(&allocator_swaps);
             title.current = next;
         }
@@ -1217,21 +1244,48 @@ HRESULT __stdcall list_reset(Wrapper* self, void* allocator)
     if (a && a->own().kind == allocator_kind && previous) {
         TitleAllocator& title = title_allocator(a);
         const auto type = previous->GetType();
-        if (state.list_close_failed) {
-            ID3D12GraphicsCommandList* replacement = nullptr;
-            hr = device_of(state.list_device)->CreateCommandList(state.list_node_mask, type, title.current->real,
-                                                               nullptr, IID_PPV_ARGS(&replacement));
-            if (SUCCEEDED(hr)) {
-                // Keep the old object through recording cleanup. In-flight GPU work keeps
-                // its allocator and submitted descriptors through the existing fence tracking.
-                replaced.Attach(previous);
-                state.real = replacement;
-                state.list_close_failed = false;
+        DesktopAllocator* target = title.current;
+        if (target->close_failed && title.type == type) {
+            target = nullptr;
+            for (DesktopAllocator* spare : title.pool) {
+                if (spare != title.current && allocator_idle(spare) && SUCCEEDED(spare->real->Reset())) {
+                    spare->submits.clear();
+                    spare->close_failed = false;
+                    target = spare;
+                    break;
+                }
             }
-        } else {
-            hr = previous->Reset(title.current->real, nullptr);
+            if (!target) {
+                ID3D12CommandAllocator* created = nullptr;
+                hr = device_of(state.list_device)->CreateCommandAllocator(type, IID_PPV_ARGS(&created));
+                if (SUCCEEDED(hr)) {
+                    target = new DesktopAllocator{created, 0, {}, false, false};
+                    title.pool.push_back(target);
+                    InterlockedIncrement(&allocator_creates);
+                }
+            }
+        }
+        if (target) {
+            if (state.list_close_failed) {
+                ID3D12GraphicsCommandList* replacement = nullptr;
+                hr = device_of(state.list_device)->CreateCommandList(state.list_node_mask, type, target->real,
+                                                                   nullptr, IID_PPV_ARGS(&replacement));
+                if (SUCCEEDED(hr)) {
+                    // Keep the old object through recording cleanup. In-flight GPU work keeps
+                    // its allocator and submitted descriptors through the existing fence tracking.
+                    replaced.Attach(previous);
+                    state.real = replacement;
+                    state.list_close_failed = false;
+                }
+            } else {
+                hr = previous->Reset(target->real, nullptr);
+            }
         }
         if (SUCCEEDED(hr)) {
+            if (target != title.current) {
+                InterlockedIncrement(&allocator_swaps);
+                title.current = target;
+            }
             title.type = type;
             DesktopAllocator*& on = list_recordings[self];
             if (on) --on->lists;
@@ -1269,6 +1323,10 @@ HRESULT __stdcall list_close(Wrapper* self)
     state.list_open = false;
     state.list_ready = SUCCEEDED(hr);
     state.list_close_failed = FAILED(hr);
+    if (FAILED(hr)) {
+        if (const auto found = list_recordings.find(self); found != list_recordings.end() && found->second)
+            found->second->close_failed = true;
+    }
     ReleaseSRWLockExclusive(&allocator_lock);
     InterlockedIncrement(&render_closes);
     if (FAILED(hr)) {
@@ -1498,6 +1556,7 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
         const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc = nullptr;
         if (SUCCEEDED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc) {
             heap_flags = static_cast<UINT>(desc->Desc_1_1.Flags) & x2w_startup::root_flags_heap_indexed;
+            w->own().root_without_bindings = !heap_flags && !desc->Desc_1_1.NumParameters && !desc->Desc_1_1.NumStaticSamplers;
             for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
                 const auto& parameter = desc->Desc_1_1.pParameters[i];
                 RootParameter info{parameter.ParameterType, 0, 0};
@@ -1528,19 +1587,45 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
     return S_OK;
 }
 
-ID3DBlob* compile_translation(const void* container, const std::vector<RootParameter>*, char* why, std::size_t why_size)
+bool readable_shader_container(const D3D12_SHADER_BYTECODE& code)
 {
-    const auto* digest = static_cast<const unsigned char*>(container) + 4;
-    std::snprintf(why, why_size, "no translation for stream shader %02x%02x%02x%02x", digest[0], digest[1], digest[2], digest[3]);
-    return nullptr;
+    return code.BytecodeLength >= 32 && code.BytecodeLength <= (1u << 20) &&
+        x2w_local::readable(code.pShaderBytecode, code.BytecodeLength) &&
+        !std::memcmp(code.pShaderBytecode, "DXBC", 4);
+}
+
+bool desktop_indirect_graphics_shader(const D3D12_SHADER_BYTECODE& code, D3D12_SHADER_VERSION_TYPE stage)
+{
+    if (!readable_shader_container(code)) return false;
+    x2w_startup::ComPtr<ID3D12ShaderReflection> shader;
+    if (FAILED(D3DReflect(code.pShaderBytecode, code.BytecodeLength, IID_PPV_ARGS(shader.GetAddressOf())))) return false;
+    D3D12_SHADER_DESC desc{};
+    if (FAILED(shader->GetDesc(&desc)) || desc.Version >> 16 != stage ||
+        ((desc.Version >> 4) & 0xf) != 5 || desc.BoundResources) return false;
+    if (stage == D3D12_SHVER_VERTEX_SHADER) {
+        for (UINT i = 0; i < desc.InputParameters; ++i) {
+            D3D12_SIGNATURE_PARAMETER_DESC input{};
+            if (FAILED(shader->GetInputParameterDesc(i, &input)) ||
+                (input.SystemValueType != D3D_NAME_VERTEX_ID && input.SystemValueType != D3D_NAME_INSTANCE_ID))
+                return false;
+        }
+    }
+    return true;
 }
 
 constexpr std::size_t stream_sizes[23] = {16, 24, 24, 24, 24, 24, 24, 40, 336, 8, 48, 56, 24, 8, 8, 40, 8, 16, 8, 24, 8, 64, 24};
 
+std::size_t desktop_stream_size(UINT type)
+{
+    // Only native pipeline creation accepts a mesh shader subobject.
+    if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) return 24;
+    return type < std::size(stream_sizes) ? stream_sizes[type] : 0;
+}
+
 // Converts a console pipeline stream to desktop form and creates the pipeline. The subobject type
 // numbers and sizes are the desktop ones; only the pointers and formats inside need converting.
 ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, char* why, std::size_t why_size,
-                                          bool& compute)
+                                          bool& compute, IndirectGraphicsPipeline& graphics)
 {
     const std::size_t bytes = desc->SizeInBytes;
     if (bytes < 16 || bytes > 0x2000 || (bytes & 7) || !x2w_local::readable(desc->pPipelineStateSubobjectStream, bytes)) {
@@ -1550,50 +1635,90 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
     std::vector<u64> copy(bytes / 8);
     std::memcpy(copy.data(), desc->pPipelineStateSubobjectStream, bytes);
     auto* stream = reinterpret_cast<unsigned char*>(copy.data());
-    const std::vector<RootParameter>* root = nullptr;
-    std::vector<ID3DBlob*> blobs;
+    const Wrapper* root = nullptr;
+    bool vertex = false, pixel = false, mesh = false, input_layout = false;
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+    D3D12_RT_FORMAT_ARRAY targets{};
+    DXGI_FORMAT depth = DXGI_FORMAT_UNKNOWN;
+    DXGI_SAMPLE_DESC samples{1, 0};
     bool ok = true;
-    // First pass: find the root signature (shader translation needs it).
+    // First pass: validate the layout and find the wrapped root signature.
     for (std::size_t offset = 0; offset < bytes;) {
         const UINT type = *reinterpret_cast<UINT*>(stream + offset);
-        if (type >= std::size(stream_sizes) || stream_sizes[type] > bytes - offset) {
+        const auto size = desktop_stream_size(type);
+        if (!size || size > bytes - offset) {
             ok = false;
             std::snprintf(why, why_size, "unknown or truncated subobject %u at +0x%zx", type, offset);
             break;
         }
-        if (type == 0) root = root_info(as_wrapper(*reinterpret_cast<void**>(stream + offset + 8)));
-        offset += stream_sizes[type];
+        if (type == 0) root = as_wrapper(*reinterpret_cast<void**>(stream + offset + 8));
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) mesh = true;
+        offset += size;
     }
+    const bool empty_root = root && root->own().kind == root_signature_kind && root->own().root_without_bindings;
     for (std::size_t offset = 0; ok && offset < bytes;) {
         const UINT type = *reinterpret_cast<UINT*>(stream + offset);
         if (type == 0) {
             u64& pointer = *reinterpret_cast<u64*>(stream + offset + 8);
             pointer = unwrap(pointer);
         } else if (type >= 1 && type <= 5) {
-            auto* code = reinterpret_cast<D3D12_SHADER_BYTECODE*>(stream + offset + 8);
+            const auto* code = reinterpret_cast<const D3D12_SHADER_BYTECODE*>(stream + offset + 8);
             if (code->pShaderBytecode) {
-                ID3DBlob* blob = (type <= 2 && is_container(code->pShaderBytecode))
-                    ? compile_translation(code->pShaderBytecode, root, why, why_size) : nullptr;
-                if (!blob) {
-                    if (!why[0]) std::snprintf(why, why_size, "stage %u has no translation", type);
+                const bool is_vertex = type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS;
+                bool supported = false;
+                if (empty_root && type <= D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+                    // The native PSO validates the DXIL stages against the empty root.
+                    supported = mesh ? !is_vertex && readable_shader_container(*code)
+                        : desktop_indirect_graphics_shader(*code, is_vertex ? D3D12_SHVER_VERTEX_SHADER : D3D12_SHVER_PIXEL_SHADER);
+                }
+                if (!supported) {
+                    std::snprintf(why, why_size, "stage %u has no translation or supported desktop binding", type);
                     ok = false;
                     break;
                 }
-                blobs.push_back(blob);
-                code->pShaderBytecode = blob->GetBufferPointer();
-                code->BytecodeLength = blob->GetBufferSize();
+                if (is_vertex) vertex = true;
+                else pixel = true;
+            }
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
+            const auto* code = reinterpret_cast<const D3D12_SHADER_BYTECODE*>(stream + offset + 8);
+            if (!empty_root || !readable_shader_container(*code)) {
+                std::snprintf(why, why_size, "mesh stage needs desktop bytecode and an empty root signature");
+                ok = false;
+                break;
             }
         } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
             const auto* code = reinterpret_cast<const D3D12_SHADER_BYTECODE*>(stream + offset + 8);
             compute = code->pShaderBytecode && code->BytecodeLength;
-        } else if (type == 15) {
-            auto* formats = reinterpret_cast<DXGI_FORMAT*>(stream + offset + 4);
-            for (int i = 0; i < 8; ++i) formats[i] = desktop_format(formats[i]);
-        } else if (type == 16) {
+        } else if (mesh && type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT) {
+            const auto* output = reinterpret_cast<const D3D12_STREAM_OUTPUT_DESC*>(stream + offset + 8);
+            if (output->NumEntries || output->NumStrides) {
+                std::snprintf(why, why_size, "mesh streams cannot use stream output");
+                ok = false;
+                break;
+            }
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
+            input_layout = reinterpret_cast<const D3D12_INPUT_LAYOUT_DESC*>(stream + offset + 8)->NumElements != 0;
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY) {
+            topology = *reinterpret_cast<const D3D12_PRIMITIVE_TOPOLOGY_TYPE*>(stream + offset + 4);
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS) {
+            auto* formats = reinterpret_cast<D3D12_RT_FORMAT_ARRAY*>(stream + offset + 4);
+            for (auto& format : formats->RTFormats) format = desktop_format(format);
+            targets = *formats;
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT) {
             auto* format = reinterpret_cast<DXGI_FORMAT*>(stream + offset + 4);
             *format = desktop_format(*format);
+            depth = *format;
+        } else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC) {
+            samples = *reinterpret_cast<const DXGI_SAMPLE_DESC*>(stream + offset + 4);
         }
-        offset += stream_sizes[type];
+        offset += desktop_stream_size(type);
+    }
+    if (ok && (vertex || pixel || mesh) &&
+        ((!vertex && !mesh) || !pixel || compute || input_layout || topology != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE ||
+         targets.NumRenderTargets != 1 || targets.RTFormats[0] == DXGI_FORMAT_UNKNOWN || depth != DXGI_FORMAT_UNKNOWN ||
+         samples.Count != 1 || samples.Quality)) {
+        std::snprintf(why, why_size, "desktop indirect graphics stream needs VS/PS or MS/PS, triangles, one single-sample target and no vertex layout or depth");
+        ok = false;
     }
     ID3D12PipelineState* pipeline = nullptr;
     if (ok) {
@@ -1614,7 +1739,8 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
         }
         check_device("Device CreatePipelineState", 86);
     }
-    for (ID3DBlob* blob : blobs) blob->Release();
+    if (pipeline && (vertex || mesh) && pixel)
+        graphics = {static_cast<ID3D12RootSignature*>(root->own().real), targets.RTFormats[0], mesh};
     return pipeline;
 }
 
@@ -1683,6 +1809,8 @@ struct Pass {
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
     bool compute_pipeline = false;
     bool compute_root = false;
+    IndirectGraphicsPipeline indirect_graphics;
+    ID3D12RootSignature* graphics_root = nullptr;
     bool targets_bound = false;
     bool topology_ok = false;
     unsigned srv_bound = 0;          // bit per root parameter with a desktop address bound
@@ -1784,7 +1912,11 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
 {
     Wrapper* w = as_wrapper(pipeline);
     Pass& pass = pass_of(self);
-    pass.pipeline_real = w && w->own().kind == pipeline_kind && w->own().real;
+    const bool available = w && w->own().kind == pipeline_kind && w->own().real;
+    pass.indirect_graphics = available ? w->own().indirect_graphics : IndirectGraphicsPipeline{};
+    // Keep direct draws on their existing translation path. Slot 61 binds
+    // a recognized desktop graphics pipeline just before it records the draw.
+    pass.pipeline_real = available && !pass.indirect_graphics.root;
     pass.compute_pipeline = pass.pipeline_real && w->own().compute_pipeline;
     pass.pipeline = w && w->own().kind == pipeline_kind ? w : nullptr;
     InterlockedIncrement(pass.pipeline_real ? &render_pipelines_real : &render_pipelines_missing);
@@ -1819,14 +1951,36 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (!sig || sig->own().kind != command_signature_kind || !sig->own().real)
         return refuse("missing or placeholder signature");
     const Wrapper* device = self->own().list_device;
-    if (!device || sig->own().dispatch_signature_device != device)
-        return refuse("requires a single rootless Dispatch signature from this device");
+    if (!device || sig->own().signature_device != device)
+        return refuse("requires a supported single rootless signature from this device");
+    const auto command = sig->own().indirect_command;
+    const bool indexed = command == IndirectCommand::draw_indexed;
+    const bool mesh = command == IndirectCommand::dispatch_mesh;
+    const bool graphics = indexed || mesh || command == IndirectCommand::draw;
     Pass& pass = pass_of(self);
-    if (!pass.compute_pipeline || !pass.compute_root) return refuse("requires a desktop compute pipeline and root");
+    u64 bytes = sizeof(D3D12_DISPATCH_ARGUMENTS);
+    if (graphics) {
+        if (indexed) bytes = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+        else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
+        else bytes = sizeof(D3D12_DRAW_ARGUMENTS);
+        if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || !pass.indirect_graphics.root ||
+            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh)
+            return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root");
+        if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
+            pass.target_formats[0] != pass.indirect_graphics.target_format ||
+            pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)
+            return refuse("indirect graphics requires one matching target, viewport and scissor");
+        if (!mesh && pass.topology != D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST)
+            return refuse("indirect draw requires triangle-list topology");
+        const auto samples = pass.target0->GetDesc().SampleDesc;
+        if (samples.Count != 1 || samples.Quality)
+            return refuse("draw requires a single-sample render target");
+    } else if (!pass.compute_pipeline || !pass.compute_root) {
+        return refuse("requires a desktop compute pipeline and root");
+    }
     Wrapper* buffer = as_wrapper(argument);
     if (!buffer || buffer->own().kind != resource_kind || !buffer->own().real)
         return refuse("argument has no desktop resource");
-    constexpr u64 bytes = sizeof(D3D12_DISPATCH_ARGUMENTS);
     const auto base = reinterpret_cast<u64>(buffer->own().title_memory);
     if (!base || (offset & 3) || offset > ~u64{} - base)
         return refuse("invalid argument offset or unmapped buffer");
@@ -1836,7 +1990,35 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (!info || info->initial_state != D3D12_RESOURCE_STATE_COMMON)
         return refuse("argument buffer does not use COMMON state tracking");
     auto* resource = static_cast<ID3D12Resource*>(buffer->own().real);
-    require_state(self, resource, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+    auto argument_state = D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    if (indexed) {
+        auto view = pass.ib;
+        const UINT alignment = view.Format == DXGI_FORMAT_R16_UINT ? 2 : view.Format == DXGI_FORMAT_R32_UINT ? 4 : 0;
+        if (!alignment || !view.BufferLocation || !view.SizeInBytes ||
+            view.BufferLocation % alignment || view.SizeInBytes % alignment)
+            return refuse("invalid index view");
+        const auto indices = placed_buffer_range(device, view.BufferLocation, view.SizeInBytes);
+        if (indices.reject || !indices.owner || !indices.owner->own().real)
+            return refuse("index view is outside a unique placed buffer");
+        const auto* index_info = resource_info(indices.owner);
+        if (!index_info || index_info->initial_state != D3D12_RESOURCE_STATE_COMMON)
+            return refuse("index buffer does not use COMMON state tracking");
+        auto* index = static_cast<ID3D12Resource*>(indices.owner->own().real);
+        const auto index_base = reinterpret_cast<u64>(indices.owner->own().title_memory);
+        const auto index_offset = view.BufferLocation - index_base;
+        const auto native_base = index->GetGPUVirtualAddress();
+        if (!native_base || index_offset > ~u64{} - native_base || (native_base + index_offset) % alignment)
+            return refuse("index view has no aligned desktop address");
+        view.BufferLocation = native_base + index_offset;
+        if (index == resource) argument_state |= D3D12_RESOURCE_STATE_INDEX_BUFFER;
+        else require_state(self, index, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+        list->IASetIndexBuffer(&view);
+    }
+    if (graphics) {
+        list->SetPipelineState(static_cast<ID3D12PipelineState*>(pass.pipeline->own().real));
+        list->SetGraphicsRootSignature(pass.graphics_root);
+    }
+    require_state(self, resource, argument_state);
     list->ExecuteIndirect(static_cast<ID3D12CommandSignature*>(sig->own().real), count, resource, offset, nullptr, 0);
 }
 // List slot 34 (desktop 30 + 4), SetGraphicsRootSignature. The title's parameters are tracked for translated
@@ -1858,10 +2040,12 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
     const bool real = w && w->own().kind == root_signature_kind && w->own().real;
     pass.root_heap_flags = real ? root_heap_flags(w) : 0;
     pass.deferred_root = pass.root_heap_flags ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
+    pass.graphics_root = nullptr;
     auto* list = recording(self);
     if (!list || !real) return;
     if (!pass.root_heap_flags) {
-        list->SetGraphicsRootSignature(static_cast<ID3D12RootSignature*>(w->own().real));
+        pass.graphics_root = static_cast<ID3D12RootSignature*>(w->own().real);
+        list->SetGraphicsRootSignature(pass.graphics_root);
         return;
     }
     const LONG deferred = InterlockedIncrement(&heap_roots_deferred);
@@ -2757,6 +2941,7 @@ HRESULT __stdcall device_frame_event(Wrapper*, UINT type, UINT offset_us, void* 
 // title address; nothing translates title GPU addresses yet. Textures trap.
 std::mutex placed_mutex;
 std::vector<std::pair<void*, ID3D12Heap*>> existing_heaps;
+volatile LONG64 placed_buffer_calls, placed_buffer_region_info, placed_buffer_queries;  // five-second totals
 
 HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3D12_RESOURCE_DESC* desc, UINT state,
                                           const void* clear, const GUID* iid, void** out)
@@ -2804,12 +2989,19 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         *out = w;
         return S_OK;
     }
-    MEMORY_BASIC_INFORMATION info{};
-    if (!address || VirtualQuery(address, &info, sizeof(info)) != sizeof(info) || info.State != MEM_COMMIT) {
+    // The allocation holding the address, and whether every byte from its base to the end of the
+    // buffer is committed in it: one region-information call for a fully committed private
+    // allocation, otherwise a region walk that stops at the end of the buffer.
+    x2w_startup::PlacedBufferRange range;
+    const bool committed = x2w_startup::measure_placed_buffer(address, desc->Width, range);
+    InterlockedIncrement64(&placed_buffer_calls);
+    if (range.region_info) InterlockedIncrement64(&placed_buffer_region_info);
+    InterlockedAdd64(&placed_buffer_queries, range.queries);
+    if (!committed) {
         log("x2w-d3d12 Device::slot133(CreatePlacedResourceX?) address=%p not committed -> E_INVALIDARG", address);
         return E_INVALIDARG;
     }
-    void* base = info.AllocationBase;
+    void* base = range.base;
     const auto initial_state = state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE ||
         state == D3D12_RESOURCE_STATE_UNORDERED_ACCESS ? static_cast<D3D12_RESOURCE_STATES>(state) : D3D12_RESOURCE_STATE_COMMON;
     if (initial_state != D3D12_RESOURCE_STATE_COMMON && !(desc->Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
@@ -2820,13 +3012,7 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
     // Desktop only accepts 64 KiB-aligned offsets, a private (VirtualAlloc) allocation, and a buffer
     // that lies inside that one allocation. Attempts that cannot succeed are skipped: each failure
     // throws inside D3D12Core.
-    MEMORY_BASIC_INFORMATION region{};
-    SIZE_T allocation_bytes = 0;
-    for (auto* cursor = static_cast<char*>(base);
-         VirtualQuery(cursor, &region, sizeof(region)) && region.AllocationBase == base && region.State == MEM_COMMIT;
-         cursor += region.RegionSize)
-        allocation_bytes += region.RegionSize;
-    if ((offset & 0xFFFF) || offset > allocation_bytes || desc->Width > allocation_bytes - offset || info.Type != MEM_PRIVATE ||
+    if ((offset & 0xFFFF) || !range.covered || range.type != MEM_PRIVATE ||
         initial_state == D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE) hr = E_INVALIDARG;
     if (SUCCEEDED(hr)) {
         std::lock_guard lock(placed_mutex);
@@ -3051,7 +3237,7 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     dump_containers("stream", desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x1000 ? desc->SizeInBytes : 0x1000);
     static LONG calls;
     if (first_calls(calls, 8))
-        log("x2w-d3d12 Device::slot86(CreatePipelineState?) stream=%p bytes=0x%llx riid=%s -> placeholder",
+        log("x2w-d3d12 Device::slot86(CreatePipelineState?) stream=%p bytes=0x%llx riid=%s",
             desc->pPipelineStateSubobjectStream, static_cast<unsigned long long>(desc->SizeInBytes), text);
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     ID3D12PipelineState* real_pipeline = nullptr;
@@ -3062,16 +3248,21 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     bool has_depth_stencil = false;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     bool compute = false;
+    IndirectGraphicsPipeline graphics;
     if (render_mode()) {
         char why[256] = "";
-        translation = stream_translation(*desc, blend, has_blend, depth_stencil, has_depth_stencil, dsv_format);
-        if (!translation) real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute);
+        // Recognized desktop stages must reach the native path before the
+        // guest cache creates a pending translation for any DXBC container.
+        real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, graphics);
+        if (!real_pipeline || graphics.root)
+            translation = stream_translation(*desc, blend, has_blend, depth_stencil, has_depth_stencil, dsv_format);
         static LONG built;
-        if (!translation && first_calls(built, 24))
+        if ((real_pipeline || !translation) && first_calls(built, 24))
             log("x2w-render stream pipeline -> %s%s", real_pipeline ? "REAL desktop pipeline" : "placeholder: ", real_pipeline ? "" : why);
     }
     *out = wrap(real_pipeline, pipeline_kind);
     static_cast<Wrapper*>(*out)->own().compute_pipeline = real_pipeline && compute;
+    static_cast<Wrapper*>(*out)->own().indirect_graphics = graphics;
     note_pipeline(static_cast<Wrapper*>(*out), 86, nullptr, desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x2000 ? desc->SizeInBytes : 0x2000,
                   translation, translation && has_blend ? &blend : nullptr,
                   translation && has_depth_stencil ? &depth_stencil : nullptr,
@@ -3133,7 +3324,9 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT coun
 // heap flags (8, ALLOW_DISPLAY, for the 4K render targets), resource desc, an initial state or
 // layout, clear value, then three zero words (protected session, castable count and formats in the
 // desktop method), riid and ppv. Desktop: CreateCommittedResource with the sanitized desc in
-// COMMON; when desktop rejects the clear value it is retried without one.
+// COMMON, GENERIC_READ on an upload heap and COPY_DEST on a readback heap (the initial states D3D12
+// requires there; the Windows 10 runtime refuses COMMON with E_INVALIDARG). When desktop rejects the
+// clear value it is retried without one.
 HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
                                             const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
                                             void* session, UINT castable_count, const void* castable, const GUID* iid,
@@ -3149,14 +3342,15 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     check_device("Device before slot", 127);
     void* const title_memory = info.SizeInBytes != ~0ull ? title_resource_memory(info.SizeInBytes, info.Alignment) : nullptr;
     ID3D12Resource* resource = nullptr;
+    const D3D12_RESOURCE_STATES initial = props->Type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
+                                          : props->Type == D3D12_HEAP_TYPE_READBACK ? D3D12_RESOURCE_STATE_COPY_DEST
+                                                                                    : D3D12_RESOURCE_STATE_COMMON;
     HRESULT hr = kind_for(*iid) == resource_kind
-        ? device_of(self)->CreateCommittedResource(props, flags, &copy, D3D12_RESOURCE_STATE_COMMON, clear,
-                                                   IID_PPV_ARGS(&resource))
+        ? device_of(self)->CreateCommittedResource(props, flags, &copy, initial, clear, IID_PPV_ARGS(&resource))
         : E_NOINTERFACE;
     bool cleared = clear != nullptr;
     if (FAILED(hr) && clear && kind_for(*iid) == resource_kind) {
-        hr = device_of(self)->CreateCommittedResource(props, flags, &copy, D3D12_RESOURCE_STATE_COMMON, nullptr,
-                                                      IID_PPV_ARGS(&resource));
+        hr = device_of(self)->CreateCommittedResource(props, flags, &copy, initial, nullptr, IID_PPV_ARGS(&resource));
         cleared = false;
     }
     static LONG calls;
@@ -3376,8 +3570,10 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
     }
     if (now - last_report >= 5000) {
         last_report = now;
-        log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu", views_noted, views_distinct,
-            descriptors_copied, static_cast<u64>(heap_infos().size()));
+        log("x2w-d3d12 views noted %lld (distinct %lld), descriptors copied %lld, heaps %llu, placed buffers %lld "
+            "(region-information proofs %lld, region queries %lld)", views_noted, views_distinct, descriptors_copied,
+            static_cast<u64>(heap_infos().size()), static_cast<long long>(placed_buffer_calls),
+            static_cast<long long>(placed_buffer_region_info), static_cast<long long>(placed_buffer_queries));
         {
             LARGE_INTEGER frequency;
             QueryPerformanceFrequency(&frequency);

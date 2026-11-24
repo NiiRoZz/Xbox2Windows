@@ -44,6 +44,80 @@ Run `ctest --preset dev --no-tests=error -R "^startup_stream_viewport_(hardware|
 `startup_stream_consumer`. On an 8×4 target the cases draw with neither call, inside a 4×2 rectangle (the
 rest keeps the clear color), and on a reset list that follows the rectangle (all pixels drawn again).
 
+## Stream vertex fetch from the input layout
+
+A vertex shader in a slot-86 stream can take its inputs from a fetch routine that the console driver builds
+from the stream's input layout. Such a shader starts with `s_swappc_b64 s[4:5], s[4:5]` and only then reads
+the registers the routine loaded. The routine's code is not in the shader container.
+
+The stand-in reads the `INPUT_LAYOUT` subobject and publishes it next to the request as `req_<key>.ia`, before
+`.a`. The file holds `ia1 <count>` and then one line per element: semantic, index, format, slot, offset, class
+and step rate. A stream with a non-empty layout includes that text in its cache key; other keys are unchanged.
+One log line per stream gives the element count and, for each element, format, slot, offset and class:
+`x2w-draw stream input layout: 2 elements (format/slot/offset/class) 6/0/0/0 6/0/4294967295/0`.
+
+`gfx2hlsl.py` translates the call as the loads it stands for, through the vertex-buffer path the other
+translations use (`srv buf vb <slot>` with a `stride` entry value). The registers come from a table in the
+container's native header. From +0x138 it holds one 5-byte record per fetched input: kind (6), input-signature
+register, component mask, first VGPR and component count minus one. Each record is matched to a layout element
+through the semantic name and index that the input signature gives for its register.
+
+The table was checked offline against the input signatures of every readable vertex program in one title's shader
+archive (local files only, not in the repository). 628 programs start with the call. All of them have a header of
+0x2f8 bytes and records of kind 6. Each of their 1,417 records names a signature register, and its mask equals
+that input's read mask. Records follow register order. The first record starts at v4, and each next one starts 4
+VGPRs later. The count reaches the highest component read: five records read only z or only w (mask 0x4 with
+count 3, mask 0x8 with count 4), and all components up to that one are loaded. None of the 1,355 programs without
+the call has a record. In all 1,983 programs the header's u32 at +0x1d8 equals the number of records.
+
+Refused: a header of any other size, a record of another kind, a mask whose highest bit is not its count,
+overlapping registers, a record reaching past v255, and a record count that disagrees with +0x1d8. A fetched element is also refused when it is
+per-instance, sits in a vertex-buffer slot above 7 (the stand-in binds slots 0 to 7), has an unknown format, or is
+appended (`D3D12_APPEND_ALIGNED_ELEMENT`) after an element of unknown size or one that ends off a 4-byte boundary,
+because the packing there is not measured. Elements that no record fetches are not checked. An unreadable layout
+is logged, and the translation is requested without it. Components a format lacks read
+as 0, 0, 0 and 1, as in the existing vertex-fetch table; that default is not measured for this path.
+
+A shader that starts with the call and has no layout is refused.
+
+After the call, every vertex register the shader reads must be defined on all paths. The translator proves this only
+for the entry block: the straight-line code from the call to the first branch or branch target. A register counts as
+defined when it is v0, a fetched register, or written in the entry block before the read by an instruction that
+runs with the entry exec mask. A write after exec was changed, or in any block after the entry block, does not
+count, even when it would run on every path. A read of any other register is refused. Programs whose later
+blocks only read registers defined this way still translate. After the call, any exec write ends the
+unconditional region, whatever instruction makes it. `s_wqm` of exec into itself only adds lanes and stays a
+no-op. Other `s_wqm` forms, writes to exec_hi, and exec writes by an instruction the translator does not model are
+refused.
+
+Before this change the call was cut off with the header and every input read as zero. The draw then had zero area
+and wrote no pixel. Programs without the call translate as before.
+
+Run `ctest --preset release --no-tests=error -R "^startup_stream_fetch_(warp|hardware)$" -V` after building
+`startup_stream_consumer`. The source-built shader declares POSITION and TEXCOORD. The stream lists them in the
+other order, TEXCOORD in slot 0 and POSITION in slot 1 at `D3D12_APPEND_ALIGNED_ELEMENT`. Two draws go to an 8×4
+target: one from start vertex 3, and one indexed with indices 4 to 9 and base vertex 5. Exactly the two position
+rectangles are drawn. Two mutations of the generated fetch must fail the exact check and draw the TEXCOORD
+rectangles instead: the records' registers exchanged, and both elements read from slot 0. Leaving the base vertex
+out of the fetch index also fails it. A shader without its layout is refused and not drawn.
+
+The translator cases need no device: `python -B tests/startup_stream_fetch_check.py`, or
+`ctest --preset release --no-tests=error -R "^startup_stream_fetch_translate$"`. They check the generated loads and
+manifest entries for both slots, and that a fetch behind `s_wqm_b64 exec, exec` still translates. They also check
+these refusals:
+- no layout;
+- an export of v12 that nothing defines;
+- v12 written only after exec was set to 0;
+- v12 written only in code a branch jumps over;
+- v12 written after `s_wqm_b32 exec_lo, 0`, or after a write to exec_hi;
+- a z-only record whose count stops below z (a count of 3 translates);
+- an element in slot 8, a per-instance element, or an element of format 10;
+- a record of kind 7, or one that reaches past v255;
+- a header record count that disagrees with the table.
+
+The pixel stage still reads attribute N from vertex output N. It does not yet pair the two by semantic, so a
+pixel shader that reads only some of the vertex outputs can receive the wrong one. That is a separate problem.
+
 ## Output window and fallback diagnostics
 
 The desktop swap chain has its own top-level window, class `X2WOutputWindow`.
@@ -443,10 +517,64 @@ zlib encodes seeded synthetic data as stored, fixed and dynamic Huffman blocks, 
 the 32 KiB window and a sync flush between blocks; each result must equal the input. A stream with
 one byte too little capacity and a truncated stream must be rejected without writes past the
 destination. On bare deflate data, a match that starts at the first output byte decodes and one that
-starts a byte earlier is rejected before it copies anything. No GPU and no game files are needed:
+starts a byte earlier is rejected before it copies anything. A hand-built dynamic block whose only
+distance code is one bit long, the one incomplete code set zlib accepts, must decode with and without
+the lookup table. Both also hold with input and capacity to spare.
+
+The decoder looks Huffman codes of up to 10 bits up in a table filled when the code is built; longer
+codes and the last byte of input are decoded one bit at a time. A differential case decodes 900
+seeded random streams (random, repetitive, word and geometric-byte data; levels 0-9; all five zlib
+strategies; some with a sync or full flush), of which 92 have codes longer than 10 bits. Each runs at
+exact capacity, one byte short, truncated, and with one to three bits flipped: 3597 cases in all.
+Status, size and bytes must equal those of the same probe built with `X2W_INFLATE_FAST_BITS=0`
+(bit-at-a-time only), and those of CPython's zlib. The one exception allowed is a stream where
+`inflate.h` decodes past an incomplete code set that zlib rejects; with this seed, no case needs it.
+The negative control is the probe built with
+`X2W_INFLATE_FAULTY_TABLE`, where codes exactly 10 bits long decode as the next symbol. It must
+differ from the reference in at least one case; it differs in 265.
+
+A boundary case decodes 57 small streams at every output capacity up to one byte past their size, and
+truncated to every length at full and at a random capacity: 63994 cases. The streams hold matches at
+every distance from 1 to 16 with lengths around 8, 16 and 32 bytes and up to 258, some after a sync
+flush; stored blocks of 0, 1 and 300 bytes at each of the eight bit positions after a fixed block; and
+one stored block of 65535 bytes. Status, size and bytes must equal the bit-at-a-time build and
+CPython's zlib. The exception is a truncated stored block that would not fit either: the decoder
+checks the block's length against the input first and reports `corrupt_stream` where zlib reports
+insufficient output (809 cases). A window case decodes 5 streams of 96 to 160 KiB whose matches
+reach the 32 KiB window: zlib's encoder keeps 262 bytes of lookahead out of its window and never reaches distance 32768, so three are fixed blocks written by
+hand with matches at distance 32768 and lengths up to 258, the last match ending at the end of the
+output. Each runs at exact capacity, one byte short, at the end of inner 32768-distance matches and
+truncated: 52 cases, all equal to the bit-at-a-time build and to zlib. In every case the probe ends both the stream and the destination
+at a no-access page, so a read past the input or a write past the capacity faults.
+
+While at least 8 input bytes and 258 output bytes (the longest match) remain, the decoder takes whole
+symbols from a 64-bit bit buffer that one 8-byte load refills, with no per-symbol bounds check. It
+leaves anything else (end of block, codes longer than 10 bits, invalid symbols and distances) to the
+bit-at-a-time loop, and gives back the whole bytes it loaded but did not use, so that loop, stored
+blocks and the Adler-32 trailer start at the same bit position as before. The bit-at-a-time build
+has neither this loop nor the 8-byte match copy and the one-memcpy stored block; it copies a byte at
+a time. Three negative controls must each be caught: `X2W_INFLATE_FAULTY_MARGIN` enters the loop
+one output byte short of the longest match and writes past a destination in the boundary case;
+`X2W_INFLATE_FAULTY_INPUT_MARGIN` enters it with 7 input bytes left and reads past an input in the
+random case; `X2W_INFLATE_FAULTY_DISTANCE` drops the loop's distance check and does not reject the
+match that starts before the output when input and capacity are to spare. No GPU and no game files
+are needed:
 
 ```powershell
 ctest --preset release --no-tests=error -R '^startup_inflate$' -V
+```
+
+The same script measures throughput; it is not a ctest. It decodes 16 MiB seeded streams (stored,
+fixed Huffman, dynamic Huffman word text, dynamic Huffman bytes of about 7.3 bits of entropy), three
+per run, through the probe's batch mode and prints decoded MiB/s next to CPython's zlib on the same
+data. Probes given together run interleaved; the first of six rounds is dropped and the best of the
+other five is kept. Each run prints the sum of the Adler-32 values of its outputs, which must match
+the input's, so the decoding cannot be skipped. Only time inside the decoder counts; the zlib column
+includes CPython's call overhead. To compare two commits, build the probe of each and pass both:
+
+```powershell
+cmake --build --preset release --target startup_inflate_probe
+.\out\pe-env\Scripts\python.exe -B tests/startup_inflate_check.py --bench out/build/release/startup_inflate_probe.exe
 ```
 
 ## DirectStorage destinations that are not writable
@@ -476,6 +604,22 @@ cmake --build --preset dev --target startup_local_log_check
 ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?$' -V
 ```
 
+## Trap-by-default header check
+
+`tests/startup_trap_header_check.cpp` (device-free ctest `startup_trap_header`, 41 cases, with
+`WILL_FAIL` negative controls `startup_trap_header_prefix_control` and
+`startup_trap_header_precedence_control`, Refs #1149) verifies `src/startup_stubs/trap.h`:
+`exit_code` 8-bit module/index bit-masking (`0xE2570000 | ...`), `listed` comma-separated,
+exact-match, wildcard `*`, and 2047/2048-byte buffer boundaries, `X2W_TRAP_EXPORT` behavior under
+`X2W_TRAP_CONTINUE` (returns `0`, logs `x2w-continue`), `X2W_TRAP_FAIL` (returns `0x80004005`, logs
+`x2w-fail`), continue-over-fail precedence, and child-process default `fire` termination (`exit_code`
+and matching `x2w-trap` lines on `stderr` and `X2W_TRAP_LOG`). No GPU is required:
+
+```powershell
+cmake --build --preset dev --target startup_trap_header_check
+ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_precedence_control)?$' -V
+```
+
 ## Switches
 
 | Variable | Effect |
@@ -484,16 +628,16 @@ ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?
 | `X2W_XMEM_STARTUP_BELOW_40=1` (`run.ps1 -StartupBelow40`) | startup compatibility configuration ([#1758](https://github.com/R0Y00/Xbox2Windows/issues/1758)): the large-page startup blocks with attribute `0x283` (null address, type `0x20003000`, protection `0x2004` or `0x2404`) are placed so that the whole block, last byte included, lies below 2^40. A block that does not fit there returns NULL with the Windows error and logs `x2w-xmem startup block below 2^40 refused:`; nothing is truncated or placed higher. Other shapes and explicit addresses keep their placement. See [Startup blocks below 2^40](experiments.md#startup-blocks-below-240) |
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
-| `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards the [single-record indirect compute dispatch](experiments.md#gpu-written-indirect-dispatch-arguments) for a desktop compute pipeline and a tracked placed buffer |
+| `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
 | `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` and no manifest; `X2W_FXC=` (empty) skips compilation and publishes the manifest alone. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
-| `X2W_AUDIO_PERMISSIVE=1` | audio HAL / APU stand-ins accept their calls (no output) |
+| `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
-| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work |
+| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
@@ -576,7 +720,7 @@ Slot 28 first asks the Windows gaming runtime to accept the caller's async block
 
 Slot 21 reserves the caller's async block on that same XAsync service, with its own operation identity (`local XGameSaveReadBlobData`). If the service rejects the block, slot 21 returns before it reads. Once the block is accepted, it snapshots the named blobs through `read_blobs` (one shared file lock for the set), packs them, and completes with the status and the number of bytes slot 22 needs. It does not use the user service, and no save lock is held across `XAsyncComplete`. The packed bytes are an array of 24-byte records, payload pointer at offset 16, then each name, a NUL and the payload. Slot 22 copies that into the caller's buffer and reports the count. A short buffer returns `0x80830007` and a missing blob returns `0x80830008`; neither writes the caller's count or bytes. A busy snapshot, and any other storage failure, uses the same status as submit (`0x80004005`); a bad name is `0x80070057`. [XGameSaveReadBlobDataResult](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavereadblobdataresult)
 
-`ctest --preset dev --no-tests=error -R '^startup_gamesave_read_async_'` commits two blobs in one process and reads them in a second through slots 21 and 22. It checks the completion callback, the required size, the count and the exact bytes, a missing blob, a short buffer that leaves the output unchanged, and two overlapping reads. The controlled fixture always runs. The system variant uses an immediate Windows gaming runtime queue and skips only when that runtime is unavailable.
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_read_async_'` commits two blobs in one process and reads them in a second through slots 21 and 22. It checks the completion callback, the required size, the count and the exact bytes, a missing blob, a short buffer that leaves the output unchanged, and two overlapping reads. The controlled fixture always runs. The system variant uses an immediate Windows gaming runtime queue and skips only when that runtime is unavailable. `ctest --preset dev --no-tests=error -R '^startup_save_blob_pack'` checks `src/startup_stubs/save_blob_pack.h` directly without a runtime or disk store, including layout, `uint32_t` payload-size and `size_t` overflow refusals, and a negative control for the earlier size check.
 
 ## Findings
 
@@ -611,6 +755,15 @@ These are measured on one executable; treat them as hypotheses for others.
   others and `UNUSED_PRESERVE` keeping them. The selection helpers match `tools/pixel_aot.py`, which
   already lowers the same forms. Float SDWA forms and a `dst_unused:UNUSED_SEXT` destination still
   stop translation rather than translating to something inexact. [#1141](https://github.com/R0Y00/Xbox2Windows/issues/1141)
+  The VOPC SDWA compares (`v_cmp_*_sdwa`, `v_cmpx_*_sdwa`) of the existing 32-bit compare table lower
+  too: i32 and u32 sources take their `src0_sel`/`src1_sel` field, sign-extended under `sext()`, and
+  the compare reads the extended value as its type. f32 SDWA compares stay refused (#1920). The
+  result goes to `vcc_lo`, the printed SGPR, or EXEC for `v_cmpx`, as in the non-SDWA forms. Class
+  compares, f32 compares and any other SDWA modifier are refused. Run
+  `ctest --preset dev --no-tests=error -R "^startup_gfx2hlsl_vopc_sdwa"`: the controls evaluate every
+  integer form against an integer reference, and the draws on WARP and hardware check 16 x 16 pixels
+  that a `v_cmpx_le_i32_sdwa` on a sign-extended byte keeps or discards, with translations that drop
+  the select or `sext()` as failing controls. [#1906](https://github.com/R0Y00/Xbox2Windows/issues/1906)
 - **Soft asserts.** Retail code keeps `int3` instructions followed by a continuation. Without a
   debugger the title's handler steps over them; under the startup debugger use
   `-ContinueAsserts N`. One of them fires about ten times a second in the texture-streaming path
@@ -726,6 +879,22 @@ These are measured on one executable; treat them as hypotheses for others.
   are generated by the test. It does not add a per-file offset or a size-based lookup, and it does not show
   what the title expects for a refused request.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_refusal_order$' -V`.
+- **DirectStorage queue errors (#1843).** Queue slot 9 (`GetErrorEvent`) returns a
+  caller-owned handle to the queue's error event. The first failed read signals the event.
+  Slot 10 (`RetrieveErrorRecord`) copies the 656-byte x64 record with the failure count
+  and the first failed request in queue order, in the layout the Xbox GDK reference gives
+  for `DSTORAGE_ERROR_RECORD`: the result, then `CommandType`
+  (`DSTORAGE_COMMAND_TYPE_REQUEST`, 0, for a failed read), then the request arm with its
+  options, destination, source, cancellation tag and name. For a file request it records
+  the opened filename and read offset. Only failed read requests are recorded. Retrieving
+  clears the record and resets the event together, so a later failure starts a new
+  notification. An empty record, on a new queue, on a second retrieve and for a
+  success-only queue, has a zero count and `CommandType` `DSTORAGE_COMMAND_TYPE_NONE` (-1). The heartbeat continues to
+  count failures by cause across all queues.
+  [Microsoft's public sample header](https://github.com/microsoft/Xbox-GDK-Samples/blob/1f44bdabed6e340170e2c7d1007500e4dff897bb/Samples/System/SimpleDirectStorageCombo/DirectStorageWin32/dstorage_win32.h)
+  · [Microsoft DirectStorage overview](https://learn.microsoft.com/en-us/xbox/gdk/docs/features/console/storage/directstorage/directstorage-overview#geterroreventretrieveerrorrecord)
+  · [DSTORAGE_ERROR_RECORD](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/structs/dstorage_error_record?view=gdk-2604)
+  · [DSTORAGE_COMMAND_TYPE](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/enums/dstorage_command_type?view=gdk-2604)
 - **DirectStorage failure causes (#1198).** After its totals line, the heartbeat prints
   `x2w-dstorage heartbeat <n> s: failed requests by cause` with one count for each of
   `read-at-or-past-eof`, `read-crossing-eof`, `read-other`, `destination-capacity`,
@@ -759,6 +928,31 @@ These are measured on one executable; treat them as hypotheses for others.
   every page request at the page end and must fail. The counts describe a run's request shapes; they
   do not say why a request of one shape fails or what the title expects for it.
   Reproduce with `ctest --preset release --no-tests=error -R '^startup_storage_page_end_counts' -V`.
+- **DirectStorage refused page request, consumer view (#1198).** The `startup_storage_consumer_pair`
+  fixture follows one refused page-destination request from enqueue to the release of its pages,
+  next to a successful request of the same shape. It loads the stand-in DLL and the xmem shim under
+  `X2W_XMEM_PERMISSIVE`, takes two page tokens from `XMemAllocatePhysicalPages`, reserves a view
+  with `XMemVirtualAlloc` and maps the pages into it with `XMemMapPhysicalPages`; every read goes
+  through that view. Each page gets its own sentinel pattern. One Submit carries two zlib requests
+  from memory with `page_offset` 0xF000 and `destination_size` 0x1000, so each ends at its page's
+  end, each followed by its status entry and an `EnqueueSignal` fence. S inflates to exactly 0x1000
+  bytes and R to 0x1800. Checkpoints: S's status is `S_OK` and R's `E_FAIL`; each fence runs after
+  its own status entry and before the next request's; at each fence (read in the fence callback)
+  and again after both, S's page shows its sentinel below 0xF000 and the exact inflated bytes from
+  there, while every byte of R's page is still R's sentinel and no byte of R's destination equals
+  R's stream prefix; the log names `inflated` for S and `destination capacity exceeded` for R. The
+  pages are then unmapped and freed (the shim's live page backings drop by two), one page is
+  allocated again and mapped at the same address, reads zero-filled, and a follow-up request of S's
+  shape on the same queue completes with the exact bytes. Its `accept_refused_control` takes R's
+  destination as data, expects R's stream prefix there, and must print that check's failure. A
+  manual mutant that writes R's first 0x1000 inflated bytes before the capacity refusal fails the
+  fixture on R's sentinel. The file-source refusals and their fence order are covered by
+  `startup_storage_refusal_order`, non-writable linear destinations by `startup_dstorage_destination`,
+  and a single short or missing-grant page request read through a mapped view, with one fill byte and
+  no fence or release, by the `dstorage` case of `startup_stubs` (`tests/startup_stub_consumer.cpp`).
+  The fixture shows what a consumer of the stand-in reads; it does not show what the title does with a
+  refused request.
+  Reproduce with `ctest --preset dev --no-tests=error -R '^startup_storage_consumer_pair' -V`.
 - **DirectStorage allocation failure (#1199, item 3).** A queue worker runs each entry inside
   a handler that turns any exception, including `std::bad_alloc` from a buffer sized by a request
   field, into a failed request: the next status entry reports `E_FAIL`, the destination is
@@ -1051,18 +1245,26 @@ on it is not handled.
 ## Startup memory accounting
 
 The DirectStorage heartbeat (`x2w-dstorage heartbeat <n> s:` in `stderr.txt`) reports this
-process's peak and current commit charge in MiB and the number of live 64 KiB physical-page
-sections, so runs that stop at different points can be compared by memory spent rather than by
-elapsed time. A physical-page section exists from a page's first use (a mapping or a DirectStorage
-write) until its grant is released; `xmem.dll` publishes that count through the experimental
-`x2w_xmem_page_stats` export. The heartbeat also prints while the request counters are unchanged
+process's peak and current commit charge in MiB and the number of live 64 KiB physical pages
+(the heartbeat still calls them sections), so runs that stop at different points can be compared by
+memory spent rather than by elapsed time. A physical page holds a slot from its first use (a mapping
+or a DirectStorage write) until its grant is released; `xmem.dll` publishes that count through the
+experimental `x2w_xmem_page_stats` export.
+
+The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab is
+created with the default `CreateFileMappingW` commit behaviour, so all of it is charged to commit when it is
+created, and it is closed only when the process ends: freeing pages returns slots, not commit. A released
+slot is reused lowest first. The experimental `x2w_xmem_slab_stats` export reports the slabs open, the slots
+in use and the slots free in the open slabs, which are the units that matter for commit now. This only
+reports; it does not change when commit is charged. `xmem_slab_slots` checks the bookkeeping on any platform
+without Windows calls. The heartbeat also prints while the request counters are unchanged
 when either memory value changed, so the cost of a stalled load is visible. Each report is followed
 by a line of failed requests by cause and a line of page-destination requests by end (see
 DirectStorage failure causes and DirectStorage page-request ends under Findings).
 
 ```powershell
-cmake --build --preset release --target xmem_shim startup_stub_xcrdapi
-ctest --preset release --no-tests=error -R '^(xmem_page_stats|startup_heartbeat_commit)$' -V
+cmake --build --preset release --target xmem_shim startup_stub_xcrdapi xmem_slab_slots_check
+ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|startup_heartbeat_commit)$' -V
 ```
 
 The `startup_heartbeat_commit` check starts the heartbeat before loading the page provider, then
@@ -1190,6 +1392,41 @@ is not affected: section-backed pages already took the committed, not-aliased pa
 - `ctest --preset release --no-tests=error -R '^xmem_page_runs_device_' -V` places a buffer
   (slot 133) inside one view and across three kinds of boundary: two mapping calls, two backing
   sections, and single-page views.
+
+## Placed buffer allocation walk (device slot 133)
+
+Slot 133 aliases a buffer only when every byte from the base of the allocation holding the address
+to the end of the buffer is committed in that allocation, and the memory is private. It used to
+measure the whole committed run from the base with one `VirtualQuery` per region and compare the
+buffer with that length. `VirtualQuery` scans page-table entries from the queried address to the end
+of the run of identical attributes, so on a large private region with touched pages each call costs
+milliseconds (about 5 ms per GiB with one touched page per 64 KiB, measured on Windows 10 19045).
+
+`src/startup_stubs/placed_buffer_range.h` first asks `QueryVirtualMemoryInformation`
+(`MemoryRegionInfo`, Windows 10 1607 and later, resolved at run time) for the allocation's base, size
+and committed bytes, which come from the allocation's bookkeeping without that scan. When the
+allocation is private and its committed bytes equal its size, every page is committed, so the full
+walk's run is the whole allocation and the decision follows from base and size. Otherwise (a partly
+committed or mapped allocation, a free address, the call missing) it walks the regions from the base
+and stops at the end of the buffer, because regions after it cannot change the answer. The alias or
+refusal is the same as before; nothing is remembered between placements, so a page decommitted,
+released or replaced directly through the Windows API is seen by the next placement. The alignment,
+memory-type and state rules are unchanged. The five-second `x2w-d3d12 views noted` line in
+`stderr.txt` reports `placed buffers <n> (region-information proofs <n>, region queries <n>)`.
+
+- `ctest --preset release --no-tests=error -R '^startup_placed_buffer_range$' -V` compares every
+  decision with the full walk on the same memory: 256 buffers spread over a 64 MiB private block
+  whose alternating 64 KiB pages have different protections (it prints the region queries per
+  placement of both walks); a middle page decommitted under a buffer, before a buffer and five pages
+  before a buffer, then committed again; a block released and replaced by a 1 MiB block at the same
+  base; a mapped view; a reservation committed in two steps; and a placeholder piece replaced by
+  committed private memory. Each case places a buffer before changing the memory, so state kept
+  between placements would show up as a mismatch. A 512 MiB committed block with one touched page per
+  64 KiB must be proven without any `VirtualQuery` call; the check prints the time per placement of
+  the full walk, the bounded walk and the proof. `_region_only_control` trusts the allocation size
+  without the committed-bytes check and must fail only in the partly committed cases;
+  `_walk_only_control` never uses the region information and must fail only that call count. A
+  refused allocation or mapping is a capability skip (77) in the controls.
 
 ## Buffer memory SRVs (device slot 70)
 

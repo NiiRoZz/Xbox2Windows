@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include "era_physical.h"
+#include "xmem_slab_slots.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -16,13 +17,13 @@
 #include <map>
 #include <mutex>
 #include <new>
-#include <set>
 
 namespace {
 struct Backing {
     HANDLE section;
     ULONG_PTR views = 0;
     ULONG64 offset = 0;  // the page is one 64 KiB slot of a shared section (see section_for)
+    std::size_t slab = 0;  // index of that section among the slabs
 };
 
 // Keep grant transitions and section views serialized. A grant can outlive all its
@@ -40,15 +41,15 @@ struct PhysicalMemory {
     ULONG_PTR mirror_cpu = 0, mirror_gpu = 0;
     SIZE_T mirror_bytes = 0;
     std::map<ULONG_PTR, SIZE_T> runs;  // OS views: base -> bytes
-    std::vector<HANDLE> slabs;
-    ULONG64 slab_used = 0;
-    std::set<std::pair<HANDLE, ULONG64>> free_slots;  // ordered, so that pages reused together are adjacent slots again
+    // The slabs and their 64 KiB slots; released slots are reused lowest first, so that pages reused together
+    // are adjacent slots again.
+    x2w_xmem::SlabSlots<HANDLE> slots{era_physical::page_bytes};
 
     ~PhysicalMemory()
     {
         for (const auto& run : runs)
             UnmapViewOfFile(reinterpret_cast<void*>(run.first));
-        for (const HANDLE slab : slabs)
+        for (const HANDLE slab : slots.slabs())
             CloseHandle(slab);
     }
 };
@@ -79,33 +80,30 @@ HANDLE section_for(ULONG_PTR page)
     const auto existing = memory.backings.find(page);
     if (existing != memory.backings.end())
         return existing->second.section;
-    constexpr ULONG64 slab_bytes = 4096 * ULONG64{page_bytes};
-    if (!memory.free_slots.empty()) {
-        const auto [section, offset] = *memory.free_slots.begin();
-        void* view = MapViewOfFile(section, FILE_MAP_WRITE, static_cast<DWORD>(offset >> 32), static_cast<DWORD>(offset), page_bytes);
+    x2w_xmem::SlabSlots<HANDLE>::Slot slot;
+    if (memory.slots.lowest_free(slot)) {
+        void* view = MapViewOfFile(slot.slab, FILE_MAP_WRITE, static_cast<DWORD>(slot.offset >> 32), static_cast<DWORD>(slot.offset), page_bytes);
         if (!view) return nullptr;
         std::memset(view, 0, page_bytes);  // a reused slot starts zero-filled, as a fresh section did
         UnmapViewOfFile(view);
-        memory.backings.emplace(page, Backing{section, 0, offset});
-        memory.free_slots.erase(memory.free_slots.begin());
-        return section;
+        memory.backings.emplace(page, Backing{slot.slab, 0, slot.offset, slot.slab_index});
+        memory.slots.take_lowest_free();
+        return slot.slab;
     }
-    if (memory.slabs.empty() || memory.slab_used == slab_bytes) {
-        const HANDLE slab = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
-                                               static_cast<DWORD>(slab_bytes >> 32), static_cast<DWORD>(slab_bytes), nullptr);
-        if (!slab) return nullptr;
-        try {
-            memory.slabs.push_back(slab);
-        } catch (const std::bad_alloc&) {
-            CloseHandle(slab);
-            throw;
-        }
-        memory.slab_used = 0;
+    const ULONG64 slab_bytes = memory.slots.slab_bytes();
+    const auto make_slab = [slab_bytes](HANDLE& slab) {
+        slab = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                  static_cast<DWORD>(slab_bytes >> 32), static_cast<DWORD>(slab_bytes), nullptr);
+        return slab != nullptr;
+    };
+    if (!memory.slots.take_fresh(make_slab, [](HANDLE slab) { CloseHandle(slab); }, slot)) return nullptr;
+    try {
+        memory.backings.emplace(page, Backing{slot.slab, 0, slot.offset, slot.slab_index});
+    } catch (...) {
+        memory.slots.unwind_fresh(slot);
+        throw;
     }
-    const HANDLE section = memory.slabs.back();
-    memory.backings.emplace(page, Backing{section, 0, memory.slab_used});
-    memory.slab_used += page_bytes;
-    return section;
+    return slot.slab;
 }
 
 auto owned_reservation(ULONG_PTR address)
@@ -703,7 +701,7 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
         for (ULONG_PTR i = 0; i < count; ++i) {
             const auto backing = memory.backings.find(pages[i]);
             if (backing != memory.backings.end()) {
-                memory.free_slots.emplace(backing->second.section, backing->second.offset);
+                memory.slots.release(backing->second.slab, backing->second.offset);
                 memory.backings.erase(backing);
             }
         }
@@ -713,13 +711,26 @@ BOOL free_pages(ULONG_PTR count, PULONG_PTR pages)
 }  // namespace
 
 // Experimental export: one snapshot of the physical-page accounting for the startup heartbeat
-// (#1199). A page gets its 64 KiB section on first use, by a mapping or by a page-token write, and
-// loses it when the grant is released; the count is reported so runs can be compared.
+// (#1199). A page gets a 64 KiB slot of a shared slab on first use, by a mapping or by a page-token write, and
+// loses it when the grant is released; the number of pages holding a slot is reported so runs can be compared.
 extern "C" BOOL WINAPI x2w_xmem_page_stats(ULONGLONG* live_sections)
 {
     if (!live_sections) return FALSE;
     const std::lock_guard guard(memory.mutex);
     *live_sections = static_cast<ULONGLONG>(memory.backings.size());
+    return TRUE;
+}
+
+// Experimental export: the slab accounting behind those pages (#1199): slabs open, slots in use and slots free
+// in the open slabs. A slab is charged to commit when it is created and closed only when the process ends, so
+// these numbers show how much commit the slabs hold, not how much of it the title touches.
+extern "C" BOOL WINAPI x2w_xmem_slab_stats(ULONGLONG* slabs, ULONGLONG* slots_in_use, ULONGLONG* slots_free)
+{
+    if (!slabs || !slots_in_use || !slots_free) return FALSE;
+    const std::lock_guard guard(memory.mutex);
+    *slabs = memory.slots.slab_count();
+    *slots_in_use = memory.slots.slots_in_use();
+    *slots_free = memory.slots.slots_free();
     return TRUE;
 }
 

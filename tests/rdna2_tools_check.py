@@ -4632,6 +4632,28 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertTrue(is_instruction_supported(f"{base}_e64 s52, -s44, |v18|"))
             self.assertTrue(is_instruction_supported(f"{base}_sdwa vcc_lo, s44, v18 src0_sel:DWORD src1_sel:DWORD"))
 
+    def test_vopc_sdwa_compare_forms_recognition(self):
+        """The 46 non-cmpx VOPC SDWA compares the translator lowers are recognized with every selection."""
+        from pixel_aot_check import SDWA_CMP_FORMS
+        for entry in SDWA_CMP_FORMS:
+            src0 = "sext(s44)" if entry["sext0"] else "s44"
+            src1 = "sext(v18)" if entry["sext1"] else "v18"
+            line = (f"{entry['form']} vcc_lo, {src0}, {src1} "
+                    f"src0_sel:{entry['sel0']} src1_sel:{entry['sel1']}")
+            self.assertTrue(is_instruction_supported(line), line)
+            self.assertTrue(is_instruction_supported(line.replace("vcc_lo", "s52")), line)
+        # VOPC SDWA takes no destination selection; the cmpx form and the 16-bit f/t predicates stay out.
+        for line in (
+            "v_cmp_eq_i32_sdwa vcc_lo, s44, v18 dst_sel:WORD_0 dst_unused:UNUSED_PAD "
+            "src0_sel:BYTE_0 src1_sel:DWORD",
+            "v_cmp_eq_i32_sdwa vcc_lo, s44, v18 src0_sel:WORD_2 src1_sel:DWORD",
+            "v_cmp_eq_i32_sdwa s[0:1], s44, v18 src0_sel:BYTE_0 src1_sel:DWORD",
+            "v_cmp_f_i16_sdwa vcc_lo, s44, v18 src0_sel:WORD_0 src1_sel:DWORD",
+            "v_cmp_lt_f16_sdwa vcc_lo, s44, v18 src0_sel:WORD_0",
+            "v_cmpx_lt_f16_sdwa vcc_lo, s44, v18 src0_sel:WORD_0 src1_sel:WORD_1",
+        ):
+            self.assertFalse(is_instruction_supported(line), line)
+
     def test_binary_scan_recognizes_vopc_sdwa(self):
         """Issue #938: binary shaders with VOPC/VOPCX SDWA reach the scanner as decoded opcodes, not vopc_sdwa."""
         supported = bytes.fromhex(
@@ -4639,7 +4661,7 @@ class TestRdna2Scanner(unittest.TestCase):
             "000081bf"          # s_endpgm
         )
         unlowered = bytes.fromhex(
-            "f904887d01000506"  # v_cmp_gt_u32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD
+            "f904087c01000506"  # v_cmp_gt_f32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD
             "f904247c01001606"  # v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD
             "000081bf"          # s_endpgm
         )
@@ -4669,7 +4691,7 @@ class TestRdna2Scanner(unittest.TestCase):
         self.assertEqual(
             [d["raw"] for d in res_unl["unsupported_details"]],
             [
-                "v_cmp_gt_u32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD",
+                "v_cmp_gt_f32_sdwa vcc_lo, v1, v2 src0_sel:WORD_1 src1_sel:DWORD",
                 "v_cmpx_eq_f32_sdwa -v1, v2 src0_sel:DWORD src1_sel:DWORD",
             ],
         )
@@ -4800,22 +4822,28 @@ class TestRdna2Scanner(unittest.TestCase):
             self.assertFalse(is_instruction_supported(line), line)
 
     def test_float_to_word_conversions_e32_and_e64(self):
-        """v_cvt_u32_f32 and v_cvt_i32_f32 accept plain e32 and e64 with optional source abs/neg;
-        v_cvt_flr_i32_f32 and v_cvt_rpi_i32_f32 stay out of generic scanner support until arbitrary runtime
-        exceptional inputs are backed by a native RDNA reference."""
+        """v_cvt_u32_f32, v_cvt_i32_f32, v_cvt_flr_i32_f32 and v_cvt_rpi_i32_f32 accept plain e32 and e64 with
+        optional source abs/neg, on runtime registers too: pixel_aot defines NaN, infinities and overflow for
+        flr and rpi (issue #1772)."""
         for line in ("v_cvt_u32_f32_e32 v12, v13", "v_cvt_i32_f32_e32 v12, s44",
                      "v_cvt_u32_f32_e32 v12, 0x40400000", "v_cvt_u32_f32_e64 v12, v13",
                      "v_cvt_i32_f32_e64 v12, s44", "v_cvt_u32_f32_e64 v12, |s44|",
                      "v_cvt_i32_f32_e64 v12, -s44", "v_cvt_i32_f32_e64 v12, -|v13|",
                      "v_cvt_u32_f32_e64 v12, abs(v13)", "v_cvt_i32_f32_e64 v12, neg(0x40400000)",
-                     "v_cvt_u32_f32_e64 v12, |0xc0300000|"):
+                     "v_cvt_u32_f32_e64 v12, |0xc0300000|",
+                     "v_cvt_flr_i32_f32_e32 v12, v13", "v_cvt_rpi_i32_f32_e32 v12, s44",
+                     "v_cvt_flr_i32_f32_e32 v12, 0x7fc00000", "v_cvt_rpi_i32_f32_e64 v12, -v13",
+                     "v_cvt_flr_i32_f32_e64 v12, -|s44|", "v_cvt_rpi_i32_f32_e64 v12, neg(0x4f000000)"):
             self.assertTrue(is_instruction_supported(line), line)
         for line in ("v_cvt_u32_f32_e64 v12, s44 clamp", "v_cvt_i32_f32_e64 v12, s44 omod:2",
                      "v_cvt_i32_f32_e32 v12, 1", "v_cvt_u32_f32_e32 v12, 0.5",
                      "v_cvt_u32_f32_e64 v12, 0.5", "v_cvt_i32_f32_e64 v12, -1",
                      "v_cvt_i32_f32_e64 v12, -0x40400000", "v_cvt_u32_f32_e64 v12, |-s44|",
                      "v_cvt_u32_f32_e32  v12, v13", "v_cvt_u32_f32_e64  v12, v13",
-                     "v_cvt_flr_i32_f32_e32 v12, v13", "v_cvt_rpi_i32_f32_e64 v12, -v13"):
+                     "v_cvt_flr_i32_f32_e64 v12, s44 clamp", "v_cvt_rpi_i32_f32_e64 v12, s44 omod:2",
+                     "v_cvt_flr_i32_f32_e32 v12, 0.5", "v_cvt_rpi_i32_f32_e64 v12, |-s44|",
+                     "v_cvt_flr_i32_f32_dpp v12, v13 quad_perm:[0,1,2,3] row_mask:0xf bank_mask:0xf",
+                     "v_cvt_rpi_i32_f32_sdwa v12, v13 dst_sel:DWORD src0_sel:DWORD"):
             self.assertFalse(is_instruction_supported(line), line)
 
     def test_disasm_cvt_flr_and_rpi_e32_and_e64(self):
