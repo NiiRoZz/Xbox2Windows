@@ -377,7 +377,8 @@ requests. The watcher's first pass retries every earlier failure once, so a tran
 requests that failed in an earlier run; after that, a request whose `<key>.fail` is newer than its
 ready marker is not retried during the run (the runtime writes each request once and never rewrites
 it). The one-shot `--pending` scan retries every failure. An unexpected translator error is written
-to `<key>.fail` as `translator error: ...` instead of stopping the scan.
+to `<key>.fail` as `translator error: ...` instead of stopping the scan. A worker killed from outside
+(for example out of memory) ends that watcher pass only; its requests are retried on the next pass.
 FXC is located as described for `X2W_SHADER_CACHE` under [Switches](#switches). A scan with more than
 one pending request translates them in parallel processes, one per logical processor (at most 61 on
 Windows, the `ProcessPoolExecutor` limit) unless `X2W_TRANSLATE_JOBS` sets the count; each request

@@ -5,8 +5,9 @@ After the watcher's first pass, a request whose .fail is newer than its marker i
 first pass and the one-shot --pending scan retry it. The --watch process must retry an earlier
 failure once, translate a new request while it runs and not rewrite a failure on later passes. A
 --pending scan with four parallel workers must print the same results and write the same failures
-as one worker, an unexpected translator error must become <key>.fail, and an invalid
-X2W_TRANSLATE_JOBS must fall back to the processor count.
+as one worker, an unexpected translator error must become <key>.fail, a broken process pool must
+end one watcher pass and not the watcher, and an invalid X2W_TRANSLATE_JOBS must fall back to the
+processor count.
 """
 import os
 import re
@@ -100,6 +101,25 @@ with tempfile.TemporaryDirectory() as tmp:
         gfx2hlsl.translate_request = real
     fail = d / ('%016x.fail' % 9)
     expect('translator error recorded', fail.read_text().startswith('translator error: ZeroDivisionError') if fail.exists() else None, True)
+
+# A broken process pool (a worker killed from outside) ends one pass, not the watcher.
+from concurrent.futures.process import BrokenProcessPool  # noqa: E402
+
+
+def broken(out_dir, skip_failed=False):
+    raise BrokenProcessPool('a worker was terminated abruptly')
+
+
+real = gfx2hlsl.translate_pending
+gfx2hlsl.translate_pending = broken
+try:
+    expect('broken pool: pass reported as incomplete', gfx2hlsl.watch_pass('.', True), False)
+except BrokenProcessPool:
+    failures.append('a broken process pool escaped watch_pass')
+finally:
+    gfx2hlsl.translate_pending = real
+with tempfile.TemporaryDirectory() as tmp:
+    expect('normal pass reported as complete', gfx2hlsl.watch_pass(tmp, True), True)
 
 # An invalid job count falls back to the processor count instead of raising.
 saved = os.environ.get('X2W_TRANSLATE_JOBS')
