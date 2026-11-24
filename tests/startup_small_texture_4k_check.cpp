@@ -139,7 +139,7 @@ int literal(bool whole_width_tail)
             ++failures;
         }
 
-    // The limit the stand-in's own reads and writes use: the 4 KiB answer whatever Alignment 0 or 0x1000 says.
+    // The limit the stand-in's own reads and writes use: the 4 KiB answer at Alignment 0x1000 only.
     const auto extent_is = [](const char* name, const D3D12_RESOURCE_DESC& desc, unsigned long long expected) {
         const unsigned long long got = x2w_startup::small_texture_4k_extent(desc);
         if (got != expected) {
@@ -147,10 +147,10 @@ int literal(bool whole_width_tail)
             ++failures;
         }
     };
-    extent_is("32x32 R8G8B8A8 at alignment 0", texture(28, 32, 32, 1, 0), 0x1000);
+    extent_is("32x32 R8G8B8A8 at alignment 0 (desktop answer kept)", texture(28, 32, 32, 1, 0), 0);
     extent_is("32x32 R8G8B8A8 at 4 KiB", texture(28, 32, 32), 0x1000);
     extent_is("32x32 R8G8B8A8 at 64 KiB", texture(28, 32, 32, 1, 0x10000), 0);
-    extent_is("256x128 R8G8B8A8, over the bound", texture(28, 256, 128, 1, 0), 0);
+    extent_is("256x128 R8G8B8A8, over the bound", texture(28, 256, 128), 0);
     struct { unsigned long long offset, bytes, extent, inside; } spans[] = {
         {0, 0x1f80, 0x1000, 0x1000}, {0xf00, 0x80, 0x1000, 0x80}, {0xf80, 0x100, 0x1000, 0x80},
         {0x1000, 0x80, 0x1000, 0}, {0x2000, 0x80, 0x1000, 0}, {0x1800, 0x80, 0, 0x80}};

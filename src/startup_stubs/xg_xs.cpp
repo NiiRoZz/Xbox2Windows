@@ -174,7 +174,8 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
     const bool valid = slice_total != ~0ull && slice_total != 0;
     if (!valid) slice_total = 0x10000;
     // A description the allocation-info entries answer with 4 KiB gets the same size and alignment here
-    // (small_texture_4k.h); its mip records still describe the desktop linear footprint.
+    // (small_texture_4k.h). Limit: its mip records still describe the desktop linear footprint, which can
+    // reach past that size; slot 8 writes only the part inside it.
     const u64 extent = x2w_startup::small_texture_4k_extent(self->desc);
     const u64 stride = extent ? extent : (slice_total + 0xFFFF) & ~u64{0xFFFF};
     const u64 total = stride * slices;

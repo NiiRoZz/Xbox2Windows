@@ -104,11 +104,12 @@ inline bool small_texture_4k(const D3D12_RESOURCE_DESC& d, D3D12_RESOURCE_ALLOCA
     return true;
 }
 
-// Bytes of executable memory behind a texture of this description, when the allocation-info entries give it
-// the 4 KiB answer: Alignment 0x1000 or unspecified (0); 0 when the description is not limited.
+// Bytes of executable memory behind a texture of this description when the allocation-info entries give it
+// the 4 KiB answer (Alignment 0x1000 and in scope); 0 when the description is not limited. Alignment 0 keeps
+// the desktop answer, and so the full footprint.
 inline std::uint64_t small_texture_4k_extent(const D3D12_RESOURCE_DESC& d)
 {
-    return d.Alignment == 0x1000 || d.Alignment == 0 ? small_texture_4k_shape(d) : 0;
+    return d.Alignment == 0x1000 ? small_texture_4k_shape(d) : 0;
 }
 
 // Bytes of [offset, offset + bytes) that lie inside the first extent bytes; extent 0 means no limit.
