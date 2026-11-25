@@ -4051,7 +4051,8 @@ class ComputePipeline(Pipeline):
         tg = type(rsrc2) is int and rsrc2 >> 10 & 1
         self.tg_size, self.tg_read = None, False
         try:
-            self.entry = entry_registers(rsrc2 & ~(1 << 10) if tg else rsrc2)  # (user SGPRs, {axis: group-ID SGPR}, thread-ID VGPRs)
+            # (user SGPRs, {axis: group-ID SGPR}, thread-ID VGPRs)
+            self.entry = entry_registers(rsrc2 & ~(1 << 10) if tg else rsrc2)
             if tg:
                 self.tg_size = self.entry[0] + len(self.entry[1])
             self.group = checked_group(group)
