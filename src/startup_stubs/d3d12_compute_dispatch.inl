@@ -179,9 +179,8 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
                 ReleaseSRWLockShared(&note_lock);
             }
             Wrapper* const wrapper = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
-            const bool alive = wrapper && wrapper->own().kind == resource_kind && InterlockedCompareExchange(&wrapper->own().refs, 0, 0) > 0;
-            ID3D12Resource* const texture = !alive ? nullptr : output ? static_cast<ID3D12Resource*>(wrapper->own().real)
-                                                                      : sampled_address_texture(wrapper);
+            ID3D12Resource* const texture = !wrapper || wrapper->own().kind != resource_kind ? nullptr
+                : output ? static_cast<ID3D12Resource*>(wrapper->own().real) : sampled_address_texture(wrapper);
             const D3D12_RESOURCE_DESC resource = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
             if (!output) {
                 D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
@@ -322,7 +321,8 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     }
     ++tr->translated;
     ReleaseSRWLockExclusive(&draw_lock);
-    check_device("translated dispatch", 14);
+    static LONG checks;  // as translated draws do: the queue's execute drains the rest
+    if ((InterlockedIncrement(&checks) & 63) == 1) check_device("translated dispatch", 14);
     InterlockedIncrement(&compute_dispatches_translated);
     static LONG logged;
     if (first_calls(logged, 8))
