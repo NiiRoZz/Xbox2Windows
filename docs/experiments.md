@@ -13963,6 +13963,17 @@ covers a nested `if`, an `if`/`else` whose arms have their own `s_cbranch_execz`
 restore reads a mask saved inside the block. The proof starts at the branch, so it is not run for a block that
 a branch from outside enters.
 
+A definition of an SGPR or `vcc` that is live at the join is still accepted when exec absorbs every read of
+it. With the block's exec writes proven, a skipped lane's exec bit is clear at the join, in the wave and in
+the model. While no instruction on any path from the join has written exec, `W & exec` and `exec & W`
+(`s_and`) give that lane 0, and `~(W & exec)` (`s_nand`) and `W | ~exec` (`s_orn2` with exec second) give it
+1, whatever the block left in W. The search follows every path from the join until W is written again. Any
+other read, a copy, a data read, a branch on `vccz`, or an absorbed form after exec has changed, keeps the
+refusal, which names the first such read. `m0` and SCC have implicit readers and are not accepted this way.
+Case N runs a compare in a block whose join computes `s_and_b32 s23, vcc_lo, exec_lo` before it restores
+exec; its control `n-unmasked` drops the AND, so the two lanes that skip the block store with a stale `vcc`.
+`s_nand` on a lane mask is still refused by the lane-mask lowering itself.
+
 Each instruction's reads and writes come from its printed operands, checked against the repository
 decoder's spelling:
 - `v_cmpx` prints no destination (its e64 form prints an unused SDST field), so all of its operands are reads;
@@ -13971,7 +13982,7 @@ decoder's spelling:
 - the high half of a mask is tracked apart from the low half.
 
 The block is still refused in these cases:
-- a definition that is live at the join;
+- a definition that is live at the join and read other than through exec as above;
 - any other exec write: exec set from a compare alone, restored from a mask saved before the block or on only
   some of the paths, written by a form the pass does not follow (`s_orn2`, `s_nand`, `s_nor`, `s_xnor`, `s_not`,
   the other saveexec and wrexec forms), written in a block that a branch from outside enters (a proven

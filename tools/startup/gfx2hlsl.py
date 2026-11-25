@@ -547,6 +547,30 @@ def clear_after(name, asm, may, clear):
     return out | {(word, h) for word, held in writes for h in held}
 
 
+def mask_lanes(name, asm):
+    """(operation, destination words, source word lists) of a bitwise scalar mask instruction, or None. Word p of
+    every operand holds the same lanes: wave half p of a 64-bit form."""
+    m = re.fullmatch(r's_(mov|and|andn2|or|orn2|nand|nor|xor|xnor)_b(32|64)', re.sub(r'_e(32|64)$', '', name))
+    if not m:
+        return None
+    words = [mask_words(op, 2 if m.group(2) == '64' else 1) for op in parse(asm)[1]]
+    if None in words or len(words) != (2 if m.group(1) == 'mov' else 3):
+        return None
+    return m.group(1), words[0], words[1:]
+
+
+def exec_absorbs(name, asm, word):
+    """True when an instruction reads `word` only through an operation whose result bit is fixed while the exec bit
+    of the same lanes is clear: W & exec and exec & W give 0, ~(W & exec) and W | ~exec give 1."""
+    lanes = mask_lanes(name, asm)
+    if not lanes or lanes[0] not in ('and', 'nand', 'orn2'):
+        return False
+    a, c = lanes[2]
+    pairs = [(a, c)] if lanes[0] == 'orn2' else [(a, c), (c, a)]
+    return any(word in w and word not in e and all(e[p] == ('exec', 'exec_hi')[p] for p in range(len(w)) if w[p] == word)
+               for w, e in pairs)
+
+
 def scalar_effects(name, asm):
     """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
     base = re.sub(r'_e(32|64)$', '', name)
@@ -1437,9 +1461,10 @@ class Stage:
         the block (its branches and loops included), which masks have that lane's bit clear, and the write must
         leave exec among them. Such a lane's bit then stays clear at every instruction the wave runs in the block,
         so the wave changes nothing of that lane there and its exec at the join is the model's. The proof starts at
-        the branch, so a block that a branch from outside enters keeps its exec writes refused. A live definition,
-        an unproven exec write, a refused effect, a branch leaving the block or a backward s_cbranch_execz is
-        refused."""
+        the branch, so a block that a branch from outside enters keeps its exec writes refused. A definition live at
+        the join is accepted when every read of it after the join is proven (execz_live_read). Any other live
+        definition, an unproven exec write, a refused effect, a branch leaving the block or a backward
+        s_cbranch_execz is refused."""
         offsets = [ins[0] for ins in self.ins]
         index = {off: i for i, off in enumerate(offsets)}
         effects = [scalar_effects(name, asm) for _, _, name, asm in self.ins]
@@ -1485,6 +1510,18 @@ class Stage:
                         for s in succ[i]:
                             if b < s < t and before.get(s, after) & after != before.get(s):
                                 before[s], changed = before.get(s, after) & after, True
+            # A live definition is still accepted when every read of it from the join on is proven (execz_live_read):
+            # where exec is unchanged since the join on every path from it.
+            quiet, work = {t: True}, [t]
+            while work:
+                i = work.pop()
+                keep = quiet[i] and not effects[i][2] & EXEC_KEYS
+                for s in succ[i]:
+                    if quiet.get(s, True) and not keep or s not in quiet:
+                        quiet[s] = quiet.get(s, True) and keep
+                        work.append(s)
+            unread = {word: self.execz_live_read(t, word, effects, succ, quiet)
+                      for word in set().union(*(effects[i][2] for i in range(b + 1, t))) & live - EXEC_KEYS}
             for i in range(b + 1, t):
                 at, _, inner, inner_asm = self.ins[i]
                 may = effects[i][2]
@@ -1497,11 +1534,42 @@ class Stage:
                 elif may & EXEC_KEYS and (entered or i in before and
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
-                elif (may - EXEC_KEYS) & live:
-                    reason = 'definition of %s, live where the block joins' % ', '.join(sorted((may - EXEC_KEYS) & live))
+                elif any(unread[word] is not None for word in (may - EXEC_KEYS) & live):
+                    words = sorted(word for word in (may - EXEC_KEYS) & live if unread[word] is not None)
+                    named = [unread[word] for word in words if unread[word] >= 0]
+                    reason = 'definition of %s, live where the block joins' % ', '.join(words) + (
+                        ': read by %s after the join' % self.ins[min(named)][2] if named else '')
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
+
+    def execz_live_read(self, t, word, effects, succ, quiet):
+        """None when every read of `word` from the join t of an execz block on, until a write of it ends the block's
+        definition, gives a lane the model skipped the wave's result; else the first read that is not proven, or -1
+        for m0 and SCC, which have implicit readers.
+
+        Such a lane's exec bit is clear at the join, in the model and in the wave (execz_refusals proves the block's
+        exec writes), and the two differ there at most in `word`. A read is proven when:
+        - exec is unchanged on every path from the join to it (`quiet`) and it reads `word` only as W & exec,
+          ~(W & exec) or W | ~exec, exec of the same lanes (exec_absorbs): the lane's bit of the result is fixed
+          whatever its bit of `word` is, so the result agrees, and when it overwrites `word` the definition ends.
+        Any other read, a data read or a copy into another register included, is not proven."""
+        if not re.fullmatch(r'vcc(_hi)?|s\d+', word):
+            return -1
+        seen, work, unproven = set(), [t], []
+        while work:
+            j = work.pop()
+            if j in seen:
+                continue
+            seen.add(j)
+            name, asm = self.ins[j][2:]
+            if word in effects[j][0]:
+                if not (quiet.get(j) and exec_absorbs(name, asm, word)):
+                    unproven.append(j)
+                    continue
+            if word not in effects[j][1]:
+                work.extend(succ[j])
+        return min(unproven, default=None)
 
     # ---- instruction translation -------------------------------------------------------------
     def joined_registers(self, with_cfg=False):
