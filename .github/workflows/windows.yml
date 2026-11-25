@@ -230,6 +230,7 @@ jobs:
             tests/startup_gfx2hlsl_bit_alu_check.py \
             tests/startup_gfx2hlsl_mad_check.py \
             tests/startup_gfx2hlsl_compute_check.py \
+            tests/startup_compute_translate_check.py \
             tests/startup_gfx2hlsl_swap_check.py \
             tests/startup_gfx2hlsl_shift64_check.py \
             tests/startup_gfx2hlsl_vopc_sdwa_check.py \

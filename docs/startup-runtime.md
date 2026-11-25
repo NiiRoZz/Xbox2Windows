@@ -642,10 +642,10 @@ costs no file access, and the writes take their own lock, not the draw lock.
 `not written`, with the reason when refused, up to 12 lines per run. The render totals line ends with
 `compute requests published <n> (already present <n>, failed <n>, pointer-like blob qwords <n>)`.
 
-**Offline.** `gfx2hlsl.py --pending` and `--watch` take `.c67` as a ready marker. With no compute stage yet,
-they record `compute stage not supported` in `<key>.fail`. The request stays in the cache, and a later
-`--pending` retries it. `--refusals` reports compute requests in a separate section, so its graphics counts
-do not change, and `triage_run.py` puts their `.fail` reasons in a `compute:` class.
+**Offline.** `gfx2hlsl.py --pending` and `--watch` take `.c67` as a ready marker and translate the request
+(see [Compute pipeline translation](#compute-pipeline-translation)). A refused request stays in the cache, and
+a later `--pending` retries it. `--refusals` reports compute requests in a separate section, so its graphics
+counts do not change, and `triage_run.py` puts their `.fail` reasons in a `compute:` class.
 
 **Local observation** (a local build of this change ported to an older base; one title, local files only, not
 in the repository):
@@ -666,6 +666,59 @@ after building `startup_stream_consumer`. On WARP:
 - A valid, refused, valid sequence publishes the two valid keys.
 - A request whose first four parts already exist is completed without rewriting them.
 - The control runs without render mode and must print `FAIL: no compute request`.
+
+### Compute pipeline translation
+
+`gfx2hlsl.py --pending` and `--watch` translate a `.c67` request with the compute stage instead of recording
+`compute stage not supported`. The request is checked first, and it is refused into `<key>.fail` (with no
+cache path in the text) when:
+- a part is missing;
+- `.desc` is not 96 bytes;
+- a part's length disagrees with its size word in `.desc` (code word 6, data word 8, state blocks words 2 and 4);
+- the files do not hash to the key in their name;
+- the code is empty, is not whole dwords, or has no `s_endpgm`.
+
+The translation is `ComputePipeline(code, root, COMPUTE_PGM_RSRC2, group size)`. Both register values come
+from state block A, which must be 28 bytes. The stage writes `<key>.cs.hlsl`, then `<key>.cs.cso` (DXC
+`cs_6_0`), then the `stage cs` manifest `<key>.txt` last; a stage refusal goes to `<key>.fail` with the
+stage's own reason. A request is done once `<key>.txt` and `<key>.cs.cso` exist. `X2W_FXC=` (empty)
+publishes the manifest alone, as for graphics. `<key>.cs.cso` has the same form as the slot 62 results of
+#1441 in the same directory. The keys come from different hashes, so the names clash only on a 64-bit
+collision. The stand-in does not load the result yet and still creates a placeholder.
+
+The state-block reading is a **hypothesis** from a local observation of 2,689 requests (an earlier local build
+of the request change; one title, local files only):
+- dword 3 holds the thread-group size X in its low 16 bits and Y in its high 16 bits, and the low 16 bits of
+  dword 4 hold Z. All 2,689 sizes are within the `numthreads` limits, with 43 distinct sizes.
+- dword 6 has the `COMPUTE_PGM_RSRC2` layout. Bits 31:24 are zero, and the thread-ID component count never
+  exceeds what the group size needs; it covers a Y size above 1 in 2,671 of 2,689. `TG_SIZE_EN` is set in 91,
+  which the stage refuses.
+
+The stand-in does not decode these values.
+
+Census: one title, local files only.
+- Requests: 2,689, published by a local build of the request change that was ported to an older base.
+- Re-keying: the requests were re-keyed offline with this `compute_key`. The files are unchanged; only their
+  names change.
+- Result: 8 of 2,689 translate and compile, and `--pending` took 12 s. No request is refused by the request
+  checks above.
+- First refusal per request:
+  - `buffer_load_format` from the descriptor format: 1,280;
+  - scalar writes under `s_cbranch_execz`: at least 404;
+  - `s_load` with a register offset through the resource heap: 158;
+  - `image_store`: 110;
+  - `TG_SIZE_EN`: 91.
+
+Run `python -B tests/startup_compute_translate_check.py` (ctest `startup_compute_translate_requests`, pure
+Python) to check the refusals above and the case A manifest. `startup_compute_translate_e2e_<warp|hardware>`
+goes end to end on the GPU:
+1. the stand-in publishes case A of `startup_gfx2hlsl_compute_check.py`;
+2. `--pending` translates it and DXC compiles it;
+3. `offscreen_check` dispatches `<key>.cs.cso` and compares all 320 words.
+
+Its `wrong_group` control swaps the group size in the state block and must mismatch. This proves that the
+request, translation, bytecode and dispatch fit together. It does not prove the state-block reading, because
+the fixture builds the block at the offsets the translator reads.
 
 `run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
 the process could not be created, 0 when the debugger finished its report, whatever the process

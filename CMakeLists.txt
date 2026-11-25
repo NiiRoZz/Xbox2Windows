@@ -2811,6 +2811,22 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_check.py" "$<TARGET_FILE:startup_stream_consumer>" disabled)
     set_tests_properties(startup_compute_request_warp startup_compute_request_disabled_control PROPERTIES TIMEOUT 60)
     set_tests_properties(startup_compute_request_disabled_control PROPERTIES PASS_REGULAR_EXPRESSION "FAIL: no compute request")
+    # Slot 67 request translation: request checks, then stand-in request -> --pending -> DXC -> dispatch; the
+    # wrong-group control must mismatch.
+    add_test(NAME startup_compute_translate_requests COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_translate_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_compute_translate_e2e_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_translate_check.py" e2e "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter})
+        add_test(NAME startup_compute_translate_e2e_wrong_group_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_translate_check.py" e2e "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" "$<TARGET_FILE:offscreen_check>" ${adapter} wrong-group)
+        set_tests_properties(startup_compute_translate_e2e_${adapter} startup_compute_translate_e2e_wrong_group_${adapter}
+            PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        set_tests_properties(startup_compute_translate_e2e_wrong_group_${adapter} PROPERTIES
+            PASS_REGULAR_EXPRESSION "control wrong-group: rejected at word=[0-9]+ ")
+    endforeach()
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_stream_draw_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_stream_draw_check.py"

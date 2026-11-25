@@ -3120,18 +3120,98 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     return key
 
 
-COMPUTE_UNSUPPORTED = 'compute stage not supported'
+S_ENDPGM = 0xbf810000
+
+
+def compute_entry(state_a):
+    """(COMPUTE_PGM_RSRC2, group size) from state block A. A hypothesis from a local observation, not decoded
+    by the stand-in (docs/startup-runtime.md#compute-pipeline-translation): dword 3 = X | Y << 16, dword 4
+    bits 15:0 = Z, dword 6 = COMPUTE_PGM_RSRC2."""
+    if len(state_a) != 28:
+        raise Unsupported('compute state block A is %d bytes, not 28' % len(state_a))
+    words = struct.unpack('<7I', state_a)
+    return words[6], (words[3] & 0xffff, words[3] >> 16, words[4] & 0xffff)
+
+
+def load_compute_request(out_dir, key, refusals=None):
+    """The ComputePipeline of a slot 67 request, after checking the files against .desc and the key."""
+    name = os.path.join(out_dir, 'req_%016x' % key)
+    try:
+        parts = {ext: open(name + ext, 'rb').read() for ext in ('.c67', '.data', '.root', '.desc', '.sa', '.sb')}
+    except OSError:
+        raise Unsupported('unreadable shader request') from None  # the error text would name the cache path
+    desc = parts['.desc']
+    if len(desc) != 96:
+        raise Unsupported('compute description is %d bytes, not 96' % len(desc))
+    words = struct.unpack('<12Q', desc)
+    for ext, word in (('.c67', 6), ('.data', 8), ('.sa', 2), ('.sb', 4)):
+        if len(parts[ext]) != words[word]:
+            raise Unsupported('compute request %s is %d bytes, the description says %d' % (ext, len(parts[ext]), words[word]))
+    if compute_key(parts['.c67'], parts['.data'], parts['.root'], desc, parts['.sa'], parts['.sb']) != key:
+        raise Unsupported('compute request files do not match the key in their name')
+    code = parts['.c67']
+    if not code or len(code) % 4:
+        raise Unsupported('compute code of %d bytes is not whole dwords' % len(code))
+    if S_ENDPGM not in struct.unpack('<%dI' % (len(code) // 4), code):
+        raise Unsupported('compute code without s_endpgm')
+    rsrc2, group = compute_entry(parts['.sa'])
+    return ComputePipeline(code, parts['.root'], rsrc2, group, refusals=refusals)
 
 
 def compute_refusals(out_dir, key):
-    """Refusal sites of one slot 67 compute request. No compute stage yet: every request waits in the cache."""
-    return [(COMPUTE_UNSUPPORTED, 'pipeline')]
+    """Refusal sites of one slot 67 compute request, without publishing a translation."""
+    refusals, op = [], 'request loading'
+    try:
+        pipe = load_compute_request(out_dir, key, refusals)
+        op = 'hlsl_cs'
+        pipe.hlsl_cs()
+        op = 'manifest'
+        pipe.manifest()
+    except Unsupported as reason:
+        refusals.append((str(reason), 'pipeline'))
+    except Exception as error:  # noqa: BLE001 - one request must not end the census
+        refusals.append((handler_error(op, error, refusals), 'pipeline'))
+    return refusals
 
 
 def translate_compute(out_dir, key):
-    """Record why a slot 67 compute request is not translated, the way a refused graphics request is."""
-    open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(COMPUTE_UNSUPPORTED + '\n')
-    return 'unsupported: %s' % COMPUTE_UNSUPPORTED
+    """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC cs_6_0) and <key>.txt last, or <key>.fail with the reason.
+    X2W_FXC set to the empty string publishes the manifest alone, as for graphics."""
+    name = os.path.join(out_dir, '%016x' % key)
+    try:
+        pipe = load_compute_request(out_dir, key)
+        hlsl, manifest = pipe.hlsl_cs(), pipe.manifest()
+    except Unsupported as reason:
+        open(name + '.fail', 'w').write(str(reason) + '\n')
+        return 'unsupported: %s' % reason
+    open(name + '.cs.hlsl', 'w').write(hlsl)
+    if os.environ.get('X2W_FXC') != '':
+        compiler = find_dxc()
+        if compiler is None:
+            message = 'dxc not found (X2W_DXC=%s): a compute stage needs shader model 6.0' % os.environ.get('X2W_DXC', '<unset>')
+            open(name + '.fail', 'w').write(message + '\n')
+            return message
+        import subprocess
+        with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
+            bytecode = os.path.join(staging, 'cs.cso')
+            r = subprocess.run([compiler, '-Gis', '-T', 'cs_6_0', '-E', 'main', '-Fo', bytecode, name + '.cs.hlsl'],
+                               capture_output=True, text=True)
+            if r.returncode or not has_bytecode(bytecode):
+                # DXC names the source path; keep only the diagnostic after it.
+                lines = [re.sub(r'^.*?\.cs\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
+                detail = lines[0] if lines else ('?' if r.returncode else 'no bytecode produced')
+                open(name + '.fail', 'w').write('dxc cs: %s\n' % detail[:500])
+                return 'dxc cs failed: %s' % detail[:500]
+            with suppress(FileNotFoundError):
+                os.remove(name + '.txt')  # withdraw an older manifest before its bytecode changes
+            os.replace(bytecode, name + '.cs.cso')
+    temporary = '%s.txt.%d.tmp' % (name, os.getpid())
+    with open(temporary, 'w') as result:
+        result.write(manifest)
+    os.replace(temporary, name + '.txt')
+    with suppress(FileNotFoundError):
+        os.remove(name + '.fail')
+    return 'ok'
 
 
 DEFAULT_FXC = r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe'
@@ -3636,10 +3716,9 @@ def pending_keys(out_dir, skip_failed):
             continue
         key = int(m.group(1), 16)
         result = os.path.join(out_dir, '%016x' % key)
+        stages = ('.cs.cso',) if m.group(2) == 'c67' else ('.vs.cso', '.ps.cso')
         # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008).
-        if os.path.isfile(result + '.txt') and (
-            manifest_only or (has_bytecode(result + '.vs.cso') and has_bytecode(result + '.ps.cso'))
-        ):
+        if os.path.isfile(result + '.txt') and (manifest_only or all(has_bytecode(result + s) for s in stages)):
             continue
         fail = os.path.join(out_dir, '%016x.fail' % key)
         # A repeated pass retries a failure only once its request is rewritten.
