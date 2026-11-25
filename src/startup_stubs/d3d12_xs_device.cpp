@@ -1875,6 +1875,7 @@ struct Pass {
     std::vector<std::pair<ID3D12Resource*, D3D12_RESOURCE_STATES>> states;  // resources this list moved out of COMMON
     // What the title bound, kept for draws through translated pipelines:
     Wrapper* pipeline = nullptr;
+    Wrapper* requested_pipeline = nullptr;  // last pipeline slot 61 asked a translation for; repeats skip draw_lock
     UINT topology = 0;
     x2w_startup::ViewTable view_tables[16]{};
     u64 source_view_heap = 0;
@@ -2145,8 +2146,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         else bytes = sizeof(D3D12_DRAW_ARGUMENTS);
         if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || !pass.indirect_graphics.root ||
             pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh) {
-            // A console pipeline used only here still gets the request a direct draw writes; nothing is drawn.
-            if (pass.pipeline && !pass.pipeline_real) request_translation(pass.pipeline);
+            // A console pipeline (no desktop pipeline) used only here still gets the request a direct draw writes;
+            // nothing is drawn.
+            if (pass.pipeline && !pass.pipeline->own().real && pass.requested_pipeline != pass.pipeline) {
+                pass.requested_pipeline = pass.pipeline;
+                request_translation(pass.pipeline);
+            }
             return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root");
         }
         if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
@@ -3771,7 +3776,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         log("x2w-render totals: resets %ld (failed %ld), closes %ld, clears %ld, target binds %ld (unresolved %ld), executes %ld, draws %ld (skipped %ld), "
             "translated draws %ld (not drawn %ld), pipelines translated %ld / missing %ld, null bindings %ld (entry %ld, buffer %ld, token %ld, wrapper %ld, dimension %ld), "
             "textures uploaded %ld (%ld KiB, unreadable %ld), heap-indexed roots deferred %ld (real draws refused: view heap %ld, "
-            "sampler heap %ld, both heaps %ld, state %ld)", render_resets,
+            "sampler heap %ld, both heaps %ld, state %ld), pipelines requested by ExecuteIndirect %ld", render_resets,
             render_reset_failures, render_closes, render_clears, render_target_binds, render_target_unresolved, render_executes, render_draws, render_draws_skipped,
             translated_draws, untranslated_draws, translation_ready, translation_missing, null_total,
             null_causes[0], null_causes[1], null_causes[2], null_causes[3], null_causes[4], textures_uploaded,
@@ -3779,7 +3784,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::view_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::sampler_heap_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
-            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)]);
+            heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_requested);
     if (render_mode() && frame % 300 == 0) {
         // Which command-list slots the title called in the last 300 frames, per frame.
         char line[2048];
