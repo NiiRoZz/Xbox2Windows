@@ -1,10 +1,11 @@
 // Translated compute programs at Dispatch (list slot 14). A device slot 67 pipeline is a placeholder that keeps
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
 // <key>.cs.cso. Bound from the compute tables recorded by slot 35: raw buffers (`srv <i> buf table <param> <byte>`
-// inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D texture outputs
-// (`uav <i> tex2d float table <param> <byte> channels 4`) named by the token of an unordered access view the title
-// created (device slot 19). Entry values come from the compute root constants of slots 37 and 39. Any other
-// manifest line makes the translation unavailable; a dispatch that cannot be bound completely is refused with one
+// inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D textures
+// (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d float table <param> <byte> channels 4` outputs) named
+// by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
+// values come from the compute root constants of slots 37 and 39. Any other manifest line makes the translation
+// unavailable; a dispatch that cannot be bound completely is refused with one
 // reason and records nothing on the desktop list.
 
 struct ComputeTranslation {
@@ -13,6 +14,7 @@ struct ComputeTranslation {
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
     std::vector<Slot> uds, srvs, uavs;
+    x2w_startup::TranslatedSamplers samplers;  // static ones only
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
     const char* unmodelled = nullptr;      // why a manifest that exists cannot be used
@@ -80,10 +82,15 @@ const char* load_compute_translation(ComputeTranslation& tr)
         else if (std::sscanf(line.c_str(), "uav %u tex2d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
                  i == tr.uavs.size())
             tr.uavs.push_back({a, b, true});
-        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer"
+        else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
+            tr.srvs.push_back({a, b, true});
+        else if (std::sscanf(line.c_str(), "smp %u %x %x %x %x%n", &i, &x, &y, &z, &x, &used) == 5 && whole() &&
+                 i == tr.samplers.statics.size())
+            tr.samplers.read_manifest_line(line.c_str());
+        else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
                   : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 2D float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant"
-                  : line.rfind("smp", 0) == 0 ? "a sampler" : "an unknown manifest line";
+                  : line.rfind("smp", 0) == 0 ? "a sampler that is not a plain static one" : "an unknown manifest line";
     }
     if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
@@ -91,7 +98,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
     // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
     if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
-            static_cast<UINT>(tr.srvs.size()), {}, &tr.root, static_cast<UINT>(tr.uavs.size()))))
+            static_cast<UINT>(tr.srvs.size()), tr.samplers, &tr.root, static_cast<UINT>(tr.uavs.size()))))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
     desc.pRootSignature = tr.root.Get();
@@ -114,7 +121,14 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     if (!key) return false;
     const char* reason = nullptr;
     LONG* counter = &compute_dispatches_refused;
-    struct View { ID3D12Resource* resource; u64 offset, bytes; bool transition, texture, described; unsigned char desc[40]; } views[40]{};
+    struct View {
+        ID3D12Resource* resource;
+        u64 offset, bytes;
+        bool transition, texture, described;
+        unsigned char desc[40];  // a texture view's description, as the title gave it with a desktop format
+        Wrapper* wrapper;
+    } views[40]{};
+    static_assert(sizeof(D3D12_SHADER_RESOURCE_VIEW_DESC) == 40 && sizeof(D3D12_UNORDERED_ACCESS_VIEW_DESC) == 40);
     const auto type = list->GetType();
     AcquireSRWLockExclusive(&draw_lock);
     ComputeTranslation* const tr = &compute_translations()[key];
@@ -152,7 +166,7 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         std::memcpy(words, reinterpret_cast<const void*>(entry), entry_bytes);
         if (slot.texture) {
             // The title's descriptor memory carries the id of the view it created there. Nothing else is bound:
-            // a null output would drop the program's stores without a trace.
+            // a null view would read zeros or drop the program's stores without a trace.
             ViewRecord record{};
             bool known = false, created = false;
             if (words[0] == view_token_magic) {
@@ -165,9 +179,29 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
                 ReleaseSRWLockShared(&note_lock);
             }
             Wrapper* const wrapper = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
-            ID3D12Resource* const texture = wrapper && wrapper->own().kind == resource_kind &&
-                InterlockedCompareExchange(&wrapper->own().refs, 0, 0) > 0 ? static_cast<ID3D12Resource*>(wrapper->own().real) : nullptr;
+            const bool alive = wrapper && wrapper->own().kind == resource_kind && InterlockedCompareExchange(&wrapper->own().refs, 0, 0) > 0;
+            ID3D12Resource* const texture = !alive ? nullptr : output ? static_cast<ID3D12Resource*>(wrapper->own().real)
+                                                                      : sampled_address_texture(wrapper);
             const D3D12_RESOURCE_DESC resource = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
+            if (!output) {
+                D3D12_SHADER_RESOURCE_VIEW_DESC desc{};
+                const bool described = record.desc_bytes >= sizeof(desc);
+                if (described) std::memcpy(&desc, record.desc, sizeof(desc));
+                if (desc.Format) desc.Format = desktop_format(desc.Format);
+                words[3] = static_cast<std::uint32_t>(desc.Format ? desc.Format : resource.Format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
+                if (!known || record.slot != 18) reason = "an input texture entry is not the token of a shader resource view";
+                else if (!texture || (resource.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE))
+                    reason = "an input texture has no desktop texture to sample";
+                else if (described ? desc.ViewDimension != D3D12_SRV_DIMENSION_TEXTURE2D
+                                   : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
+                    reason = "an input texture view is not 2D";
+                // shortcut: a packed format needs the stand-in rules of the draw path; add them with its first user.
+                else if (x2w_startup::packed_target_format(desc.Format)) reason = "an input texture view has a packed format";
+                views[i] = {texture, 0, 0, true, true, described};
+                std::memcpy(views[i].desc, &desc, sizeof(desc));
+                views[i].wrapper = wrapper;
+                continue;
+            }
             D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
             const bool described = record.desc_bytes >= sizeof(desc);
             if (described) std::memcpy(&desc, record.desc, sizeof(desc));
@@ -209,6 +243,13 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
             if (views[input].resource == placed.alias) reason = "an output buffer is also an input";
         views[i] = {placed.alias, offset, bytes, true};
     }
+    // A texture the title filled in memory is brought up to date first. An upload recorded before a later one
+    // fails only syncs content, as a draw sampling that texture would.
+    for (std::size_t i = 0; i < inputs && !reason; ++i)
+        if (views[i].texture && !upload_texture(self, views[i].wrapper, views[i].resource)) {
+            reason = "an input texture could not be uploaded";
+            std::memset(words, 0, sizeof(words));
+        }
     if (reason) {
         if (!tr->first_refusal) {
             tr->first_refusal = reason;
@@ -230,6 +271,12 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     D3D12_CPU_DESCRIPTOR_HANDLE dest{draw_heap->GetCPUDescriptorHandleForHeapStart().ptr + std::size_t{first} * draw_heap_increment};
     for (std::size_t i = 0; i < count; ++i, dest.ptr += draw_heap_increment) {
         const View& view = views[i];
+        if (i < inputs && view.texture) {
+            require_state(self, view.resource, sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            device_of(the_device)->CreateShaderResourceView(view.resource,
+                view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr, dest);
+            continue;
+        }
         if (i < inputs) {
             if (view.transition) require_state(self, view.resource, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             buffer_view(dest, view.resource, view.offset, static_cast<std::size_t>(view.bytes));

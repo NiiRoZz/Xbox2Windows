@@ -12,6 +12,12 @@ runs share one cache:
 3. texture-store-none (no Dispatch recorded): every half keeps its sentinel;
 4. texture-store-denied (a texture without unordered access, whose view the stand-in does not create): refused
    with one logged reason, every half keeps its sentinel.
+
+Texture input: case A of startup_gfx2hlsl_compute_check.py with a level-zero sample of a 2D texture XORed into the
+stored word (a static sampler, a texture view at table byte 64). The consumer adds a 1x1 RGBA8 texture whose red
+is 1.0 and a shader resource view of it (device slot 18). After translation all 320 words equal the case's
+expectation XOR the bits of 1.0f; dispatch-sampled-unbound (no view created) is refused with one logged reason and
+every word keeps the sentinel.
 Exit 77 when the adapter is not available.
 """
 import os
@@ -96,12 +102,64 @@ def store(directory, consumer, dxc, env):
           f'without a Dispatch and for a refused view; debug layer: {layer}')
 
 
+# v_xor_b32 v5, v5, v12: the assembled `v_xor_b32 v5, v5, v6` of case A with its second source register changed
+# (not assembled by llvm-mc here; the translation below is checked to read it as written).
+XOR = 'v_xor_b32 v5, v5, v12'
+SAMPLED = ('s_mov_b64 s[20:21], 0', 's_mov_b64 s[22:23], 0', 's_load_dwordx8 s[24:31], s[10:11], 0x40',
+           'image_sample_lz v[12:15], v[0:1], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D', XOR)
+
+
+def sample(directory, consumer, dxc, env):
+    cache, base = prepare(directory)
+    env = dict(base, **env)
+    (directory / 'compute_root').write_bytes(C.root_blob(table_range=True))
+    env['X2W_TEST_COMPUTE_ROOT'] = str(directory / 'compute_root')
+    _, words, rsrc2, group, groups = C.CASES['A']
+    assert groups == (3, 2, 2) and (C.KEY, C.STRIDE) == (0x01234567, 0x9e3779b9), 'the consumer hard-codes case A'
+    assert words[96:100].hex() == '050d0a3a', 'case A no longer holds v_xor_b32 v5, v5, v6 at byte 96'
+    C.SPLICE[XOR] = '05190a3a'
+    code = C.splice(*SAMPLED)
+    pipeline = C.translate('A', code=code)
+    assert 'v5 = v5 ^ v12;' in pipeline.hlsl_cs() and pipeline.manifest().endswith(
+        'srv 0 buf table 1 0\nsrv 1 tex2d table 1 64\nuav 0 table 1 16\nsmp 0 0x0 0x0 0x0 0x0\n'), pipeline.manifest()
+    (directory / 'program').write_bytes(code)
+    (directory / 'data').write_bytes(DATA)
+    (directory / 'state').write_bytes(state_a(group, rsrc2))
+    one = struct.unpack('<I', struct.pack('<f', 1.0))[0]
+    written = 24 * 3 * 2 * 2  # threads per group times groups; the words past them keep the sentinel
+    untouched, plain = [C.SENTINEL] * C.WORDS, C.expected('A')
+    assert plain[written:] == untouched[written:]
+    expected = [word ^ one for word in plain[:written]] + plain[written:]
+    layout = '<%dI' % C.WORDS
+
+    got, result = run(directory, consumer, env, 'dispatch-sampled', layout)
+    assert got == untouched, 'a Dispatch without a translation wrote the output'
+    key = int(lines(result, 'x2w-draw compute request')[0].split()[3], 16)
+    translate(cache, dxc, key)
+
+    got, result = run(directory, consumer, env, 'dispatch-sampled', layout)
+    wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
+    assert not wrong, 'word=%d got=%08x expected=%08x (%d words differ)\n%s' % (
+        wrong[0], got[wrong[0]], expected[wrong[0]], len(wrong), result.stderr[-3000:])
+    assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1, result.stderr[-3000:]
+    layer = clean(result)
+
+    got, result = run(directory, consumer, env, 'dispatch-sampled-unbound', layout)
+    assert got == untouched, 'a refused Dispatch wrote the output'
+    refused = lines(result, 'refused: ')
+    assert len(refused) == 1 and 'an input texture entry is not the token of a shader resource view' in refused[0], \
+        result.stderr[-3000:]
+    print(f'texture input: all {C.WORDS} words match after translation; untouched before translation and without a '
+          f'view; debug layer: {layer}')
+
+
 def main(consumer, dxc, adapter):
     env = dict(X2W_D3D12_LIST_NOOP='1', X2W_D3D12_DEBUG='1')  # guest lists; debug-layer messages go to the log
     if adapter == 'hardware':
         env['X2W_TEST_DISPATCH_HARDWARE'] = '1'
     with tempfile.TemporaryDirectory() as temporary:
         store(Path(temporary) / 'store', consumer, dxc, env)
+        sample(Path(temporary) / 'sample', consumer, dxc, env)
     print(f'startup_compute_dispatch_texture: PASS on {adapter}')
 
 
