@@ -1800,7 +1800,7 @@ class Stage:
         self.tbuffer(ops, mods, 4)
 
     def image(self, ops, mods, how):
-        if self.kind == 'cs' and 'd16' in mods:
+        if getattr(self, 'kind', None) == 'cs' and 'd16' in mods:
             raise Unsupported('compute d16 image load requires validated SRV formats')
         dst = reg_range(ops[0])
         dim = [m for m in mods if m.startswith('dim:')][0][4:]
