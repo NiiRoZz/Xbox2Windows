@@ -149,8 +149,9 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     if (reason) {
         ReleaseSRWLockExclusive(&draw_lock);
         InterlockedIncrement(counter);
-        static LONG refusals;
-        if (first_calls(refusals, 16)) log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
+        // Dispatches that arrive before the offline translation must not use up the lines for bind refusals.
+        static LONG untranslated, refusals;
+        if (first_calls(counter == &compute_dispatches_untranslated ? untranslated : refusals, 16)) log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
         return true;
     }
     const UINT n = static_cast<UINT>(count);
