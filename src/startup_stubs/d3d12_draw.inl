@@ -413,18 +413,18 @@ BoundPipeline* translation_for(Wrapper* pipeline)
 }
 
 // The request translation_for writes on a direct draw, for a pipeline that slot 61 refuses. Only direct draws poll
-// for the manifest afterwards, so these pipelines are also counted apart in the render totals.
-LONG indirect_requested;
+// for the manifest afterwards. Count first lookups separately from published request files.
+LONG indirect_first_lookups;
 void request_translation(Wrapper* pipeline)
 {
     AcquireSRWLockExclusive(&draw_lock);
     const bool known = translation_by_pipeline().count(pipeline) != 0;
     translation_for(pipeline);
     ReleaseSRWLockExclusive(&draw_lock);
-    if (!known) InterlockedIncrement(&indirect_requested);
+    if (!known) InterlockedIncrement(&indirect_first_lookups);
     static LONG lookups;
     if (first_calls(lookups, 16))
-        log("x2w-render ExecuteIndirect requests the translation of pipeline %p (%s)", static_cast<void*>(pipeline),
+        log("x2w-render ExecuteIndirect looks up translation for pipeline %p (%s)", static_cast<void*>(pipeline),
             known ? "already known" : "new");
 }
 

@@ -11,7 +11,7 @@ pipeline under test, binds it on a guest list and records refused slot-61 calls 
   slot57-dispatch  the same pipeline with one Dispatch call (a compute-state refusal): no request
   desktop-draw     a slot-86 pipeline with desktop shaders and one Draw call: no lookup
 
-Every slot-61 lookup logs "x2w-render ExecuteIndirect requests the translation of pipeline" (first 16).
+Every slot-61 lookup logs "x2w-render ExecuteIndirect looks up translation for pipeline" (first 16).
 """
 import os
 from pathlib import Path
@@ -21,7 +21,7 @@ import tempfile
 
 from startup_stream_draw_check import pixel, vertex
 
-LOOKUP = "x2w-render ExecuteIndirect requests the translation of pipeline"
+LOOKUP = "x2w-render ExecuteIndirect looks up translation for pipeline"
 
 
 def run(consumer, backend, directory, mode, runs=1):
