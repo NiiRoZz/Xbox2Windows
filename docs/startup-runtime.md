@@ -700,11 +700,11 @@ Census: one title, local files only.
 - Requests: 2,689, published by a local build of the request change that was ported to an older base.
 - Re-keying: the requests were re-keyed offline with this `compute_key`. The files are unchanged; only their
   names change.
-- Result: 8 of 2,689 translate and compile, and `--pending` took 12 s. No request is refused by the request
+- Result: 8 of 2,689 translate and compile, and `--pending` took 11 s. No request is refused by the request
   checks above.
 - First refusal per request:
   - `buffer_load_format` from the descriptor format: 1,280;
-  - scalar writes under `s_cbranch_execz`: at least 404;
+  - scalar writes under `s_cbranch_execz`: 541;
   - `s_load` with a register offset through the resource heap: 158;
   - `image_store`: 110;
   - `TG_SIZE_EN`: 91.

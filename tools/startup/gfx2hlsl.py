@@ -3201,6 +3201,8 @@ def translate_compute(out_dir, key):
                 lines = [re.sub(r'^.*?\.cs\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
                 detail = lines[0] if lines else ('?' if r.returncode else 'no bytecode produced')
                 open(name + '.fail', 'w').write('dxc cs: %s\n' % detail[:500])
+                with suppress(FileNotFoundError):
+                    os.remove(name + '.txt')  # no manifest next to a failure, as on the success path
                 return 'dxc cs failed: %s' % detail[:500]
             with suppress(FileNotFoundError):
                 os.remove(name + '.txt')  # withdraw an older manifest before its bytecode changes

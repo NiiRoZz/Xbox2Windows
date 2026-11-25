@@ -82,8 +82,18 @@ def check_requests(directory):
     # The pending scan treats the translated request as done (manifest-only mode) and retries the others.
     pending = G.pending_keys(str(cache), skip_failed=False)
     assert key not in pending and moved in pending, pending
+    # A failed compile withdraws the manifest an earlier pass left. The Python interpreter stands in for DXC and
+    # exits non-zero on DXC's options.
+    os.environ.pop('X2W_FXC')
+    os.environ['X2W_DXC'] = sys.executable
+    assert (cache / ('%016x.txt' % key)).exists()
+    result = G.translate_request(str(cache), key)
+    assert result.startswith('dxc cs failed: '), result
+    assert (cache / ('%016x.fail' % key)).read_text().startswith('dxc cs: '), (cache / ('%016x.fail' % key)).read_text()
+    assert not (cache / ('%016x.txt' % key)).exists(), 'a manifest was left next to the failure'
+    assert key in G.pending_keys(str(cache), skip_failed=False)
     print('compute request translation: case A manifest, %d malformed requests refused with no manifest, '
-          'renamed and incomplete requests refused, done test' % len(cases))
+          'renamed and incomplete requests refused, done test, failed compile withdraws the manifest' % len(cases))
 
 
 def check_e2e(directory, consumer, dxc, runner, adapter, wrong_group):
