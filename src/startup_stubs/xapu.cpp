@@ -343,7 +343,7 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
 #ifdef X2W_HAVE_OPUS
         const float* pcm = nullptr;
         void* dest = nullptr;
-        // Queue room first, so a refused command changes no decoder state.
+        // Refuse a full queue before touching any decoder state.
         hr = reserve_result(*conn) ? hr_ok : hr_out_of_memory;
         if (hr == hr_ok && decode) {
             hr = decode_packet(*conn, reinterpret_cast<const unsigned char*>(rdx), entry.value, &pcm, &dest);

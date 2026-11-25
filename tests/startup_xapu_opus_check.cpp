@@ -332,6 +332,10 @@ int main(int argc, char** argv)
         auto out9 = filled(960);
         std::vector<float> want(960);
         const auto& p = short_packets[3];
+        expect_refused("malformed packet at the current rate -> E_FAIL", hr_fail,
+                       decode_cmd(9, 48000.0f, 960, bad, sizeof(bad), out.data(), 3840), out);
+        expect_refused("valid packet in too-small capacity -> E_FAIL", hr_fail,
+                       decode_cmd(9, 48000.0f, 80, p.data(), static_cast<std::uint32_t>(p.size()), out.data(), 320), out);
         const auto cmd = decode_cmd(9, 48000.0f, 960, p.data(), static_cast<std::uint32_t>(p.size()), out9.data(), 3840);
         check(enqueue(handle, cmd.data(), 0, 0) == hr_ok && pop().bytes == 1920 &&
                   opus_decode_float(ref_10ms, p.data(), static_cast<opus_int32>(p.size()), want.data(), 960, 0) == 480 &&

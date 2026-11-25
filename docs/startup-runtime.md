@@ -2100,8 +2100,9 @@ libopus. Any other invalid field (rate, channel count, frames over 5760, packet 
 unwritable output, slot 256 or above) returns `E_INVALIDARG`. A packet that libopus rejects, or one holding more
 frames than `+0x24`, returns `E_FAIL`, and a command shorter than `0x40` readable bytes returns `E_POINTER`. A full
 queue returns `E_OUTOFMEMORY` before any decode, reset or close. A refused command queues no result, leaves the
-output untouched and keeps the slot's decoder; decoding goes through a scratch buffer and is copied out only once
-the result is queued.
+output untouched and keeps the existing decoder object. Invalid arguments and a full queue fail before calling
+libopus. If libopus fails while using an existing decoder, its internal state follows libopus. Decoded samples
+are copied from scratch only after the result is queued.
 
 ```powershell
 cmake --preset dev -DX2W_WITH_OPUS=ON -DOpus_DIR=<libopus install>/lib/cmake/Opus
