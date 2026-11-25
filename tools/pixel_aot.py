@@ -3094,8 +3094,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
     must supply normalized whole-pair instructions and apply the returned mask in the PSO.
     Uncompressed partial exports use the same opt-in for floating-point and integer targets.
     wave_size names the guest execution width (32 or 64). Low-only execution mask operations
-    (s_mov_b32 save of exec_lo, s_wqm_b32, and s_and_b32/s_mov_b32 restore) require a validated
-    guest wave32 profile (wave_size=32); native Scarlett/GFX10 wave64 operations remain independent
+    (s_mov_b32 save of exec_lo, s_wqm_b32, and s_and_b32/s_mov_b32 restore, and the wave32 masked region:
+    s_and_saveexec_b32, its s_mov_b32/s_or_b32 exec_lo close and its s_andn2_b32 exec_lo else) require a
+    validated guest wave32 profile (wave_size=32); native Scarlett/GFX10 wave64 operations remain independent
     of guest profile declarations.
     half_denorm declares the binary16 denormal state at shader entry (MODE[7:6]). Only "preserve" is accepted; None
     means unknown, and the plain binary16 VOP2 arithmetic forms are then refused. The caller takes it from validated
@@ -3351,9 +3352,14 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                           exported, ended, mask, attribute_input, interpolated,
                           dict(quad_values), samples, False)
         elif region is not None:
-            if re.fullmatch(r"s_or_b64 exec, exec, s\[\d+:\d+\]|s_mov_b64 exec, s\[\d+:\d+\]", line):
+            # A region accepts only the close and else spellings of its own width: s_and_saveexec_b64 and v_cmpx
+            # regions the wave64 forms, s_and_saveexec_b32 regions the wave32 forms on exec_lo.
+            if region["width"] == 64 and re.fullmatch(
+                    r"s_or_b64 exec, exec, s\[\d+:\d+\]|s_mov_b64 exec, s\[\d+:\d+\]"
+                    r"|s_andn2_b64 exec, s\[\d+:\d+\], exec", line):
                 pass
-            elif re.fullmatch(r"s_andn2_b64 exec, s\[\d+:\d+\], exec", line):
+            elif region["width"] == 32 and re.fullmatch(
+                    r"s_or_b32 exec_lo, exec_lo, s\d+|s_mov_b32 exec_lo, s\d+|s_andn2_b32 exec_lo, s\d+, exec_lo", line):
                 pass
             elif (re.fullmatch(r"s_cbranch_execz -?(?:0x[0-9a-f]+|\d+)", line)
                     and i == region["arm_start"] + 1 and region["skip"] is None):
@@ -3644,6 +3650,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             mask = "entry"
             wqm_width = None
             scc = None
+        elif region is not None and region["width"] == 32 and (m := match(r"s_mov_b32 exec_lo, (s\d+)")):
+            # The MOV close of a wave32 region: exec_lo is the whole EXEC of a wave32 guest. As for s_mov_b64, SCC
+            # is left alone, and it is already untracked after s_and_saveexec_b32.
+            close_region(i, [m[1]])
+            region = None
         elif m := match(r"s_mov_b32 (?:exec|exec_lo), (s\d+)"):
             if not guest_wave32:
                 raise ValueError("32-bit execution mask restore requires a validated wave32 guest profile")
@@ -3652,6 +3663,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Unsupported execution mask")
             mask = "entry"
             wqm_width = None
+            scc = None
+        elif line.startswith("s_and_saveexec_b32 "):
+            # The wave32 masked-if: exec_lo is the whole EXEC of a wave32 guest, so saving it into one SGPR and
+            # ANDing it with a single-register lane condition opens the same per-lane region as
+            # s_and_saveexec_b64. Only a validated wave32 profile admits it; the compare that wrote the condition
+            # is tracked the same way in both profiles. A save into the condition register itself is refused,
+            # since the order of that read and write is not modelled.
+            if not guest_wave32:
+                raise ValueError("32-bit execution mask save requires a validated wave32 guest profile")
+            if not (m := match(r"s_and_saveexec_b32 (s\d+), (vcc_lo|s\d+)")):
+                raise ValueError("Unsupported execution mask save")
+            save = [sgpr_name(m[1])]
+            regs = lane_mask(m[2])
+            condition = scalar.get(regs[0])
+            if (m[1] == m[2] or region is not None or mask != "entry" or pending.intersection(save)
+                    or not isinstance(condition, tuple) or condition[0] != "condition"
+                    or [scalar.get(r) for r in regs] != [(*condition[:2], 0, 1)]):
+                raise ValueError("Unsupported execution mask save")
+            scalar[save[0]] = ("exec_saved",)
+            region = {"save": save, "cond": condition[1], "written": {}, "skip": None, "start": i, "arm_start": i,
+                      "else": None, "then": {}, "else_written": {}, "else_undefined": set(), "skipped": False,
+                      "scalar_written": set(), "scc_written": False, "opener": "saveexec", "width": 32,
+                      "arm_outstanding": (set(pending), dict(sample_dest))}
+            vector.masked = True
+            scalar.masked = True
             scc = None
         elif m := match(r"s_and_saveexec_b64 (s\[\d+:\d+\]), (vcc|s\[\d+:\d+\])"):
             # A masked-if from a known full entry mask: the source must hold a tracked
@@ -3667,7 +3703,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
             region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False,
-                      "scalar_written": set(), "scc_written": False, "opener": "saveexec",
+                      "scalar_written": set(), "scc_written": False, "opener": "saveexec", "width": 64,
                       "arm_outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
@@ -3738,7 +3774,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             scalar[pair[0]] = scalar[pair[1]] = ("exec_saved",)
             region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False,
-                      "scalar_written": set(), "scc_written": False, "opener": "cmpx",
+                      "scalar_written": set(), "scc_written": False, "opener": "cmpx", "width": 64,
                       "arm_outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
@@ -3772,7 +3808,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             region = {"save": None, "cond": scc if m[1] == "0" else f"(!{scc})", "written": {}, "skip": None,
                       "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False, "scalar_written": set(), "scc_written": False,
-                      "opener": "scc", "end": end - 1 if join is not None else end, "join": join}
+                      "opener": "scc", "width": None, "end": end - 1 if join is not None else end, "join": join}
             vector.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
             # The whole-wave empty-mask skip may sit right after the save, or right after the else transition
@@ -3789,22 +3825,33 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             if restore is None or restore <= i:
                 raise ValueError("Execution skip targets no instruction boundary")
             target = instructions[restore][1] if isinstance(instructions[restore], tuple) else instructions[restore]
-            rm = re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)
-            if rm is None:
-                rm = re.fullmatch(r"s_mov_b64 exec, s\[(\d+):(\d+)\]", target)
-            if rm is None and region["else"] is None:
-                rm = re.fullmatch(r"s_andn2_b64 exec, s\[(\d+):(\d+)\], exec", target)
-            if rm is None or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
-                raise ValueError("Execution skip does not target the matching restore")
+            if region["width"] == 32:
+                # The wave32 close and else name one SGPR; it is compared as written, so any other register
+                # (also one out of range) is a mismatch.
+                rm = re.fullmatch(r"s_or_b32 exec_lo, exec_lo, (s\d+)|s_mov_b32 exec_lo, (s\d+)", target)
+                if rm is None and region["else"] is None:
+                    rm = re.fullmatch(r"s_andn2_b32 exec_lo, (s\d+), exec_lo", target)
+                if rm is None or [next(g for g in rm.groups() if g)] != region["save"]:
+                    raise ValueError("Execution skip does not target the matching restore")
+            else:
+                rm = re.fullmatch(r"s_or_b64 exec, exec, s\[(\d+):(\d+)\]", target)
+                if rm is None:
+                    rm = re.fullmatch(r"s_mov_b64 exec, s\[(\d+):(\d+)\]", target)
+                if rm is None and region["else"] is None:
+                    rm = re.fullmatch(r"s_andn2_b64 exec, s\[(\d+):(\d+)\], exec", target)
+                if rm is None or [f"s{n}" for n in registers(*rm.groups(), 2)] != region["save"]:
+                    raise ValueError("Execution skip does not target the matching restore")
             region["skip"] = restore
             region["skipped"] = True
             seen_skip = True
-        elif region is not None and (m := match(r"s_andn2_b64 exec, (s\[\d+:\d+\]), exec")):
+        elif region is not None and (m := match(r"s_andn2_b64 exec, (s\[\d+:\d+\]), exec"
+                                                r"|s_andn2_b32 exec_lo, (s\d+), exec_lo")):
             # The else transition (issue #1315): EXEC becomes saved & ~EXEC, the saved lanes whose condition is
             # false. The else arm starts from the pre-region vector state; a register first defined by the then
             # arm is undefined there. A then-arm skip must land exactly here. s_andn2_b64 writes SCC from the new
-            # EXEC, which is untracked.
-            if (sgpr_pair(m[1]) != region["save"] or region["else"] is not None
+            # EXEC, which is untracked. The wave32 spelling (an s_and_saveexec_b32 region; the in-region filter
+            # admits each spelling only in a region of its width) names the one saved SGPR.
+            if ((sgpr_pair(m[1]) if m[1] else [m[2]]) != region["save"] or region["else"] is not None
                     or (region["skip"] is not None and region["skip"] != i)):
                 raise ValueError("Unexpected execution mask else transition")
             region["then"] = {dst: dict.get(vector, dst) for dst in region["written"]}
@@ -3828,6 +3875,11 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             close_region(i, sgpr_pair(m[1]))
             region = None
             # s_or_b64 writes SCC from the restored mask, a wave property the per-lane model cannot compute.
+            scc = None
+        elif region is not None and region["width"] == 32 and (m := match(r"s_or_b32 exec_lo, exec_lo, (s\d+)")):
+            close_region(i, [m[1]])
+            region = None
+            # s_or_b32 writes SCC from the restored mask, as s_or_b64 does.
             scc = None
         elif m := match(r"s_(cmov|not|brev)_b64 (s\[\d+:\d+\]), ([^,]+)"):
             op, dst, src = m.groups()
