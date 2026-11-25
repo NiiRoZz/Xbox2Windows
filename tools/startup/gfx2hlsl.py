@@ -2184,9 +2184,6 @@ class Stage:
             return self.set_v(reg_range(ops[0])[1], text.format(*args))
         if base in SCA:
             return self.scalar(base, ops)
-        if base == 'buffer_load_format_xyzw':
-            # Not translated: the four-component form has no startup request that needs it yet.
-            raise Unsupported('%s requires descriptor FORMAT and DST_SEL' % base)
         raise Unsupported(base)
 
     # VOP1/VOP2 with DPP16 quad broadcast (#2125 item A): quad_perm:[k,k,k,k] makes every lane read SRC0 from
@@ -3287,12 +3284,13 @@ class Stage:
         return False
 
     def mubuf_format(self, ops, mods, count):
-        """buffer_load_format_x/xy/xyz: FORMAT and DST_SEL come from word 3 of the descriptor, known at draw time.
+        """buffer_load_format_x/xy/xyz/xyzw: FORMAT and DST_SEL come from word 3 of the descriptor, known at draw time.
 
         The runtime passes that word as an entry constant. Each supported format becomes one case of a switch
         on the FORMAT field that decodes the four components as the tbuffer path does; DST_SEL then picks, for
-        each destination register, a component or the constant 0 or 1. The draw validates FORMAT and descriptor
-        availability before submission, so the generated switch only sees the supported cases.
+        each destination register, a component or the constant 0 or 1. The draw builds the word from a hardware
+        descriptor or from the title's typed buffer view (src/startup_stubs/buffer_format_word3.h) and refuses the
+        draw when it has none or the FORMAT has no case here, so the default arm is not reached from a draw.
         """
         if self.kind not in ('vs', 'ps'):
             raise Unsupported('formatted buffer load requires a graphics draw')
@@ -3334,6 +3332,9 @@ class Stage:
 
     def op_buffer_load_format_xyz(self, ops, mods):
         self.mubuf_format(ops, mods, 3)
+
+    def op_buffer_load_format_xyzw(self, ops, mods):
+        self.mubuf_format(ops, mods, 4)
 
     def op_tbuffer_load_format_x(self, ops, mods):
         self.tbuffer(ops, mods, 1)
