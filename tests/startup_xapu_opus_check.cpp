@@ -156,6 +156,26 @@ void decode_stream(const char* label, std::uint32_t slot, int rate, int channels
     }
 }
 
+// Decodes one mono packet through XApu and through `ref` (a fresh decoder when null); true when both agree.
+bool mono_matches(std::uint32_t slot, int rate, std::uint32_t frames, const std::vector<unsigned char>& packet,
+                  OpusDecoder* ref)
+{
+    int error = OPUS_OK;
+    OpusDecoder* fresh = ref ? nullptr : opus_decoder_create(rate, 1, &error);
+    OpusDecoder* dec = ref ? ref : fresh;
+    if (!dec) return false;
+    auto out = filled(frames);
+    std::vector<float> want(frames);
+    const auto cmd = decode_cmd(slot, static_cast<float>(rate), frames, packet.data(),
+                                static_cast<std::uint32_t>(packet.size()), out.data(), frames * 4);
+    const bool ok = enqueue(handle, cmd.data(), 0, 0) == hr_ok && pop().bytes == frames * 4 &&
+                    opus_decode_float(dec, packet.data(), static_cast<opus_int32>(packet.size()), want.data(),
+                                      static_cast<int>(frames), 0) == static_cast<int>(frames) &&
+                    std::memcmp(out.data(), want.data(), frames * sizeof(float)) == 0;
+    if (fresh) opus_decoder_destroy(fresh);
+    return ok;
+}
+
 void expect_refused(const char* label, long want, const std::array<unsigned char, 0x60>& cmd,
                     const std::vector<float>& out)
 {
@@ -196,6 +216,23 @@ int main(int argc, char** argv)
     // 20 ms mono tone at 48 kHz: 960 frames * 1 channel * 4 bytes.
     const auto mono = tone_packets(48000, 1, 960, 3);
     decode_stream("48 kHz mono 20 ms packets decode to 3840 bytes, bit-exact", 7, 48000, 1, 960, mono, 960, ref_mono);
+    // Full queue: decode, reset and close are refused before they touch the slot's decoder.
+    {
+        bool filled_up = true;
+        for (std::uint32_t i = 0; i < 16384 && filled_up; ++i) filled_up = enqueue(handle, plain_cmd(4, 99).data(), 0, 0) == hr_ok;
+        check(filled_up && get_count(handle, 0) == 16384, "queue fills to 16384 entries");
+        auto out = filled(960);
+        const auto cmd = decode_cmd(7, 48000.0f, 960, mono[0].data(), static_cast<std::uint32_t>(mono[0].size()), out.data(), 3840);
+        check(enqueue(handle, cmd.data(), 0, 0) == static_cast<long>(0x8007000E) && untouched(out),
+              "full queue: decode -> E_OUTOFMEMORY, output untouched");
+        check(enqueue(handle, plain_cmd(5, 7).data(), 0, 0) == static_cast<long>(0x8007000E) &&
+                  enqueue(handle, plain_cmd(2, 7).data(), 0, 0) == static_cast<long>(0x8007000E),
+              "full queue: reset and close -> E_OUTOFMEMORY");
+        bool drained = true;
+        while (drained && get_count(handle, 0)) drained = pop().type == 4;
+        check(drained && get_count(handle, 0) == 0, "full queue drains");
+        check(mono_matches(7, 48000, 960, mono[0], ref_mono), "after the full-queue refusals slot 7 continues its stream");
+    }
     {
         auto out = filled(960);
         const auto cmd = decode_cmd(7, 48000.0f, 960, mono[2].data(), static_cast<std::uint32_t>(mono[2].size()),
@@ -204,12 +241,16 @@ int main(int argc, char** argv)
         double energy = 0;
         for (float s : out) energy += static_cast<double>(s) * s;
         check(std::sqrt(energy / out.size()) > 0.1, "decoded tone is not silence (RMS > 0.1)");
+        std::vector<float> sync(960);  // keep the reference decoder on slot 7's stream
+        opus_decode_float(ref_mono, mono[2].data(), static_cast<opus_int32>(mono[2].size()), sync.data(), 960, 0);
+        check(std::memcmp(out.data(), sync.data(), sizeof(float) * 960) == 0, "mono tone decodes again, bit-exact");
     }
     decode_stream("48 kHz stereo 20 ms packets decode to 7680 bytes, bit-exact", 8, 48000, 2, 960,
                   tone_packets(48000, 2, 960, 3), 960, ref_stereo);
     // 10 ms packet in a 960-frame buffer: the result carries the decoded count, not the capacity.
+    const auto short_packets = tone_packets(48000, 1, 480, 4);
     decode_stream("10 ms packets in a 20 ms buffer report 1920 bytes", 9, 48000, 1, 960,
-                  tone_packets(48000, 1, 480, 3), 480, ref_10ms);
+                  {short_packets.begin(), short_packets.begin() + 3}, 480, ref_10ms);
     decode_stream("16 kHz mono 20 ms packets decode to 1280 bytes, bit-exact", 10, 16000, 1, 320,
                   tone_packets(16000, 1, 320, 3), 320, ref_16k);
 
@@ -266,21 +307,36 @@ int main(int argc, char** argv)
         check(r.type == 3 && r.slot == 13 && r.bytes == 0 && untouched(out), "no-packet command completes with 0 bytes");
     }
 
-    // Close (2) drops slot 7's decoder: the next packet decodes like a fresh decoder, not a continuation.
+    // Reset (5) and close (2) each leave slot 7 decoding like a fresh decoder, not a continuation.
     {
+        check(mono_matches(7, 48000, 960, mono[1], ref_mono), "slot 7 continues before reset");
         check(enqueue(handle, plain_cmd(5, 7).data(), 0, 0) == hr_ok, "reset slot 7 accepted");
+        const Result reset = pop();
+        check(reset.type == 5 && reset.slot == 7, "reset result queued");
+        check(mono_matches(7, 48000, 960, mono[1], nullptr), "decode after reset matches a fresh decoder");
+        check(mono_matches(7, 48000, 960, mono[2], nullptr) == false, "control: a used decoder differs from a fresh one");
         check(enqueue(handle, plain_cmd(2, 7).data(), 0, 0) == hr_ok, "close slot 7 accepted");
-        const Result reset = pop(), close = pop();
-        check(reset.type == 5 && reset.slot == 7 && close.type == 2 && close.slot == 7, "reset and close results queued");
-        OpusDecoder* fresh = opus_decoder_create(48000, 1, &error);
+        const Result close = pop();
+        check(close.type == 2 && close.slot == 7, "close result queued");
+        check(mono_matches(7, 48000, 960, mono[1], nullptr), "decode after close matches a fresh decoder");
+    }
+
+    // A new rate on a live slot starts a new decoder; a failed decode at a new rate keeps the old one.
+    {
+        const auto low = tone_packets(16000, 1, 320, 1);
+        check(mono_matches(7, 16000, 320, low[0], nullptr), "slot 7 at 16 kHz decodes like a fresh 16 kHz decoder");
+        const unsigned char bad[] = {0x03, 0x00};
         auto out = filled(960);
+        expect_refused("malformed packet at a new rate -> E_FAIL", hr_fail,
+                       decode_cmd(9, 16000.0f, 320, bad, sizeof(bad), out.data(), 1280), out);
+        auto out9 = filled(960);
         std::vector<float> want(960);
-        const auto cmd = decode_cmd(7, 48000.0f, 960, mono[1].data(), static_cast<std::uint32_t>(mono[1].size()), out.data(), 3840);
-        check(enqueue(handle, cmd.data(), 0, 0) == hr_ok && pop().bytes == 3840, "slot 7 decodes after close");
-        check(fresh && opus_decode_float(fresh, mono[1].data(), static_cast<opus_int32>(mono[1].size()), want.data(), 960, 0) == 960 &&
-                  std::memcmp(out.data(), want.data(), sizeof(float) * 960) == 0,
-              "decode after close matches a fresh decoder");
-        if (fresh) opus_decoder_destroy(fresh);
+        const auto& p = short_packets[3];
+        const auto cmd = decode_cmd(9, 48000.0f, 960, p.data(), static_cast<std::uint32_t>(p.size()), out9.data(), 3840);
+        check(enqueue(handle, cmd.data(), 0, 0) == hr_ok && pop().bytes == 1920 &&
+                  opus_decode_float(ref_10ms, p.data(), static_cast<opus_int32>(p.size()), want.data(), 960, 0) == 480 &&
+                  std::memcmp(out9.data(), want.data(), 480 * sizeof(float)) == 0,
+              "after the failed decode slot 9 continues its 48 kHz stream");
     }
 
     // Typed completions off: type 3 queues the zeroed result and decodes nothing.

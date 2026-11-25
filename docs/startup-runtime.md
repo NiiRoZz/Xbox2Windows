@@ -2097,9 +2097,11 @@ completions on, a type `3` command then decodes one Opus packet. The command fie
 size when the packet holds fewer frames. Each slot keeps its own decoder; type `5` resets it and type `2` frees it,
 as does `XApuDisconnect`. A command with no packet (null pointer and 0 bytes) completes with 0 bytes, as without
 libopus. Any other invalid field (rate, channel count, frames over 5760, packet over 64 KiB, unreadable packet,
-unwritable output, slot 256 or above) returns `E_INVALIDARG`, a packet that libopus rejects returns `E_FAIL`, and a
-command shorter than `0x40` readable bytes returns `E_POINTER`. A refused command queues no result and leaves the
-output untouched; decoding goes through a scratch buffer and is copied out only once the result is queued.
+unwritable output, slot 256 or above) returns `E_INVALIDARG`. A packet that libopus rejects, or one holding more
+frames than `+0x24`, returns `E_FAIL`, and a command shorter than `0x40` readable bytes returns `E_POINTER`. A full
+queue returns `E_OUTOFMEMORY` before any decode, reset or close. A refused command queues no result, leaves the
+output untouched and keeps the slot's decoder; decoding goes through a scratch buffer and is copied out only once
+the result is queued.
 
 ```powershell
 cmake --preset dev -DX2W_WITH_OPUS=ON -DOpus_DIR=<libopus install>/lib/cmake/Opus
@@ -2110,8 +2112,9 @@ ctest --preset dev --no-tests=error -R '^startup_xapu_(queue|opus)$' -V
 `startup_xapu_opus` encodes generated 1 kHz tones with the same libopus and checks exact byte counts (3840 for
 48 kHz mono, 7680 for stereo, 1920 for a 10 ms packet in a 20 ms buffer, 1280 for 16 kHz), bit-exact PCM against
 a reference decoder, untouched guard floats past the decoded frames, a malformed packet, each refusal above with
-an untouched output and an empty queue, decoding after close, and that type `3` decodes nothing with typed
-completions off. It is registered only in the optional build.
+an untouched output and an empty queue, a full queue that leaves the slot's stream intact, reset and close each
+starting a fresh decoder, a rate change on a live slot, and that type `3` decodes nothing with typed completions
+off. It is registered only in the optional build.
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),

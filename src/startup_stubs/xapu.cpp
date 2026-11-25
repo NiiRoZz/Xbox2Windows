@@ -80,7 +80,8 @@ Connection* connections = nullptr;
 u64 next_handle = 0x5841500000000001ULL;
 bool timer_active = false;
 
-bool push_result(Connection& conn, QueueEntry entry) noexcept
+// Makes room for one more entry, so a following place_result cannot fail.
+bool reserve_result(Connection& conn) noexcept
 {
     if (conn.count >= max_queue_entries) return false;
     if (conn.count == conn.capacity) {
@@ -96,8 +97,19 @@ bool push_result(Connection& conn, QueueEntry entry) noexcept
         conn.head = 0;
         conn.capacity = next_cap;
     }
+    return true;
+}
+
+void place_result(Connection& conn, QueueEntry entry) noexcept
+{
     conn.entries[(conn.head + conn.count) % conn.capacity] = entry;
     ++conn.count;
+}
+
+bool push_result(Connection& conn, QueueEntry entry) noexcept
+{
+    if (!reserve_result(conn)) return false;
+    place_result(conn, entry);
     return true;
 }
 
@@ -171,24 +183,30 @@ long decode_packet(Connection& conn, const unsigned char* c, std::uint32_t& byte
         !x2w_local::readable(reinterpret_cast<const void*>(packet), packet_bytes) ||
         !x2w_local::writable(reinterpret_cast<const void*>(out), out_bytes))
         return hr_invalid_arg;
+    // A new rate or channel count gets a new decoder, which replaces the slot's only after a good decode.
     SlotDecoder& d = conn.decoders[slot];
-    if (d.decoder && (d.channels != static_cast<int>(channels) || d.rate != rate)) {
-        opus_decoder_destroy(d.decoder);
-        d = SlotDecoder{};
-    }
-    if (!d.decoder) {
+    OpusDecoder* decoder = d.decoder;
+    const bool fresh = !decoder || d.channels != static_cast<int>(channels) || d.rate != rate;
+    if (fresh) {
         int error = OPUS_OK;
-        OpusDecoder* created = opus_decoder_create(rate, static_cast<int>(channels), &error);
-        if (!created || error != OPUS_OK) return hr_out_of_memory;
-        d = SlotDecoder{created, static_cast<int>(channels), rate};
+        decoder = opus_decoder_create(rate, static_cast<int>(channels), &error);
+        if (!decoder || error != OPUS_OK) {
+            if (decoder) opus_decoder_destroy(decoder);
+            return hr_out_of_memory;
+        }
     }
-    const int decoded = opus_decode_float(d.decoder, reinterpret_cast<const unsigned char*>(packet),
+    const int decoded = opus_decode_float(decoder, reinterpret_cast<const unsigned char*>(packet),
                                           static_cast<opus_int32>(packet_bytes), scratch, static_cast<int>(frames), 0);
     if (decoded < 0) {
+        if (fresh) opus_decoder_destroy(decoder);
         static LONG errors;
         if (x2w_local::first_calls(errors, 8))
             x2w_local::logf("x2w-audio XApu decode slot=%u bytes=%u -> opus error %d", slot, packet_bytes, decoded);
         return hr_fail;
+    }
+    if (fresh) {
+        if (d.decoder) opus_decoder_destroy(d.decoder);
+        d = SlotDecoder{decoder, static_cast<int>(channels), rate};
     }
     bytes = static_cast<std::uint32_t>(decoded) * channels * 4u;
     *pcm = scratch;
@@ -325,14 +343,17 @@ extern "C" __declspec(noinline) long XApuEnqueueCommand(u64 rcx, u64 rdx, u64 r8
 #ifdef X2W_HAVE_OPUS
         const float* pcm = nullptr;
         void* dest = nullptr;
-        hr = hr_ok;
-        if (decode) {
+        // Queue room first, so a refused command changes no decoder state.
+        hr = reserve_result(*conn) ? hr_ok : hr_out_of_memory;
+        if (hr == hr_ok && decode) {
             hr = decode_packet(*conn, reinterpret_cast<const unsigned char*>(rdx), entry.value, &pcm, &dest);
-        } else if (entry.type == 2 || entry.type == 5) {
+        } else if (hr == hr_ok && (entry.type == 2 || entry.type == 5)) {
             drop_decoder(*conn, entry.slot, entry.type == 2);
         }
-        if (hr == hr_ok) hr = push_result(*conn, entry) ? hr_ok : hr_out_of_memory;
-        if (hr == hr_ok && pcm) std::memcpy(dest, pcm, entry.value);
+        if (hr == hr_ok) {
+            place_result(*conn, entry);
+            if (pcm) std::memcpy(dest, pcm, entry.value);
+        }
 #else
         hr = push_result(*conn, entry) ? hr_ok : hr_out_of_memory;
 #endif
