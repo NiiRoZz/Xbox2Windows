@@ -6,6 +6,7 @@ values (tables, vertex-buffer table, root buffers) turn into HLSL resources inst
 The output is HLSL for both stages plus a manifest that tells the runtime what to bind where.
 """
 from contextlib import suppress
+import functools
 import os
 import re
 import struct
@@ -434,15 +435,21 @@ def split_top(text, sep=','):
     return parts
 
 
-def parse(asm):
-    """-> (mnemonic, [operands], [modifier tokens])"""
+@functools.lru_cache(maxsize=None)
+def parse_cached(asm):
     name, _, rest = asm.partition(' ')
     ops = split_top(rest)
     mods = []
     if ops:
         tail = split_top(ops[-1], ' ')
         ops[-1], mods = tail[0], tail[1:]
-    return name, ops, mods
+    return name, tuple(ops), tuple(mods)
+
+
+def parse(asm):
+    """-> (mnemonic, [operands], [modifier tokens]); the analysis passes parse each instruction many times."""
+    name, ops, mods = parse_cached(asm)
+    return name, list(ops), list(mods)
 
 
 FLOATS = {'0.5': 0.5, '-0.5': -0.5, '1.0': 1.0, '-1.0': -1.0, '2.0': 2.0, '-2.0': -2.0, '4.0': 4.0, '-4.0': -4.0,
@@ -453,6 +460,7 @@ def fbits(x):
     return struct.unpack('<I', struct.pack('<f', x))[0]
 
 
+@functools.lru_cache(maxsize=None)
 def reg_range(tok):
     """'s[8:11]' -> ('s', 8, 11); 's8' -> ('s', 8, 8); 'v[1:3]' -> ('v', 1, 3); 'exec'/'vcc' pairs too."""
     m = re.fullmatch(r'([sv])\[(\d+):(\d+)\]', tok)
