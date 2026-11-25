@@ -9466,7 +9466,9 @@ count, so the decoder runs them side by side.
 `decode_lanes` uses an AVX2 path (16 lanes as two 8-lane halves) when `cpuid` reports AVX, AVX2 and
 POPCNT and the OS saves the YMM state. Otherwise it uses a scalar loop that runs both phases of a cycle
 in one pass. On every path, header bytes, fragment ends and flushes go through the original per-lane
-step. The original loop is kept as `decode_lanes_reference` for tests.
+step. The original loop is kept as `decode_lanes_reference` for tests. The SIMD code is compiled only by
+MSVC for x64; a clang-cl build has only the scalar path, and its AVX2 tests report 77 with that reason
+rather than a CPU limit.
 
 Each path has its own tests: `bcpack_lanes_scalar`, `bcpack_lanes_avx2` and their
 `bcpack_lanes_python_*` counterparts. A path test compares only that path with the reference and

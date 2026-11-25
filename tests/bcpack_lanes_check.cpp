@@ -476,17 +476,24 @@ int main(int argc, char** argv) {
     for (int p = 0; p < LANE_PATH_COUNT; ++p) std::printf(" %s%s", PATH_NAMES[p], lane_path_supported(p) ? "" : " (not supported)");
     std::printf("; decode_lanes uses %s\n", PATH_NAMES[best_lane_path()]);
     if (only_path >= 0 && !lane_path_supported(only_path)) {
-        std::printf("capability skip: the %s path is not supported here\n", PATH_NAMES[only_path]);
+#ifdef X2W_BCPACK_LANE_SIMD
+        std::printf("capability skip: this CPU or OS lacks the %s path\n", PATH_NAMES[only_path]);
+#else
+        std::printf("capability skip: the %s path is not compiled (it needs MSVC for x64, not clang-cl)\n",
+                    PATH_NAMES[only_path]);
+#endif
         return 77;
     }
     const std::vector<Stream> list = streams(argv[1], do_bench, large);
     if (do_bench) return bench(list);
     if (emit_file) return emit(list, emit_file);
 
-    if (check_interval() != 0 || check_anchors(argv[1], consumer) != 0) return 1;
+    // The sweep runs even when an anchor fails, so a control build shows that both catch it.
+    const bool anchors_ok = check_interval() == 0 && check_anchors(argv[1], consumer) == 0;
     Checker checker;
     for (const Stream& s : list) checker.sweep(s, full);
     std::printf("%zu streams compared (%zu accepted, %zu rejected by the reference; %zu damaged streams accepted), %d mismatches\n",
                 checker.compared, checker.accepted, checker.rejected, checker.damaged_accepted, checker.failures);
-    return checker.failures == 0 ? 0 : 1;
+    std::printf("result: anchors %s, %d mismatches\n", anchors_ok ? "passed" : "failed", checker.failures);
+    return anchors_ok && checker.failures == 0 ? 0 : 1;
 }

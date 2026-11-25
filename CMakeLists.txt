@@ -650,10 +650,13 @@ foreach(path IN LISTS bcpack_lane_paths)
                      "$<TARGET_FILE:bcpack_lanes_${variant}>" "${CMAKE_SOURCE_DIR}/tools/_bcpack_rans/vectors" --path ${path})
             list(APPEND bcpack_lane_tests ${name})
         endforeach()
-        set_tests_properties(bcpack_lanes_python_${path}_drain_control PROPERTIES WILL_FAIL TRUE)
+        set_tests_properties(bcpack_lanes_python_${path}_drain_control PROPERTIES
+            PASS_REGULAR_EXPRESSION "${path} path, [0-9]+ bytes, widths .*: Python accepts, C\\+\\+ rejects")
     endif()
     set_tests_properties(${bcpack_lane_tests} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
-    set_tests_properties(bcpack_lanes_${path}_drain_control PROPERTIES WILL_FAIL TRUE)
+    # Both the vector symbols and the reference sweep must catch the control build.
+    set_tests_properties(bcpack_lanes_${path}_drain_control PROPERTIES PASS_REGULAR_EXPRESSION
+        "${path} path: synthetic_11 lane [0-9]+ differs from the vector's symbols.*result: anchors failed, [1-9][0-9]* mismatches")
 endforeach()
 # A queue whose worker cannot start (both CreateThread attempts fail, or the construction of its work
 # throws std::bad_alloc) completes status entries and fences at Submit, never inside Enqueue (#1199).
