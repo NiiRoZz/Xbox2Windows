@@ -3839,7 +3839,7 @@ class Stage:
                 token, self.sym.get(sreg[1]) if sreg and sreg[0] == 's' else None)
             if (at and at[2] % 4 == 0 and (at[3] + extra) % 4 == 0  # a dword-aligned word for any root constant
                     and first[0] == 'desc' and key[0][0] == 'table' and key not in self.pipe.modified
-                    and all(self.sym.get(r[1] + n) == first[:3] + (first[3] + n,) for n in range(4))):
+                    and all(self.sym.get(r[1] + n) == first[:3] + (first[3] + n,) + first[4:] for n in range(4))):
                 where = key[0][1:] + key[1:] + at[:3] + (at[3] + extra,)
         # All words use the original offset, even when a destination overwrites its register.
         uniform = self.tracks_uniformity() and self.uniform_source(token)
