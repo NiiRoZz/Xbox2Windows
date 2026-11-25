@@ -301,12 +301,18 @@ def check_exec_join():
     # Accepted: the mask ANDed with exec at the target (either operand order), and ORed with its complement.
     hlsl = exec_join_hlsl(and_s16)
     assert "        pc = ((exec & 1) == 0) ? 2 : 1;" in hlsl and '        s16 = (s16 & exec) & 1;' in hlsl, hlsl
-    assert '        s16 = (exec & s16) & 1;' in exec_join_hlsl(sop2(S_AND_B64, 16, EXEC, 16))
-    assert '        s16 = (s16 | ~exec) & 1;' in exec_join_hlsl(sop2(S_ORN2_B64, 16, 16, EXEC))
-    # The emitted results with exec bit 0, the only case in which s16 may not hold the register: every word of
-    # s16 gives 0 for the AND and 1 for the OR with the complement.
+    swapped, orn2 = exec_join_hlsl(sop2(S_AND_B64, 16, EXEC, 16)), exec_join_hlsl(sop2(S_ORN2_B64, 16, 16, EXEC))
+    assert '        s16 = (exec & s16) & 1;' in swapped and '        s16 = (s16 | ~exec) & 1;' in orn2
+    # exec as the destination: the same statement, and the lane stays off on the skipping edge.
+    assert '        exec = (s16 & exec) & 1;' in exec_join_hlsl(sop2(S_AND_B64, EXEC, 16, EXEC), read='8002007e')
+    # The emitted right-hand sides with exec bit 0, the only case in which the variable s16 may not hold the
+    # register: every word of s16 gives 0 for the AND and 1 for the OR with the complement.
+    def rhs(text):
+        line, = (l for l in text if l.startswith('        s16 = ') and l.endswith(') & 1;'))
+        return line[len('        s16 = '):-1]
     for word in (0, 1, 3, 0x7ffffffe, 0xffffffff, 0x80000001):
-        assert (word & 0) & 1 == 0 and (0 & word) & 1 == 0 and (word | ~0) & 1 == 1
+        for text, want in ((hlsl, 0), (swapped, 0), (orn2, 1)):
+            assert eval(rhs(text), {'s16': word, 'exec': 0}) == want, (rhs(text), word)
     # Another destination: the result is read, and the source stays joined for the read after it.
     assert '        s32 = (s16 & exec) & 1;' in exec_join_hlsl(sop2(S_AND_B64, 32, 16, EXEC), read='2002007e')  # v0 = s32
     exec_join_refused(JOINED_S16, sop2(S_AND_B64, 32, 16, EXEC))
