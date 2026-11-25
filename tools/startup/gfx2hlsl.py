@@ -437,6 +437,17 @@ UNIFORM_VALU = frozenset((
 QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', (3, 2, 1, 0): 'QuadReadAcrossDiagonal'}
 
 
+# VALU forms whose second operand is an SGPR destination (VOP3b carry-out or scale flag), not a source.
+VOP3B_SDST = re.compile(r'v_(add|sub|subrev)_co(_ci)?_u32|v_div_scale_f(32|64)|v_mad_[iu]64_[iu]32')
+
+
+def writes_exec(name, ops):
+    """Conservatively: whether the instruction can write EXEC, explicitly or implicitly."""
+    r = reg_range(ops[0]) if ops else None
+    return bool(ops and ops[0] in ('exec', 'exec_lo', 'exec_hi') or r and r[0] == 's' and r[1] <= 127 and r[2] >= 126
+                or 'saveexec' in name or 'wrexec' in name or name.startswith(('v_cmpx', 's_movreld')))
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -584,6 +595,7 @@ class Stage:
     def set_v(self, n, expr):
         if hasattr(self, 'uniform_v'):
             self.uniform_v.discard(n)
+        self.last_v = (n, expr)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
 
@@ -645,6 +657,8 @@ class Stage:
                 self.varying_s.discard(n)
             else:
                 self.varying_s.add(n)
+            if getattr(self, 'since_join', None) is not None:
+                (self.since_join.add if uniform else self.since_join.discard)(n)
         getattr(self, 'masks', set()).discard(n)  # unit probes build a Stage without __init__
         if sym is not None:
             self.sym[n] = sym
@@ -700,6 +714,8 @@ class Stage:
         self.varying_s = set()
         self.scc_uniform = True
         self.has_branches = bool(targets)
+        self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
+        self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
         start = 0
         refusals = getattr(self, 'refusals', None)  # unit probes build a Stage without __init__
         for off, n, name, asm in self.ins:
@@ -711,6 +727,10 @@ class Stage:
             # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
             # branch-free program is past it too (dead code).
             self.past_entry = bool(self.blocks) or 0 in targets
+            if off in targets:
+                # A join: another path can reach here with other VGPR, SGPR and SCC values, so no proof survives.
+                self.uniform_v.clear()
+                self.since_join, self.scc_uniform = set(), False
             try:
                 term = self.one(name, asm)
             except Unsupported as reason:
@@ -742,6 +762,8 @@ class Stage:
                 return lo in self.uniform_v
             if lo in getattr(self, 'masks', ()):
                 return False
+            if getattr(self, 'since_join', None) is not None and lo not in self.since_join:
+                return False  # written before the last join: program-order tracking is not exact there
             sym = self.sym.get(lo)
             if sym:
                 return sym[0] in ('const', 'ud', 'fixed_buffer_word')
@@ -759,9 +781,14 @@ class Stage:
         base = re.sub(r'_e(32|64)$', '', name)
         # Compute the proof before lowering, since a destination can also be a source.
         dst = None
+        if self.tracks_uniformity() and hasattr(self, 'uniform_expr'):
+            self.forget_writes(name, ops)
         # Unit probes build a Stage without __init__: without the tracking state, prove nothing.
+        # Past the entry block of a program with branches the read recomputes the defining expression, so the
+        # proof no longer needs a known exec (see op_v_readfirstlane_b32).
         if (base in UNIFORM_VALU and ops and self.tracks_uniformity() and
-                not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False) and
+                (getattr(self, 'past_entry', False) and hasattr(self, 'uniform_expr') or
+                 not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False)) and
                 (not mods or (base in VEC_F or base in VEC_U_TO_F) and
                  all(m in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods))):
             candidate = reg_range(ops[0])
@@ -771,9 +798,19 @@ class Stage:
                     sources = [re.sub(r'^-(?=[^\d.])', '', tok).strip('|') for tok in sources]
                 if sources and all(self.uniform_source(tok) for tok in sources):
                     dst = candidate[1]
+        self.last_v = None
         term = self.lower(base, asm, ops, mods)
         if dst is not None:
             self.uniform_v.add(dst)
+            if hasattr(self, 'uniform_expr'):
+                # Proven sources are scalars, constants and VGPRs; each VGPR needs its own current expression.
+                expr = self.last_v[1] if self.last_v and self.last_v[0] == dst else None
+                vs = [int(n) for n in re.findall(r'\bv(\d+)\b', expr or '')]
+                if expr is None or any(n not in self.uniform_expr for n in vs):
+                    self.uniform_expr.pop(dst, None)
+                else:
+                    self.uniform_expr[dst] = re.sub(r'\bv(\d+)\b', lambda m: '(%s)' % self.uniform_expr[int(m[1])],
+                                                    expr)
         return term
 
     def dpp_pair(self, base, asm, ops, mods):
@@ -821,6 +858,28 @@ class Stage:
                   % ((word,) * 4 + (DPP_SCRATCH,) + perm))
         ops = [ops[0], '%sv%d%s' % (src.group(1), DPP_SCRATCH, src.group(3))] + ops[2:]
         return self.lower(base, asm, ops, [])
+
+    def forget_writes(self, name, ops):
+        """Before an instruction runs: an EXEC write ends every recomputable expression, and an SGPR write ends the
+        expressions that read it and that SGPR's since-join mark (set_s marks it again when it proves the new value).
+        The VGPR proofs stay: the entry-block read copies the VGPR, which neither write changes."""
+        if writes_exec(name, ops):
+            self.uniform_expr.clear()
+        if not ops or name.startswith(('s_cmp', 's_bitcmp')):
+            return
+        written = [ops[0]] + ([ops[1]] if len(ops) > 1 and VOP3B_SDST.match(name) else [])
+        regs = set(range(128)) if name.startswith('s_movreld') else set()  # M0 picks the destination
+        for tok in written:
+            r = reg_range(tok)
+            if r and r[0] == 's':
+                regs.update(range(r[1], r[2] + 1))
+        if not regs:
+            return
+        if self.since_join is not None:
+            self.since_join -= regs
+        for v in [v for v, expr in self.uniform_expr.items()
+                  if regs & {int(n) for n in re.findall(r'\bs(\d+)\b', expr)}]:
+            del self.uniform_expr[v]
 
     def lower(self, base, asm, ops, mods):
         if getattr(self, 'fetched', False):  # unit probes build a Stage without __init__
@@ -1855,11 +1914,20 @@ class Stage:
 
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
-        if (mods or not self.tracks_uniformity() or getattr(self, 'past_entry', True) or
-                not getattr(self, 'exec_known', False) or not dst or dst[0] != 's' or dst[1] != dst[2] or
-                not src or src[0] != 'v' or src[1] != src[2] or src[1] not in self.uniform_v):
+        past_entry = getattr(self, 'past_entry', True)
+        # Past the entry block of a branch-free program is only dead code after s_endpgm: nothing to recompute.
+        if (mods or not self.tracks_uniformity() or not dst or dst[0] != 's' or dst[1] != dst[2] or
+                not src or src[0] != 'v' or src[1] != src[2] or src[1] not in self.uniform_v or
+                (src[1] not in getattr(self, 'uniform_expr', {}) or not getattr(self, 'has_branches', False)
+                 if past_entry else not getattr(self, 'exec_known', False))):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
-        self.set_s(reg_range(ops[0])[1], self.u(ops[1]))
+        if past_entry:
+            # The first active lane ran the definition: no join, EXEC write or overwrite of the VGPR and no write
+            # of a scalar it read lies between them. A lane inactive at the definition kept an older VGPR value,
+            # so the read recomputes the definition from the scalars instead of reading this lane's copy.
+            self.set_s(dst[1], self.uniform_expr[src[1]])
+        else:
+            self.set_s(dst[1], self.u(ops[1]))
 
     def op_v_mov_b32(self, ops, mods):
         self.set_v(reg_range(ops[0])[1], self.u(ops[1]))
@@ -1881,6 +1949,9 @@ class Stage:
         uniform = (dst in self.uniform_v and self.exec_known, src in self.uniform_v and self.exec_known)
         for reg, flag in zip((src, dst), uniform):
             (self.uniform_v.add if flag else self.uniform_v.discard)(reg)
+        exprs = getattr(self, 'uniform_expr', {})
+        moved = {src: exprs.pop(dst, None), dst: exprs.pop(src, None)}
+        exprs.update({reg: e for reg, e in moved.items() if e is not None and reg in self.uniform_v})
         self.used_v.update((dst, src))
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
 
