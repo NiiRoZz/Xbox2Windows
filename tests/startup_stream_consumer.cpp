@@ -168,6 +168,7 @@ static void* desktop_pipeline(void* device)
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
 static void* slot67_pipeline;
 static void* slot67_root;
+static void* slot67_other_root;  // a second root signature object, for the root-change controls
 
 // A console resource through device slot 127 (CreateCommittedResource3).
 static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state)
@@ -181,7 +182,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
     return SUCCEEDED(hr) ? resource : nullptr;
 }
 
-// Case A of startup_gfx2hlsl_compute_check.py through the stand-in's own list: two root constants (slot 39), a
+// Case A of startup_gfx2hlsl_compute_check.py through the stand-in's own list: two root constants (word 0 by slot
+// 37, word 1 by slot 39; a slot 40 call with other words in between must not reach them), a
 // table (slot 35) of two 16-byte hardware buffer descriptors written into the title heap's memory, and Dispatch
 // (slot 14) of 3x2x2 groups with the slot 67 placeholder bound. Input and output are placed buffers 64 KiB apart
 // in one allocation, so both alias this process's memory and the result is read from that memory after the queue's
@@ -194,6 +196,10 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // 32-byte heap record that holds the input descriptor (heap byte 64). Heap bytes 0 and 32 hold the output's
 // descriptor, so an index that is ignored or scaled by 16 names a buffer the dispatch refuses as an input.
 // dispatch-heap-outside sets the constant to 0x07ffffff, whose record is past any heap.
+// Controls on the recorded state: dispatch-missing-word leaves out the slot 37 call; dispatch-root-changed sets
+// another compute root and the first one again after the constants, dispatch-same-root sets the same root again;
+// dispatch-reset closes and resets the list after the constants; dispatch-wrong-root records under the other
+// root; dispatch-same-buffer names the output buffer as the input too.
 static int dispatch_slot67(void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
@@ -212,7 +218,7 @@ static int dispatch_slot67(void* device, const std::string& mode)
             D3D12_TEXTURE_LAYOUT_ROW_MAJOR, i ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
         if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(buffers[i]), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
                 word(&__uuidof(ID3D12Resource)), word(&placed[i]))))) return 71;
-        const UINT64 address = reinterpret_cast<UINT64>(buffers[i]);
+        const UINT64 address = reinterpret_cast<UINT64>(buffers[mode == "dispatch-same-buffer" ? 1 : i]);
         const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | 4u << 16, words, 0};
         std::memcpy(descriptors[mode == "dispatch-swapped" ? 1 - i : i], view, sizeof(view));
     }
@@ -221,11 +227,13 @@ static int dispatch_slot67(void* device, const std::string& mode)
         UINT64 backing, bytes;
     } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
     void *heap = nullptr, *queue = nullptr, *allocator = nullptr, *list = nullptr, *fence = nullptr;
-    const D3D12_COMMAND_QUEUE_DESC queue_desc{};
-    const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    // dispatch-sampled-compute records the same calls on a compute list and queue.
+    const D3D12_COMMAND_LIST_TYPE list_type = mode == "dispatch-sampled-compute" ? D3D12_COMMAND_LIST_TYPE_COMPUTE : D3D12_COMMAND_LIST_TYPE_DIRECT;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{list_type};
+    const UINT list_desc[]{static_cast<UINT>(list_type), 2, 1, 0};
     if (FAILED(static_cast<HRESULT>(invoke(device, 14, word(&heap_desc), word(&__uuidof(ID3D12DescriptorHeap)), word(&heap)))) ||
         FAILED(static_cast<HRESULT>(invoke(device, 8, word(&queue_desc), word(&__uuidof(ID3D12CommandQueue)), word(&queue)))) ||
-        FAILED(static_cast<HRESULT>(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&__uuidof(ID3D12CommandAllocator)), word(&allocator)))) ||
+        FAILED(static_cast<HRESULT>(invoke(device, 9, list_type, word(&__uuidof(ID3D12CommandAllocator)), word(&allocator)))) ||
         FAILED(static_cast<HRESULT>(invoke(device, 73, word(list_desc), word(allocator), 0, word(&__uuidof(ID3D12GraphicsCommandList)), word(&list)))) ||
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence))))) return 72;
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
@@ -236,8 +244,14 @@ static int dispatch_slot67(void* device, const std::string& mode)
         for (const UINT at : {0u, 32u, 64u})
             std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64], sizeof(descriptors[0]));
     const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : 2u};
+    const UINT graphics[2] = {0xdeadbeef, 0xfeedface};
+    const auto bind = [&] {
+        invoke(list, 32, 1, word(&heap));
+        invoke(list, 25, word(slot67_pipeline));
+        invoke(list, 33, word(mode == "dispatch-wrong-root" ? slot67_other_root : slot67_root));
+    };
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
-    invoke(list, 32, 1, word(&heap));
+    bind();
     if (mode.rfind("dispatch-sampled", 0) == 0) {
         const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, 1, 1, 1, 1, DXGI_FORMAT_R8G8B8A8_UNORM, {1, 0}};
         const D3D12_RESOURCE_DESC upload_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, 256, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -255,11 +269,18 @@ static int dispatch_slot67(void* device, const std::string& mode)
         invoke(list, 16, word(&image), 0, 0, 0, word(&source), 0);
         D3D12_SHADER_RESOURCE_VIEW_DESC view{DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
         view.Texture2D.MipLevels = 1;
-        if (mode == "dispatch-sampled") invoke(device, 18, word(texture), word(&view), cpu + 64);
+        if (mode != "dispatch-sampled-unbound") invoke(device, 18, word(texture), word(&view), cpu + 64);
     }
-    invoke(list, 25, word(slot67_pipeline));
-    invoke(list, 33, word(slot67_root));
-    invoke(list, 39, 0, heap_record ? 3 : 2, word(constants), 0);
+    if (mode != "dispatch-missing-word") invoke(list, 37, 0, constants[0], 0);
+    invoke(list, 40, 0, 2, word(graphics), 0);
+    invoke(list, 39, 0, 1, word(&constants[1]), 1);
+    if (mode == "dispatch-root-changed") invoke(list, 33, word(slot67_other_root));
+    if (mode == "dispatch-root-changed" || mode == "dispatch-same-root") invoke(list, 33, word(slot67_root));
+    if (mode == "dispatch-reset") {
+        if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+        bind();
+    }
+    if (heap_record) invoke(list, 39, 0, 1, word(&constants[2]), 2);
     invoke(list, 35, 1, gpu);
     if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
@@ -284,7 +305,8 @@ static int dispatch_slot67(void* device, const std::string& mode)
 // unordered access view of it (device slot 19) whose token the stand-in writes into the title heap at table byte 64,
 // three root constants, Dispatch of 2x1x1 groups, and the texture copied to a readback buffer whose 1024 halves go
 // to X2W_TEST_DISPATCH_OUT. texture-store-none records no Dispatch; texture-store-denied creates the texture
-// without unordered access, so the stand-in records its view as not created.
+// without unordered access, so the stand-in records its view as not created. texture-store-uint makes the texture
+// and its view RGBA16_UINT; texture-store-self also creates a shader resource view of the texture at table byte 0.
 static int texture_slot67(void* device, const std::string& mode)
 {
     constexpr UINT width = 32, height = 8, pitch = width * 8, bytes = pitch * height;
@@ -292,7 +314,8 @@ static int texture_slot67(void* device, const std::string& mode)
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
         return make_committed(device, type, desc, state);
     };
-    const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    const DXGI_FORMAT format = mode == "texture-store-uint" ? DXGI_FORMAT_R16G16B16A16_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, format,
         {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         mode == "texture-store-denied" ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     const D3D12_RESOURCE_DESC buffer_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -318,11 +341,14 @@ static int texture_slot67(void* device, const std::string& mode)
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence))))) return 72;
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
-    const D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D};
+    const D3D12_UNORDERED_ACCESS_VIEW_DESC view{format, D3D12_UAV_DIMENSION_TEXTURE2D};
     invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
+    D3D12_SHADER_RESOURCE_VIEW_DESC read{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    read.Texture2D.MipLevels = 1;
+    if (mode == "texture-store-self") invoke(device, 18, word(texture), word(&read), cpu);
     D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    source.PlacedFootprint = {0, {DXGI_FORMAT_R16G16B16A16_FLOAT, width, height, 1, pitch}};
+    source.PlacedFootprint = {0, {format, width, height, 1, pitch}};
     D3D12_TEXTURE_COPY_LOCATION result = source;
     result.pResource = static_cast<ID3D12Resource*>(readback);
     const UINT constants[3] = {1, 2, 3};
@@ -360,6 +386,7 @@ static bool create_slot67(void* device, const char* code_path, const char* data_
     std::vector<char> state{std::istreambuf_iterator<char>(state_file), {}};
     if (code.empty() || data.empty() || state.empty() || !stream_root_signature()) return false;
     void* root = stream_root_signature();
+    slot67_other_root = root;
     char root_path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_COMPUTE_ROOT", root_path, MAX_PATH);
     if (n && n < MAX_PATH) {
