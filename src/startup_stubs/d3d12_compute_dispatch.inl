@@ -5,8 +5,9 @@
 // (`srv <i> tex2d table <param> <byte>` inputs, `uav <i> tex2d float table <param> <byte> channels 4` outputs) named
 // by the token of a view the title created (device slots 18 and 19). `smp` lines become static samplers. Entry
 // values come from the compute root constants of slots 37 and 39. Any other manifest line makes the translation
-// unavailable; a dispatch that cannot be bound completely is refused with one
-// reason and records nothing on the desktop list.
+// unavailable; a dispatch that cannot be bound completely is refused with one reason and records no Dispatch and
+// binds nothing (the upload of an input texture the title filled in memory may already be recorded: it only
+// syncs content).
 
 struct ComputeTranslation {
     struct Slot { int a, b; bool texture; };  // root parameter and byte offset (views), or parameter and word (entry values)
@@ -213,11 +214,15 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
             else if (described ? desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc.Texture2D.PlaneSlice
                                : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
                 reason = "an output texture view is not 2D";
+            else if (x2w_startup::packed_target_format(format)) reason = "an output texture view has a packed format";
             else if (!float_output_format(format)) reason = "an output texture format is not a float or normalized one";
-            for (std::size_t other = 0; other < i && !reason; ++other)
-                if (views[other].resource == texture) reason = "an output texture is bound to another slot of the dispatch";
+            // One state per resource here: a texture read and written by the same call is refused. Two outputs
+            // of one texture (two mips) share the unordered access state.
+            for (std::size_t input = 0; input < inputs && !reason; ++input)
+                if (views[input].wrapper == wrapper) reason = "an output texture is also an input of the dispatch";
             views[i] = {texture, 0, 0, true, true, described};
             std::memcpy(views[i].desc, &desc, sizeof(desc));
+            views[i].wrapper = wrapper;
             continue;
         }
         if (!output) {
@@ -331,8 +336,8 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     return true;
 }
 
-// With the periodic totals: refused dispatches by the first refusal reason of their key, then the keys with the
-// most dispatches. The per-call log lines above share one small budget, so they cannot rank keys.
+// With the periodic totals: refused dispatches by the first refusal reason of their key, then every key by
+// dispatch count. The per-call log lines above share one small budget, so they cannot rank keys.
 void log_compute_census()
 {
     struct Reason { const char* text; u64 keys, dispatches; };
@@ -361,7 +366,7 @@ void log_compute_census()
     log("x2w-render compute census: %zu keys dispatched", keys.size());
     for (const Reason& r : reasons)
         log("x2w-render compute census reason \"%s\": %llu keys, %llu dispatches", r.text, r.keys, r.dispatches);
-    for (std::size_t i = 0; i < keys.size() && i < 40; ++i)
+    for (std::size_t i = 0; i < keys.size(); ++i)
         log("x2w-render compute census key %016llx: %llu dispatches, %llu translated, first refusal: %s [%08x %08x %08x %08x]",
             keys[i].key, keys[i].dispatches, keys[i].translated, keys[i].first_refusal ? keys[i].first_refusal : "none",
             keys[i].refusal_words[0], keys[i].refusal_words[1], keys[i].refusal_words[2], keys[i].refusal_words[3]);
