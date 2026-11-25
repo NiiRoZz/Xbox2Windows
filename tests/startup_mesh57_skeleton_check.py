@@ -8,6 +8,7 @@ The fixture (tests/startup_mesh57_skeleton.s, source-built) holds the accepted s
 word and both waves pass a barrier; later the same lane stores the primitive and vertex counts, both waves pass
 a barrier, wave 0 sends one allocation request and wave 1 reads the counts back. Each thread then exports the
 position and one parameter of vertex `thread` and the packed indices of primitive `thread`, each under its count.
+The data of a thread is the buffer slot of its low four bits.
 
 Without arguments: the fixture translates through the slot 57 request path, and each mutation of the shape is
 refused with its own message. `binary` compares the embedded words with llvm-mc. `draw` compiles the request
@@ -34,9 +35,9 @@ MESH = (
     ' be8e0309 bf8a0000 bf008006 bf840010 befe0404 bf880007 7e02020d 7e040280 7e06020e d8340000'
     ' 00000102 d8340004 00000302 befe04c1 bfa3ffe3 bf8a0000 8f048c0d 887c0e04 bf900009 bf82000d'
     ' bf8a0000 befe0404 bf880009 7e040280 d8d80000 01000002 d8d80004 03000002 bf8cc17f 7e1a0501'
-    ' bf8cc07f 7e1c0503 befe04c1 7d28000e 34080084 e0381000 80041004 e03810c0 80041404 bf8c3f70'
-    ' f80008cf 13121110 f800020f 17161514 befe04c1 7d28000d 34080082 e0301180 80041804 bf8c3f70'
-    ' f8000941 00000018 bf810000').split()
+    ' bf8cc07f 7e1c0503 befe04c1 7d28000e 3608008f 34080884 e0381000 80041004 e03810c0 80041404'
+    ' bf8c3f70 f80008cf 13121110 f800020f 17161514 befe04c1 7d28000d 3608008f 34080882 e0301180'
+    ' 80041804 bf8c3f70 f8000941 00000018 bf810000').split()
 PIXEL_ASM = ('v_interp_mov_f32 v0, p0, attr0.x\nv_interp_mov_f32 v1, p0, attr0.y\nv_interp_mov_f32 v2, p0, attr0.z\n'
              'v_interp_mov_f32 v3, p0, attr0.w\nexp mrt0 v0, v1, v2, v3 done vm\ns_endpgm\n')
 PIXEL = 'c8020002 c8060102 c80a0202 c80e0302 f800180f 03020100 bf810000'.split()
@@ -59,8 +60,8 @@ def mutate(old, new, nth=0):
     return MESH[:at] + [new] + MESH[at + 1:]
 
 
-def request(directory, mesh):
-    ms, ps, blob = code(mesh), code(PIXEL), root()
+def request(directory, mesh, pixel=PIXEL):
+    ms, ps, blob = code(mesh), code(pixel), root()
     key = G.mesh57_key(ms, ps, blob)
     for ext, data in (('.root', blob), ('.ps57', ps), ('.m57', ms)):
         (Path(directory) / ('req_%016x%s' % (key, ext))).write_bytes(data)
@@ -106,6 +107,12 @@ REFUSALS = (
      'numeric use of s25 holding an entry value the mesh model does not define'),
     ('a read of s3 other than the wave index', mutate('bf8c3f70', 'be940303'),
      'slot 57 mesh: s3 is read other than as the wave index'),
+    # s_and_b32 s4, s3, 0xf000000: wave 0 would restore a zero mask and store no count.
+    ('a wave test that overwrites the saved lane-0 mask', mutate('8706ff03', '8704ff03'),
+     'slot 57 mesh count exchange: registers of the accepted shape overlap'),
+    # s_mov_b32 s6, s8 after the thread index is derived: the count compare no longer tells the waves apart.
+    ('a count compare of a register rewritten after the wave index', mutate('bf8cc07f', 'be860308'),
+     'slot 57 mesh count exchange: the compared register is not the wave index'),
 )
 
 
@@ -141,6 +148,17 @@ def controls():
         for ext, data in (('.root', blob), ('.ps57', b''), ('.m57', ms)):
             (Path(tmp) / ('req_%016x%s' % (key, ext))).write_bytes(data)
         expect('no pixel stage', G.translate_request(tmp, key), 'unsupported: slot 57 mesh without a pixel stage is not covered')
+    # exp null off, off, off, off done vm; s_endpgm: a pixel stage without a colour output.
+    with tempfile.TemporaryDirectory() as tmp:
+        expect('a depth-only pixel stage', request(tmp, MESH, 'f8001890 00000000 bf810000'.split())[1],
+               'unsupported: slot 57 mesh with a depth-only pixel stage is not covered')
+    # The request path refuses a missing s_endpgm earlier; the walk takes the last instruction as the terminator
+    # unread, so the pipeline refuses it too (s_nop in its place).
+    try:
+        G.MeshPipeline(code(MESH[:-1] + ['bf800000']), code(PIXEL), root())
+        expect('a mesh program without s_endpgm', 'ok', 'refused')
+    except G.Unsupported as refusal:
+        expect('a mesh program without s_endpgm', str(refusal), 'slot 57 mesh program does not end with s_endpgm')
 
 
 def assemble(mc, text):
@@ -172,13 +190,13 @@ def geometry():
     return points, colours, indices
 
 
-def buffer(points, colours, indices):
+def buffer(points, colours, words):
     data = bytearray(512)
     for slot, (x, y) in enumerate(points):
         struct.pack_into('<4f', data, 16 * slot, x / 16 - 1, 1 - y / 16, 0.5, 1)
         struct.pack_into('<4f', data, 192 + 16 * slot, *(channel / 255 for channel in colours[slot]))
-    for t, (a, b, c) in enumerate(indices):
-        struct.pack_into('<I', data, 384 + 4 * t, a | b << 10 | c << 20)
+    for t, word in enumerate(words):
+        struct.pack_into('<I', data, 384 + 4 * t, word)
     return bytes(data)
 
 
@@ -186,15 +204,16 @@ def rasterise(points, colours, indices, verts, prims):
     """D3D rules: sample at the pixel centre, top-left fill, flat colour of the first vertex, later primitives on top.
 
     Counts above the 128 threads of a group are clamped and an index at or past the vertex count names the last
-    vertex, as the lowering documents. Coordinates are doubled so centres are integers."""
+    vertex, as the lowering documents. Vertex `thread` holds slot `thread & 15`, as the fixture reads it.
+    Coordinates are doubled so centres are integers."""
     verts, prims = min(verts, 128), min(prims, 128)
     image = [(0, 0, 0, 255)] * (SIDE * SIDE)
     if not verts:
         return image
     for a, b, c in indices[:prims]:
         a, b, c = (min(i, verts - 1) for i in (a, b, c))
-        colour = colours[a]
-        tri = [(2 * points[i][0], 2 * points[i][1]) for i in (a, b, c)]
+        colour = colours[a % 16]
+        tri = [(2 * points[i % 16][0], 2 * points[i % 16][1]) for i in (a, b, c)]
         area = (tri[1][0] - tri[0][0]) * (tri[2][1] - tri[0][1]) - (tri[1][1] - tri[0][1]) * (tri[2][0] - tri[0][0])
         if not area:
             continue
@@ -224,15 +243,23 @@ def draw(dxc, renderer, adapter):
             return 0
         name = str(Path(tmp) / ('%016x' % key))
         uds = G.MeshPipeline(code(MESH), code(PIXEL), root()).uds
-        # (vertex count, primitive count): all, fewer primitives, fewer vertices (indices clamp), no vertex.
+        # (vertex count, primitive count, thread of vertex slot 0, flags of the first primitive words): all, fewer
+        # primitives, fewer vertices (indices clamp), no vertex; every thread, with the triangles on vertices
+        # 112..123 (wave 1, lanes 48..59), each named by eight primitives and the other 96 primitives on vertex 0
+        # alone, the first triangle null (bit 31) and the second with its three edge flags (bits 9, 19, 29).
         # Each case is one process and one device, which takes seconds on a hardware adapter.
-        cases = ((12, 4), (12, 1), (7, 4), (0, 4))
-        for verts, prims in cases:
+        cases = ((12, 4, 0, ()), (12, 1, 0, ()), (7, 4, 0, ()), (0, 4, 0, ()),
+                 (128, 128, 112, (1 << 31, 1 << 9 | 1 << 19 | 1 << 29)))
+        for case in cases:
+            verts, prims, first, flags = case
+            named = [tuple(first + i for i in triangle) for triangle in indices]
+            words = [a | b << 10 | c << 20 | flag for (a, b, c), flag in zip(named, flags + (0,) * 4)]
+            drawn = [(0, 0, 0) if word >> 31 else triangle for triangle, word in zip(named, words)]
             constants = bytearray(1024)
             struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 0)), prims)
             struct.pack_into('<I', constants, 4 * uds.index(('rootconst', 0, 1)), verts)
-            image = rasterise(points, colours, indices, verts, prims)
-            head = bytes(constants) + buffer(points, colours, indices) + b'\xcd' * 80
+            image = rasterise(points, colours, drawn, verts, prims)
+            head = bytes(constants) + buffer(points, colours, words) + b'\xcd' * 80
             path = Path(tmp) / 'draw.bin'
             path.write_bytes(head + b''.join(bytes(pixel) for pixel in image))
             args = [renderer, adapter, '--mesh-indexed', name + '.ms57.cso', name + '.ps57.cso', str(path)]
@@ -241,10 +268,11 @@ def draw(dxc, renderer, adapter):
                 print(r.stdout + r.stderr)
                 return 77
             covered = sum(pixel != (0, 0, 0, 255) for pixel in image)
-            print('vertices=%d primitives=%d covered=%d: %s' % (verts, prims, covered, r.stdout.strip().splitlines()[-1:]))
-            expect('draw of %d vertices, %d primitives' % (verts, prims),
+            what = 'vertices=%d primitives=%d first=%d flags=%s' % (verts, prims, first, ['%08x' % flag for flag in flags])
+            print('%s covered=%d: %s' % (what, covered, r.stdout.strip().splitlines()[-1:]))
+            expect('draw of ' + what,
                    (r.returncode, 'pixels=1024 mismatches=0' in r.stdout), (0, True))
-            if (verts, prims) == cases[0]:
+            if case is cases[0]:
                 expect('the full case covers pixels', covered > 200, True)
                 wrong = list(image)
                 at = next(i for i, pixel in enumerate(image) if pixel != (0, 0, 0, 255))

@@ -2,6 +2,7 @@
 // Entry: s3 bits 24..27 hold the wave index; root constants s8 = primitive count, s9 = vertex count;
 // s[10:11] points at a descriptor table whose first descriptor is a raw buffer:
 // 12 float4 positions at byte 0, 12 uint4 parameter words at byte 192, 12 packed index words at byte 384.
+// A thread reads the slot of its low four bits, so threads past 15 stay inside the 512 bytes.
 s_inst_prefetch 0x3
 s_mov_b64 exec, 1
 s_mov_b64 s[4:5], exec
@@ -55,7 +56,8 @@ s_waitcnt lgkmcnt(0)
 v_readfirstlane_b32 s14, v3
 s_mov_b64 exec, -1
 v_cmpx_gt_i32 s14, v0
-v_lshlrev_b32 v4, 4, v0
+v_and_b32 v4, 15, v0
+v_lshlrev_b32 v4, 4, v4
 buffer_load_dwordx4 v[16:19], v4, s[16:19], 0 offen
 buffer_load_dwordx4 v[20:23], v4, s[16:19], 0 offen offset:192
 s_waitcnt vmcnt(0)
@@ -63,7 +65,8 @@ exp pos0 v16, v17, v18, v19 done
 exp param0 v20, v21, v22, v23
 s_mov_b64 exec, -1
 v_cmpx_gt_i32 s13, v0
-v_lshlrev_b32 v4, 2, v0
+v_and_b32 v4, 15, v0
+v_lshlrev_b32 v4, 2, v4
 buffer_load_dword v24, v4, s[16:19], 0 offen offset:384
 s_waitcnt vmcnt(0)
 exp prim v24, off, off, off done

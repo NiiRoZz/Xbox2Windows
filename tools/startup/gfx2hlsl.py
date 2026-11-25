@@ -1061,7 +1061,7 @@ MESH_VREG = re.compile(r'\bv(?:\[(\d+):(\d+)\]|(\d+))')
 MESH_EXCHANGE = [
     r's_mov_b64 exec, 1',
     r's_mov_b64 (?P<lane>s\[\d+:\d+\]), exec',
-    r's_and_b32 s\d+, s3, 0xf000000',
+    r's_and_b32 (?P<a_bits>s\d+), s3, 0xf000000',
     r's_cbranch_scc1 label_(?P<a_other>\w+)',
     r'v_lshrrev_b32_e32 v5, 7, v5',
     r'v_mov_b32_e32 (?P<a_zero>v\d+), 0',
@@ -1164,7 +1164,7 @@ def mesh_skeleton(ins):
     if (len({vreg['b_p'], vreg['b_zero'], vreg['b_v']}) != 3 or len({vreg['b_r0'], vreg['b_r1']}) != 2
             or vreg['b_r0'] == vreg['b_zero2'] or 5 in (vreg['a_zero'], vreg['a_zero2'])
             or len({sreg['prims'], sreg['verts'], sreg['b_tmp']}) != 3 or {sreg['prims'], sreg['verts']} & lane
-            or sreg['wave'] in lane | {3, sreg['prims'], sreg['verts']}):
+            or sreg['wave'] in lane | {3, sreg['prims'], sreg['verts']} or int(env['a_bits'][1:]) in lane):
         raise Unsupported('slot 57 mesh count exchange: registers of the accepted shape overlap')
     if not ins or ins[-1][2] != 's_endpgm':
         raise Unsupported('slot 57 mesh program does not end with s_endpgm')
@@ -4203,11 +4203,14 @@ class Stage:
 
     def mesh_export(self, asm, target, vals, flags):
         if target == 'target_20':
-            # Three 10-bit vertex indices in the first word, as tools/mesh_entry_aot.py reads the primitive export.
+            # First word: three 9-bit vertex indices at bits 0, 10 and 20, an edge flag above each (not modelled:
+            # triangles are filled) and the null bit 31 (Mesa ac_nir_pack_ngg_prim_exp_arg).
             if vals[1:] != ['off'] * 3 or [f for f in flags if f != 'done']:
                 raise Unsupported('mesh primitive export form %r' % asm)
             # An index at or past the vertex count has no defined vertex; the clamp keeps it inside the array.
-            self.emit('if (exec & 1) { w = %s; tris[tid] = min(uint3(w, w >> 10, w >> 20) & 1023u, max(%s, 1u) - 1u); }'
+            # A null primitive names one vertex three times, which covers no pixel.
+            self.emit('if (exec & 1) { w = %s; tris[tid] = w >> 31 != 0u ? (uint3)0u : '
+                      'min(uint3(w, w >> 10, w >> 20) & 511u, max(%s, 1u) - 1u); }'
                       % (self.u(vals[0]), self.mesh_verts))
             return None
         first = len(self.lines)
@@ -6164,6 +6167,8 @@ def translate_mesh57(out_dir, key):
         null_only = {a.split()[1] for _, _, op, a in pixel if op == 'exp'} == {'null'}
         if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps' and not null_only:
             raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
+        if null_only:
+            raise Unsupported('slot 57 mesh with a depth-only pixel stage is not covered')
     if not ps:
         raise Unsupported('slot 57 mesh without a pixel stage is not covered')
     pipe = MeshPipeline(ms, ps, root)

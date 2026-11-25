@@ -8985,7 +8985,10 @@ code around it is straight-line and exports vertex and primitive `thread`
 under `count > thread`. `mesh_skeleton` in `tools/startup/gfx2hlsl.py` states
 the shape and refuses every other program with the first difference. The
 lowering clamps both counts to the 128 threads of a group and each index to
-the last vertex. The source-built fixture draws on WARP and a hardware
+the last vertex. It reads 9-bit indices, ignores the edge flags, and gives a
+primitive whose null bit (31) is set one vertex three times, so it covers no
+pixel. A depth-only pixel program is refused. The source-built fixture draws
+on WARP and a hardware
 adapter and matches a CPU rasteriser. The runtime does not load the
 translated pair, so the dispatch stays unforwarded.
 The request fixture checks paired and mesh-only requests, duplicate
