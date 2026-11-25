@@ -3661,7 +3661,7 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
         static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",
                                                "placeholder-signature", "other"};
         static const char* const kinds[] = {"other", "dispatch", "draw", "drawindexed", "dispatchmesh"};
-        char line[512];
+        char line[1024];  // fits every outcome with five 19-digit counts
         int n = std::snprintf(line, sizeof(line), "x2w-render indirect:");
         for (int o = 0; o < indirect_outcomes; ++o) {
             n += std::snprintf(line + n, sizeof(line) - n, "%s %s:", o ? ";" : "", outcomes[o]);

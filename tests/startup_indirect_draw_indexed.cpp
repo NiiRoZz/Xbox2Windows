@@ -487,9 +487,11 @@ int main(int argc, char** argv) try
     wchar_t directory[MAX_PATH];
     if (!GetTempPathW(MAX_PATH, directory)) return 4;
     const std::wstring log_path = std::wstring(directory) + L"x2w_indirect_counts_" + std::to_wstring(GetCurrentProcessId()) + L".log";
-    DeleteFileW(log_path.c_str());
-    SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
-    SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
+    if (indexed) {
+        DeleteFileW(log_path.c_str());
+        SetEnvironmentVariableW(L"X2W_TRAP_LOG", log_path.c_str());
+        SetEnvironmentVariableA("X2W_PRESENT_SIGNATURE_EVERY", "0");
+    }
     DXGI_ADAPTER_DESC1 desc{};
     check(adapter->GetDesc1(&desc), "get selected adapter description");
     std::printf("adapter: %ls, debug layer %s\n", desc.Description, debug ? "enabled" : "unavailable");
