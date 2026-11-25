@@ -486,7 +486,9 @@ def run_case(name, dxc, runner, adapter, directory, control=None):
     groups = PROGRAMS[prog][4]
     case.write_bytes(struct.pack('<I', groups[0] | (groups[1] << 8) | (groups[2] << 16))
                      + struct.pack('<%dI' % WORDS, *expected) + struct.pack('<16I', *constants) + source)
-    return subprocess.run([runner, adapter, '--compute-store-case', str(cso), str(case)], capture_output=True, text=True)
+    # The helper's GetDimensions needs a descriptor-table view; root descriptors carry no size.
+    return subprocess.run([runner, adapter, '--compute-store-sized-case', str(cso), str(case)],
+                          capture_output=True, text=True)
 
 
 def check_dispatch(dxc, runner, adapter, control=None):
