@@ -703,8 +703,9 @@ class Stage:
                 self.lines, start = [], off
             self.pc = off
             # Before the first branch target or terminator every path has run exactly the instructions above, so
-            # the program-order tracking is exact there even in a program with branches.
-            self.past_entry = self.has_branches and (bool(self.blocks) or 0 in targets)
+            # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
+            # branch-free program is past it too (dead code).
+            self.past_entry = bool(self.blocks) or 0 in targets
             try:
                 term = self.one(name, asm)
             except Unsupported as reason:

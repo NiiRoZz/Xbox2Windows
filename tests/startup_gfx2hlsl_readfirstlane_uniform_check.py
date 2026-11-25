@@ -1,4 +1,4 @@
-"""Check straight-line v_readfirstlane_b32 lowering without shader machine code."""
+"""Check v_readfirstlane_b32 lowering in straight-line code and entry blocks, without shader machine code."""
 import os
 import sys
 
@@ -148,6 +148,12 @@ REFUSED = [
     ('exec write in the entry block', (MOVE, 's_and_saveexec_b32 s8, s2', READ, 's_branch label_0010',
                                        's_endpgm')),
     ('mask in the entry block', (COMPARE, MOVE, READ, 's_branch label_0010', 's_endpgm')),
+    # A branch target ends the entry block even before any terminator: a later branch can come back to it.
+    ('read in a loop whose header is in the entry block',
+     (MOVE, READ, 'v_mov_b32_e32 v7, v0', 's_cbranch_scc0 label_0004', 's_endpgm')),
+    ('read at a backward branch target', (MOVE, 's_nop 0', READ, 'v_mov_b32_e32 v7, v0', 's_branch label_0008',
+                                          's_endpgm')),
+    ('read after s_endpgm in a branch-free program', (MOVE, 's_endpgm', READ)),
 ]
 # The entry block of a program with branches: every path reaches it through the same instructions, so a read
 # there is proven like straight-line code, up to the instruction just before the first branch target.
