@@ -12,6 +12,7 @@ runs share one cache:
 3. texture-store-none (no Dispatch recorded): every half keeps its sentinel;
 4. texture-store-denied (a texture without unordered access, whose view the stand-in does not create): refused
    with one logged reason, every half keeps its sentinel.
+A fifth run binds the same program under a manifest edited to declare no entry values.
 
 Texture input: case A of startup_gfx2hlsl_compute_check.py with a level-zero sample of a 2D texture XORed into the
 stored word (a static sampler, a texture view at table byte 64). The consumer adds a 1x1 RGBA8 texture whose red
@@ -98,8 +99,18 @@ def store(directory, consumer, dxc, env):
     assert got == untouched, 'a refused Dispatch wrote the texture'
     refused = lines(result, 'refused: ')
     assert len(refused) == 1 and 'an output texture view was not created on the desktop' in refused[0], result.stderr[-3000:]
-    print(f'texture output: all {halves} halves match after translation (64 changed); untouched before translation, '
-          f'without a Dispatch and for a refused view; debug layer: {layer}')
+
+    # The same compiled program under a manifest without entry values (the program reads none of its three): the
+    # runtime binds no constants. The manifest is edited here; the translator writes `ud 0` for a root without them.
+    manifest = cache / f'{key:016x}.txt'
+    kept = [line for line in manifest.read_text().splitlines() if not line.startswith('udsrc ')]
+    assert len(kept) == 5 and kept[3] == 'ud 3', kept
+    manifest.write_bytes(('\n'.join(kept).replace('ud 3', 'ud 0') + '\n').encode())
+    got, result = run(directory, consumer, env, 'texture-store', layout)
+    assert got == expected and lines(result, 'translated: 0 entry values, 0 inputs, 1 outputs'), result.stderr[-3000:]
+    clean(result)
+    print(f'texture output: all {halves} halves match after translation (64 changed) and without entry values; '
+          f'untouched before translation, without a Dispatch and for a refused view; debug layer: {layer}')
 
 
 # v_xor_b32 v5, v5, v12: the assembled `v_xor_b32 v5, v5, v6` of case A with its second source register changed
