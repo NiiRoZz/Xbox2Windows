@@ -2071,12 +2071,12 @@ pointer, and its later decode commands pointed into the buffer. A size of 0, or 
 or unreadable command headers (`E_POINTER`), null or unreadable inputs and null or unwritable outputs
 (`E_POINTER`), and unknown or disconnected handles (`E_HANDLE`), and records one `(type, slot)`
 entry per `XApuEnqueueCommand` call (reading the 32-bit command type at `+0x00` and 32-bit slot
-index at `+0x04`) in a per-connection FIFO ring buffer capped at 16,384 entries (128 KiB per
+index at `+0x04`) in a per-connection FIFO ring buffer capped at 16,384 entries (192 KiB per
 connection; additional enqueues return `E_OUTOFMEMORY` without dropping queued entries).
 `XApuGetResultCount` reports the queued entry count, and `XApuDequeueResult` retires one entry
 and zeroes the `0x58`-byte result buffer. The experimental `X2W_XAPU_TYPED_COMPLETIONS=1`
 also writes the command type at `+0x00` and slot index at `+0x04`. Decoded bytes at `+0x34`
-remain zero in both modes. An empty
+remain zero in both modes unless the optional Opus decode below is built in. An empty
 queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
 
 Command/result types `1` (open), `2` (close), `3` (packet), and `5` (stop) are established by
@@ -2085,6 +2085,33 @@ observed callers. The experimental mode echoes any 32-bit type value at `+0x00` 
 outside `+0x00` and `+0x04` zero. Handles are never reused, and each connection's queue buffer is
 released on `XApuDisconnect`. Default non-permissive mode still traps on every export
 (`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
+
+The default build does not depend on libopus. Configuring with `-DX2W_WITH_OPUS=ON` (and `Opus_DIR` pointing at an
+installed libopus CMake package) links libopus into `xapu.dll`. The stand-ins link the static MSVC runtime, so libopus
+must be built with `-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>`. Tested with libopus 1.5.2;
+its notice is in [`src/startup_stubs/THIRD_PARTY_NOTICES.md`](../src/startup_stubs/THIRD_PARTY_NOTICES.md). With typed
+completions on, a type `3` command then decodes one Opus packet. The command fields as one title fills them:
+`+0x1C` sample rate (32-bit float: 8000, 12000, 16000, 24000 or 48000), `+0x24` frames, `+0x28` packet bytes,
+`+0x2C` packet pointer, `+0x34` output bytes (frames × channels × 4, 1 or 2 channels) and `+0x38` output pointer
+(interleaved 32-bit float). The result carries the decoded byte count at `+0x34`, which is smaller than the output
+size when the packet holds fewer frames. Each slot keeps its own decoder; type `5` resets it and type `2` frees it,
+as does `XApuDisconnect`. A command with no packet (null pointer and 0 bytes) completes with 0 bytes, as without
+libopus. Any other invalid field (rate, channel count, frames over 5760, packet over 64 KiB, unreadable packet,
+unwritable output, slot 256 or above) returns `E_INVALIDARG`, a packet that libopus rejects returns `E_FAIL`, and a
+command shorter than `0x40` readable bytes returns `E_POINTER`. A refused command queues no result and leaves the
+output untouched; decoding goes through a scratch buffer and is copied out only once the result is queued.
+
+```powershell
+cmake --preset dev -DX2W_WITH_OPUS=ON -DOpus_DIR=<libopus install>/lib/cmake/Opus
+cmake --build --preset dev --target startup_stub_xapu startup_xapu_queue_check startup_xapu_opus_check
+ctest --preset dev --no-tests=error -R '^startup_xapu_(queue|opus)$' -V
+```
+
+`startup_xapu_opus` encodes generated 1 kHz tones with the same libopus and checks exact byte counts (3840 for
+48 kHz mono, 7680 for stereo, 1920 for a 10 ms packet in a 20 ms buffer, 1280 for 16 kHz), bit-exact PCM against
+a reference decoder, untouched guard floats past the decoded frames, a malformed packet, each refusal above with
+an untouched output and an empty queue, decoding after close, and that type `3` decodes nothing with typed
+completions off. It is registered only in the optional build.
 
 `src/startup_stubs/audio_sink.{h,cpp}` is a desktop WASAPI shared-mode render sink. It opens the
 default render endpoint, takes the mix format from `GetMixFormat` (32-bit float or 16-bit PCM only),
