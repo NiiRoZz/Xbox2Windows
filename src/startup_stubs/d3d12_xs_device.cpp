@@ -2299,7 +2299,7 @@ struct Pass {
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     u64 root_address[16] = {};       // title address of each root descriptor
-    x2w_root_constants::Store constants;          // graphics root constants (slot 40)
+    std::uint32_t constants[16][8] = {};
     unsigned char constant_words_bound[16] = {};
     x2w_root_constants::Store compute_constants;  // compute root constants (slots 37 and 39)
     Wrapper* compute_root_wrapper = nullptr;      // compute root signature last set by slot 33
@@ -2956,7 +2956,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 list->SetGraphicsRootShaderResourceView(srv, inputs[0].resource->GetGPUVirtualAddress() + inputs[0].offset);
             for (UINT i = 0; i < pass.root->size(); ++i) {
                 if (i == srv) continue;
-                list->SetGraphicsRoot32BitConstants(i, (*pass.root)[i].constants_count, pass.constants.words[i], 0);
+                list->SetGraphicsRoot32BitConstants(i, (*pass.root)[i].constants_count, pass.constants[i], 0);
             }
         }
     }
@@ -3000,7 +3000,7 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
     if (pass.root != params) {
         for (auto& table : pass.view_tables) table = {};
         std::fill_n(pass.root_address, 16, 0);
-        pass.constants.clear();
+        std::memset(pass.constants, 0, sizeof(pass.constants));
         std::memset(pass.constant_words_bound, 0, sizeof(pass.constant_words_bound));
     }
     pass.root = params;

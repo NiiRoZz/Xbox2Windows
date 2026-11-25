@@ -113,6 +113,9 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
             counter = &compute_dispatches_untranslated;
         }
     }
+    // A word no slot 37 or 39 call wrote since the compute root was set has no value to pass (it is not 0).
+    for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i)
+        if (!pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1)) reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
