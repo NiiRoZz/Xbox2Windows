@@ -14772,6 +14772,17 @@ The [MASM fixture](../tests/cpu/switch_sal.asm) emits explicit `/6` byte sequenc
 
 Not covered by this experiment: `SAL` outside leaf/switch-lifted functions, and title CPU code execution.
 
+## Startup list Dispatch
+
+Command-list slot 14 (`Dispatch`) is recorded on the desktop list only when the list is open and direct or compute, a desktop compute pipeline and a desktop compute root signature are bound, the compute root declares no static samplers and only root SRV parameters (slot 43), the compute pipeline was built against that same root signature, every root SRV the root declares was set since the root was bound (a rejected or unaligned replacement clears its binding), and every group count is at most 65535. Zero groups on an axis is forwarded and runs nothing. A root with other parameters is refused with `compute root arguments are not forwarded`, a pipeline from another root with `compute pipeline was built against another root signature`, an unset or rejected root SRV with `a compute root SRV is not bound`, because the compute root-argument slots (35, 37, 39, 41, 43, 45) have no handler yet and the dispatch would run with them unset. Other refusals are logged as `x2w-render Dispatch(x, y, z) refused: <reason>`.
+
+Only the decision is checked: `tests/startup_list_dispatch_check.cpp` runs without a device and its five mutated runs must fail. Executing a dispatch on a GPU, with real results read back, is not verified yet.
+
+```powershell
+cmake --build --preset dev --target startup_list_dispatch_check
+ctest --preset dev --no-tests=error -R "^startup_list_dispatch" -V
+```
+
 ## Non-constant scalar symbols at branch targets in the startup translator
 
 Follow-up to #2279, which drops scalar constants at a join that another path writes, over the textual range between

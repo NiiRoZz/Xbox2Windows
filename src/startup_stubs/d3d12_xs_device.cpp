@@ -2273,10 +2273,10 @@ struct Pass {
     ID3D12RootSignature* compute_root = nullptr; // latest guest root if it was forwarded
     x2w_startup::ComPtr<ID3D12RootSignature> desktop_compute_root; // last root actually set on this recording
     std::array<D3D12_GPU_VIRTUAL_ADDRESS, 64> desktop_compute_upload_srvs{};
-    const std::vector<RootParameter>* compute_params = nullptr;
-    std::unique_ptr<ComputeBindingTrace> compute_trace;
     ID3D12RootSignature* compute_pipeline_root = nullptr; // root the bound compute pipeline was built against
     UINT compute_srv_bound = 0;                           // root SRV parameters that reached the desktop list since slot 33
+    const std::vector<RootParameter>* compute_params = nullptr;
+    std::unique_ptr<ComputeBindingTrace> compute_trace;
     bool compute_root_has_arguments = false;     // that root declares parameters other than root SRVs, or static samplers
     IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
@@ -2515,6 +2515,9 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
         pass.compute_trace->root = w;
     }
+    pass.compute_srv_bound = 0;
+    // Root SRV parameters are forwarded by their own slot; anything else the root declares is not.
+    pass.compute_root_has_arguments = real && !w->own().root_without_bindings && !w->own().root_srv_only;
     if (pass.compute_root) {
         if (pass.desktop_compute_root.Get() != pass.compute_root)
             pass.desktop_compute_upload_srvs.fill(0);
