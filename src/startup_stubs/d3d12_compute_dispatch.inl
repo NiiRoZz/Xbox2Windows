@@ -36,7 +36,7 @@ struct ComputeTranslation {
     {
         // The per-process cache is destroyed during DLL detach. A driver may already have shut
         // down when the process is terminating. Explicit unload still releases both references.
-        if (x2w_d3d12_process_terminating) {
+        if (x2w_startup::d3d12_process_terminating) {
             pipeline.Detach();
             root.Detach();
         }
