@@ -8899,8 +8899,18 @@ empty vertex slot, and a recorded root signature that matches the bound
 root. The pixel program is optional for depth-only work. The cache stores
 the root in `.root`, the pixel program (or an empty file) in `.ps57`, and
 writes the mesh program last in `.m57`. The offline reader validates the
-request key and stage exports. It reports unsupported mesh code and leaves
-the dispatch unforwarded until mesh code emission and binding are available.
+request key and stage exports. It translates a mesh program of one
+group-memory shape, with a pixel program, to `.ms57.hlsl` and `.ps57.hlsl`
+and compiles them as `ms_6_5` and `ps_6_0`. In that shape lane 0 of wave 0
+stores the primitive and vertex counts, every wave passes a barrier, wave 0
+sends one allocation request and the other wave reads the counts back; the
+code around it is straight-line and exports vertex and primitive `thread`
+under `count > thread`. `mesh_skeleton` in `tools/startup/gfx2hlsl.py` states
+the shape and refuses every other program with the first difference. The
+lowering clamps both counts to the 128 threads of a group and each index to
+the last vertex. The source-built fixture draws on WARP and a hardware
+adapter and matches a CPU rasteriser. The runtime does not load the
+translated pair, so the dispatch stays unforwarded.
 The request fixture checks paired and mesh-only requests, duplicate
 publication, a mismatched root, a populated vertex slot, and an incomplete
 pixel span.
@@ -8918,6 +8928,7 @@ an unsupported IID still returns `E_NOINTERFACE`.
 cmake --build --preset release --target startup_indirect_draw_indexed
 ctest --preset release --no-tests=error -R '^startup_indirect_mesh_(request|create_result)_' -V
 .\out\pe-env\Scripts\python.exe -B tests/startup_gfx2hlsl_watch_check.py
+ctest --preset release --no-tests=error -R '^startup_mesh57_skeleton' -V
 ```
 
 ```powershell

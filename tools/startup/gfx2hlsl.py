@@ -1045,6 +1045,240 @@ def check_lds_exchange(ins, group, words):
         raise Unsupported('LDS exchange needs a fill, a barrier and a completed read')
 
 
+# ---- slot 57 mesh stage: the group-memory count exchange (#2413) --------------------------------
+# A group is two wave64 waves and thread = wave * 64 + lane. 128 is also D3D12's limit for the numthreads of a mesh
+# shader, and the declared size of both output arrays.
+MESH_THREADS = 128
+MESH_VREG = re.compile(r'\bv(?:\[(\d+):(\d+)\]|(\d+))')
+MESH_EXCHANGE = [
+    r's_mov_b64 exec, 1',
+    r's_mov_b64 (?P<lane>s\[\d+:\d+\]), exec',
+    r's_and_b32 s\d+, s3, 0xf000000',
+    r's_cbranch_scc1 label_(?P<a_other>\w+)',
+    r'v_lshrrev_b32_e32 v5, 7, v5',
+    r'v_mov_b32_e32 (?P<a_zero>v\d+), 0',
+    r'ds_write_b32 {a_zero}, v5 offset:8',
+    r's_waitcnt_depctr 0xffe3',
+    r's_barrier 0x0',
+    r's_branch label_(?P<a_join>\w+)',
+    r's_barrier 0x0',
+    r'v_mov_b32_e32 (?P<a_zero2>v\d+), 0',
+    r'ds_read_b32 v5, {a_zero2} offset:8',
+]
+MESH_COUNTS = [
+    r's_barrier 0x0',
+    r's_cmp_eq_i32 (?P<wave>s\d+), 0',
+    r's_cbranch_scc0 label_(?P<b_reader>\w+)',
+    r's_mov_b64 exec, {lane}',
+    r's_cbranch_execz label_(?P<b_wskip>\w+)',
+    r'v_mov_b32_e32 (?P<b_p>v\d+), (?P<prims>s\d+)',
+    r'v_mov_b32_e32 (?P<b_zero>v\d+), 0',
+    r'v_mov_b32_e32 (?P<b_v>v\d+), (?P<verts>s\d+)',
+    r'ds_write_b32 {b_zero}, {b_p}',
+    r'ds_write_b32 {b_zero}, {b_v} offset:4',
+    r's_mov_b64 exec, -1',
+    r's_waitcnt_depctr 0xffe3',
+    r's_barrier 0x0',
+    r's_lshl_b32 (?P<b_tmp>s\d+), {prims}, 12',
+    r's_or_b32 m0, {b_tmp}, {verts}',
+    r's_sendmsg 0x9',
+    r's_branch label_(?P<b_join>\w+)',
+    r's_barrier 0x0',
+    r's_mov_b64 exec, {lane}',
+    r's_cbranch_execz label_(?P<b_rskip>\w+)',
+    r'v_mov_b32_e32 (?P<b_zero2>v\d+), 0',
+    r'ds_read_b32 (?P<b_r0>v\d+), {b_zero2}',
+    r'ds_read_b32 (?P<b_r1>v\d+), {b_zero2} offset:4',
+    r's_waitcnt lgkmcnt\(1\)',
+    r'v_readfirstlane_b32 {prims}, {b_r0}',
+    r's_waitcnt lgkmcnt\(0\)',
+    r'v_readfirstlane_b32 {verts}, {b_r1}',
+    r's_mov_b64 exec, -1',
+]
+
+
+def mesh_vregs(tokens):
+    out = set()
+    for m in MESH_VREG.finditer(' '.join(tokens)):
+        out.update(range(int(m[1] or m[3]), int(m[2] or m[3]) + 1))
+    return out
+
+
+def mesh_run(ins, at, what, patterns, env):
+    """Match consecutive instructions; {name} in a pattern is the text an earlier (?P<name>...) bound."""
+    for k, pattern in enumerate(patterns):
+        text = ins[at + k][3] if at + k < len(ins) else ''
+        m = re.fullmatch(re.sub(r'\{(\w+)\}', lambda ref: re.escape(env[ref[1]]), pattern), text)
+        if not m:
+            raise Unsupported('slot 57 mesh %s: instruction %d of the accepted shape (%s) is absent'
+                              % (what, k + 1, pattern.split()[0]))
+        env.update(m.groupdict())
+    return at + len(patterns)
+
+
+def mesh_skeleton(ins):
+    """Prove the one accepted group-memory shape of a slot 57 mesh program and replace it by per-thread instructions.
+
+    Accepted shape, in program order (anything else is refused with its own message):
+    - Exchange: exec = 1 (lane 0 of each wave), the mask saved in an SGPR pair; wave 0 (s3 bits 24..27 zero) stores
+      entry v5 >> 7 at byte 8, waits and passes a barrier; every other wave passes a barrier and reads byte 8 to v5.
+    - Straight-line code up to the next barrier. Its only read of v5 may be one v_readfirstlane_b32 under exec = -1.
+    - Counts: one barrier; the wave whose index (s_bfe_u32 of s3, 4 bits at 24) is zero stores SGPR P at byte 0 and
+      SGPR V at byte 4 under the saved lane-0 mask, waits, passes a barrier and sends one allocation request with
+      m0 = P << 12 | V; every other wave passes a barrier and reads both words back into the same P and V.
+    - Straight-line code to s_endpgm. Exports only here: pos0 and param under exec = -1 narrowed by one
+      v_cmpx_gt_i32 V, thread; the primitive export likewise with P. thread is the v_mbcnt pair over wave << 6.
+    Each path therefore passes three barriers, each store has one writer (one lane of one wave), and a wait and a
+    barrier separate it from every read. The lowering keeps one writer and one barrier: thread 0 stores, all read.
+
+    Registers the two arms leave different, that the lowering does not compute, or that hold an entry value the
+    model does not define, are refused when read: VGPRs by the scan below, SGPRs by a symbol (setup_entry and the
+    op_x2w_mesh_* handlers), SCC and m0 after the counts. Of s3 only the wave index is modelled.
+    """
+    env = {}
+    start = 1 if ins and ins[0][2] == 's_inst_prefetch' else 0
+    a_end = mesh_run(ins, start, 'group-index exchange', MESH_EXCHANGE, env)
+    count_at = next((i for i in range(a_end, len(ins)) if ins[i][2] == 's_barrier'), len(ins))
+    b_end = mesh_run(ins, count_at, 'count exchange', MESH_COUNTS, env)
+
+    def lands(key, index, what):
+        if index >= len(ins) or int(env[key], 16) != ins[index][0]:
+            raise Unsupported('slot 57 mesh %s: a branch leaves the accepted shape' % what)
+    lands('a_other', start + 10, 'group-index exchange')
+    lands('a_join', a_end, 'group-index exchange')
+    lands('b_reader', count_at + 17, 'count exchange')
+    lands('b_wskip', count_at + 10, 'count exchange')
+    lands('b_join', b_end, 'count exchange')
+    lands('b_rskip', count_at + 27, 'count exchange')
+    lane = set(range(*(lambda r: (r[1], r[2] + 1))(reg_range(env['lane']))))
+    sreg = {key: int(env[key][1:]) for key in ('wave', 'prims', 'verts', 'b_tmp')}
+    vreg = {key: int(env[key][1:]) for key in ('a_zero', 'a_zero2', 'b_p', 'b_zero', 'b_v', 'b_zero2', 'b_r0', 'b_r1')}
+    if (len({vreg['b_p'], vreg['b_zero'], vreg['b_v']}) != 3 or len({vreg['b_r0'], vreg['b_r1']}) != 2
+            or vreg['b_r0'] == vreg['b_zero2'] or 5 in (vreg['a_zero'], vreg['a_zero2'])
+            or len({sreg['prims'], sreg['verts'], sreg['b_tmp']}) != 3 or {sreg['prims'], sreg['verts']} & lane
+            or sreg['wave'] in lane | {3, sreg['prims'], sreg['verts']}):
+        raise Unsupported('slot 57 mesh count exchange: registers of the accepted shape overlap')
+    if not ins or ins[-1][2] != 's_endpgm':
+        raise Unsupported('slot 57 mesh program does not end with s_endpgm')
+
+    out = list(ins[:start])
+    span = lambda first, last: (ins[first][0], ins[last][0] + ins[last][1] - ins[first][0])
+    out.append(span(start, start + 1) + ('x2w_mesh_lane0', 'x2w_mesh_lane0 ' + env['lane']))
+    out.append(ins[start + 2])
+    out.append(span(start + 3, a_end - 1) + ('s_nop', 's_nop 0'))
+    # State of the walk over the code outside the two exchanges.
+    stale = set(range(256))   # VGPRs the model does not hold for every lane; no entry VGPR is modelled
+    pending = set()           # of those, the ones written only for the lanes of a narrowed exec
+    mask = 'lane0'         # 'lane0', None (all lanes), 'verts' or 'prims' (all lanes narrowed by one compare)
+    wave_known = False     # sreg['wave'] holds s_bfe_u32(s3, 4 bits at 24)
+    thread = base = None   # VGPR of the thread index, SGPR holding wave << 6
+    scc_stale = False
+    exports = []
+    for index in list(range(a_end, count_at)) + [None] + list(range(b_end, len(ins) - 1)):
+        if index is None:
+            if not wave_known:
+                raise Unsupported('slot 57 mesh count exchange: the compared register is not the wave index')
+            out.append(span(count_at, b_end - 2) + (
+                'x2w_mesh_counts', 'x2w_mesh_counts %s, %s, %s' % (env['prims'], env['verts'], env['b_tmp'])))
+            out.append(ins[b_end - 1])
+            stale |= pending | {vreg[k] for k in ('b_p', 'b_zero', 'b_v', 'b_zero2', 'b_r0', 'b_r1')}
+            pending.clear()
+            mask, scc_stale = None, True
+            continue
+        off, size, name, asm = ins[index]
+        after = index >= b_end
+        _, ops, _ = parse(asm)
+        base_name = re.sub(r'_e(32|64)$', '', name)
+        if name.startswith(('s_cbranch', 's_branch', 's_setpc', 's_call', 's_swappc')):
+            raise Unsupported('slot 57 mesh: a branch outside the group-memory exchanges is not covered')
+        if name.startswith('ds_') or name in ('s_barrier', 's_sendmsg', 's_sendmsghalt'):
+            raise Unsupported('slot 57 mesh: %s outside the group-memory exchanges' % name)
+        if name.startswith(('v_readlane', 'v_writelane')):
+            raise Unsupported('slot 57 mesh: lane spills are not covered')
+        keep = ins[index]
+        if base_name == 'v_readfirstlane_b32':
+            if after or asm != 'v_readfirstlane_b32 %s, v5' % ops[0] or mask is not None or 5 not in stale:
+                raise Unsupported('slot 57 mesh: v_readfirstlane_b32 outside the group-index read is not covered')
+            keep = (off, size, 'x2w_mesh_group', 'x2w_mesh_group ' + ops[0])
+            ops = ops[:1]
+        writes_s = set()
+        if not base_name.startswith(('v_cmpx', 'exp', 'ds_write', 'buffer_store')):
+            for tok in destinations(name, ops):
+                r = reg_range(tok)
+                if r and r[0] == 's':
+                    writes_s.update(range(r[1], r[2] + 1))
+        if 3 in writes_s or writes_s & lane:
+            raise Unsupported('slot 57 mesh: the wave word s3 or the saved lane-0 mask is written')
+        if writes_s and name.startswith('v_') and keep[2] != 'x2w_mesh_group':
+            raise Unsupported('slot 57 mesh: %s into an SGPR is not covered' % base_name)
+        # Only the wave index of s3 is modelled.
+        if not re.fullmatch(r's_bfe_u32 s\d+, s3, 0x40018', asm) and any(
+                r and r[0] == 's' and r[1] <= 3 <= r[2] for r in map(reg_range, ops)):
+            raise Unsupported('slot 57 mesh: s3 is read other than as the wave index')
+        if after and writes_s & {sreg['prims'], sreg['verts']}:
+            raise Unsupported('slot 57 mesh: an output count is written after the count exchange')
+        if after and re.search(r'\bm0\b', asm):
+            raise Unsupported('slot 57 mesh: m0 is used after the allocation request')
+        if scc_stale and reads_scc(name, asm):
+            raise Unsupported('slot 57 mesh: SCC of the count exchange is read')
+        if name.startswith(('s_cmp', 's_bitcmp')):
+            scc_stale = False
+        # EXEC and VCC as wave-wide masks are outside the per-thread model here: only the two forms below touch EXEC.
+        if asm == 's_mov_b64 exec, -1':
+            mask = None
+            stale |= pending
+            pending.clear()
+        elif base_name.startswith('v_cmpx'):
+            count = {env['verts']: 'verts', env['prims']: 'prims'}.get(ops[0] if ops else None)
+            if (base_name != 'v_cmpx_gt_i32' or not after or mask is not None or count is None
+                    or thread is None or ops[1:] != ['v%d' % thread]):
+                raise Unsupported('slot 57 mesh: an EXEC compare other than output count > thread index under '
+                                  'exec = -1 is not covered')
+            mask = count
+        elif writes_exec(name, ops) or re.search(r'\bexec(_lo|_hi)?\b', asm) or (
+                name.startswith('s_') and re.search(r'\bvcc(_lo|_hi)?\b', asm)):
+            raise Unsupported('slot 57 mesh: %s on a wave mask is not covered' % base_name)
+        # The thread index: v_mbcnt_lo(-1, wave << 6) then v_mbcnt_hi(-1, that) under exec = -1.
+        if asm == 's_bfe_u32 %s, s3, 0x40018' % env['wave']:
+            wave_known = True
+        elif sreg['wave'] in writes_s:
+            wave_known = False
+        if wave_known and re.fullmatch(r's_lshl_b32 s\d+, %s, 6' % env['wave'], asm) and ops[0] != env['wave']:
+            base = int(ops[0][1:])
+        elif base in writes_s:
+            base = None
+        reads_v = mesh_vregs(ops if base_name.startswith(('v_cmp', 'exp', 'ds_write', 'buffer_store')) else ops[1:])
+        dest = reg_range(ops[0]) if ops and not base_name.startswith(('v_cmp', 'exp', 'buffer_store')) else None
+        writes_v = set(range(dest[1], dest[2] + 1)) if dest and dest[0] == 'v' else set()
+        if base_name == 'v_mbcnt_lo_u32_b32' and base is not None and ops[1:] == ['-1', 's%d' % base] and mask is None \
+                and index + 1 < len(ins) and ins[index + 1][3] == 'v_mbcnt_hi_u32_b32 %s, -1, %s' % (ops[0], ops[0]):
+            thread = dest[1]
+        elif thread in writes_v and not (base_name == 'v_mbcnt_hi_u32_b32' and ins[index - 1][2].startswith('v_mbcnt_lo')):
+            raise Unsupported('slot 57 mesh: the thread index register is rewritten')
+        if keep[2] != 'x2w_mesh_group' and reads_v & stale:
+            raise Unsupported('slot 57 mesh: v%d is read where it is not defined for every lane (an entry value, or '
+                              'left different per wave by an exchange)' % min(reads_v & stale))
+        if mask is not None:
+            pending |= writes_v & stale
+        else:
+            pending -= writes_v
+        stale -= writes_v
+        if name == 'exp':
+            target = asm.split()[1].rstrip(',')
+            want = 'prims' if target == 'target_20' else 'verts' if re.fullmatch(r'pos0|param\d+', target) else None
+            if want is None:
+                raise Unsupported('slot 57 mesh: export target %s is not covered' % target)
+            if not after or mask != want:
+                raise Unsupported('slot 57 mesh: export %s is not under exec = -1 narrowed by its output count > '
+                                  'thread index' % target)
+            exports.append(target)
+        out.append(keep)
+    if exports.count('pos0') != 1 or exports.count('target_20') != 1:
+        raise Unsupported('slot 57 mesh: one pos0 and one primitive export are required')
+    out.append(ins[-1])
+    return out
+
+
 class Stage:
     """Translates one stage. Shares the resource and entry-constant registries of its pipeline."""
 
@@ -1074,6 +1308,8 @@ class Stage:
             self.ins = decode(strip_header(code))
         else:
             self.ins = decode(strip_header(code), refusals) if decoded is None else decoded
+        if kind == 'ms':
+            self.ins = mesh_skeleton(self.ins)
         # A loop header is translated before the back edges into it, so whether a back edge brings the symbol kept
         # there is known only afterwards: translate again with that register read at run time or refused there. A
         # register only moves from kept to 'run' to 'refuse', so this ends.
@@ -1138,6 +1374,13 @@ class Stage:
             reg += 1
         if self.kind == 'cs':
             self.setup_compute_entry(reg)
+        elif self.kind == 'ms':
+            # The wave index is bits 24..27 of s3 (mesh_skeleton requires the program to read it that way).
+            self.used_s.add(3)
+            self.entry = ['s3 = (tid >> 6) << 24;']
+            for n in range(105):
+                if n != 3 and n not in self.sym:
+                    self.sym[n] = ('an entry value the mesh model does not define',)
         elif self.kind == 'vs':
             self.sym[0] = ('ptr', ('vbtab',))
             self.sym[1] = ('ptrhi', ('vbtab',))
@@ -3898,8 +4141,61 @@ class Stage:
         # FF1 reports its index and leaves SCC unchanged.
         self.set_s(dst[1], '0u', ('const', 0))
 
+    # ---- slot 57 mesh stage: instructions mesh_skeleton() puts in place of the group-memory exchanges ----
+    def op_x2w_mesh_lane0(self, ops, mods):
+        # `s_mov_b64 exec, 1` leaves lane 0 of each wave running. The saved copy of that mask is not modelled.
+        r = reg_range(ops[0])
+        for n in range(r[1], r[2] + 1):
+            self.sym[n] = ('the saved mesh lane-0 mask',)
+        self.emit('exec = (tid & 63u) == 0u ? 1u : 0u;')
+        self.exec_known = False
+
+    def op_x2w_mesh_group(self, ops, mods):
+        # The word is entry v5 >> 7 of wave 0, lane 0. What v5 holds at entry is not verified, so a use is refused.
+        self.sym[reg_range(ops[0])[1]] = ('the mesh group index',)
+
+    def op_x2w_mesh_counts(self, ops, mods):
+        prims, verts, temporary = (reg_range(tok)[1] for tok in ops)
+        self.emit('if (tid == 0u) { lds[0] = %s; lds[1] = %s; }' % (self.S(prims), self.S(verts)))
+        self.emit('GroupMemoryBarrierWithGroupSync();')
+        # Thread t writes vertex t and primitive t, so a count above the thread count names outputs that no
+        # thread writes. The clamp keeps the declared arrays in bounds and changes nothing a thread writes.
+        for n, word in ((prims, 0), (verts, 1)):
+            self.set_s(n, 'min(lds[%d], %du)' % (word, MESH_THREADS), uniform=True)
+        # Without a vertex no index is valid, so no primitive is.
+        self.emit('if (%s == 0u) %s = 0u;' % (self.S(verts), self.S(prims)))
+        self.emit('SetMeshOutputCounts(%s, %s);' % (self.S(verts), self.S(prims)))
+        self.mesh_verts = self.S(verts)
+        self.sym[temporary] = ('a mesh allocation temporary',)
+
+    def mesh_export(self, asm, target, vals, flags):
+        if target == 'target_20':
+            # Three 10-bit vertex indices in the first word, as tools/mesh_entry_aot.py reads the primitive export.
+            if vals[1:] != ['off'] * 3 or [f for f in flags if f != 'done']:
+                raise Unsupported('mesh primitive export form %r' % asm)
+            # An index at or past the vertex count has no defined vertex; the clamp keeps it inside the array.
+            self.emit('if (exec & 1) { w = %s; tris[tid] = min(uint3(w, w >> 10, w >> 20) & 1023u, max(%s, 1u) - 1u); }'
+                      % (self.u(vals[0]), self.mesh_verts))
+            return None
+        first = len(self.lines)
+        self.in_mesh_export = True
+        try:
+            self.export(asm)
+        finally:
+            self.in_mesh_export = False
+        self.lines[first:] = ['if (exec & 1) { %s mesh_vertex = true; }' % ' '.join(self.lines[first:])]
+        return None
+
     def op_v_mbcnt_lo_u32_b32(self, ops, mods, high=False):
         name = 'v_mbcnt_%s_u32_b32' % ('hi' if high else 'lo')
+        if self.kind == 'ms':
+            # V_MBCNT counts the mask bits strictly below the lane, in the low or high half of a wave64 mask.
+            dst = reg_range(ops[0]) if len(ops) == 3 else None
+            if mods or not dst or dst[0] != 'v' or dst[1] != dst[2] or ops[1] != '-1':
+                raise Unsupported('%s in a mesh stage requires a VGPR, the mask -1 and a base' % name)
+            below = 'max(tid & 63u, 32u) - 32u' if high else 'min(tid & 63u, 32u)'
+            self.set_v(dst[1], '(%s + %s)' % (self.u(ops[2]), below))
+            return
         if self.kind != 'cs':
             raise Unsupported(name)
         if mods or len(ops) != 3:
@@ -4594,6 +4890,8 @@ class Stage:
         if not m:
             raise Unsupported('export form %r' % asm)
         target, vals, flags = m.group(1), [v.strip() for v in m.group(2).split(',')], m.group(3).split()
+        if getattr(self, 'kind', None) == 'ms' and not getattr(self, 'in_mesh_export', False):
+            return self.mesh_export(asm, target, vals, flags)
         if any(f.startswith('en:') for f in flags):
             raise Unsupported('compressed export enable mask %s does not select whole channel pairs'
                               % next(f for f in flags if f.startswith('en:'))[3:])
@@ -4948,6 +5246,7 @@ VERIFIED_SINT_RTVS = frozenset((4, 18, 32, 43))
 
 
 class Pipeline:
+    vertex_kind = 'vs'
     uses_pack16_rne = False
     uses_gather_2d_lod = False
     srv_formats = ()
@@ -4989,11 +5288,11 @@ class Pipeline:
         self.modified = set()
         self.rect = self.ud(('rect',))
         if refusals is None:
-            self.vs = Stage(self, 'vs', vs_code)
+            self.vs = Stage(self, self.vertex_kind, vs_code)
             self.ps = Stage(self, 'ps', ps_code)
         else:
             decoded = {} if decoded is None else decoded
-            self.vs = Stage(self, 'vs', vs_code, refusals=refusals, decoded=decoded.get('vs'))
+            self.vs = Stage(self, self.vertex_kind, vs_code, refusals=refusals, decoded=decoded.get('vs'))
             self.ps = Stage(self, 'ps', ps_code, refusals=refusals, decoded=decoded.get('ps'))
         self.params = sorted(int(k[5:]) for k in self.vs.exports if k.startswith('param'))
         self.flat = sorted(a for a, how in self.ps.attrs.items() if 'flat' in how)
@@ -5386,6 +5685,27 @@ class ComputePipeline(Pipeline):
         return '\n'.join(lines) + '\n'
 
 
+class MeshPipeline(Pipeline):
+    """A slot 57 mesh and pixel pair. The mesh stage is the vertex-producing stage of the pair (self.vs)."""
+    vertex_kind = 'ms'
+
+    def hlsl_ms(self):
+        s = self.vs
+        if len(s.blocks) != 1:
+            raise Unsupported('slot 57 mesh: a branch outside the group-memory exchanges is not covered')
+        lines = [re.sub(r' o\.fparam(\d+) = [^;]*;', lambda m: m[0] if int(m[1]) in self.flat else '',
+                        re.sub(r' o\.hparam(\d+)_(?:lo|hi) = [^;]*;',
+                               lambda m: m[0] if int(m[1]) in self.f16_plain else '', line))
+                 for line in s.body()]
+        return '\n'.join(
+            self.common() + ['struct VSOut {'] + self.interface(False) + [
+                '};', 'groupshared uint lds[2];', '[numthreads(%d, 1, 1)]' % MESH_THREADS, '[outputtopology("triangle")]',
+                'void main(uint tid : SV_GroupIndex, out vertices VSOut verts[%d], out indices uint3 tris[%d]) {'
+                % (MESH_THREADS, MESH_THREADS), '    VSOut o = (VSOut)0; bool mesh_vertex = false;']
+            + s.declarations() + ['    ' + line for line in s.entry] + lines
+            + ['    if (mesh_vertex) verts[tid] = o;', '}']) + '\n'
+
+
 def fnv(data, h=1469598103934665603):
     for b in data:
         h = ((h ^ b) * 1099511628211) & 0xffffffffffffffff
@@ -5720,8 +6040,11 @@ def mesh57_key(ms, ps, root):
     return value
 
 
-def inspect_mesh57_request(out_dir, key):
-    """Read a fixed-descriptor mesh request without falling back to a vertex translation."""
+def translate_mesh57(out_dir, key):
+    """Translate a fixed-descriptor mesh request of the accepted shape (mesh_skeleton), or raise Unsupported.
+
+    Writes <key>.ms57.hlsl, <key>.ps57.hlsl, the compiled .ms57.cso and .ps57.cso, and <key>.ms57.txt (last).
+    No runtime path loads these names yet."""
     source = os.path.join(out_dir, 'req_%016x' % key)
     ms, ps, root = (open(source + ext, 'rb').read() for ext in ('.m57', '.ps57', '.root'))
     if mesh57_key(ms, ps, root) != key:
@@ -5737,10 +6060,38 @@ def inspect_mesh57_request(out_dir, key):
         pixel = decode(strip_header(ps))
         if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps':
             raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
-    for offset, _, op, _ in mesh:
-        if op.startswith('ds_'):
-            raise Unsupported('slot 57 mesh workgroup memory: %s at +0x%x' % (op, offset))
-    raise Unsupported('slot 57 mesh code emission is unavailable')
+    if not ps:
+        raise Unsupported('slot 57 mesh without a pixel stage is not covered')
+    pipe = MeshPipeline(ms, ps, root)
+    sources = (('ms', 'ms_6_5', pipe.hlsl_ms()), ('ps', 'ps_6_0', pipe.hlsl_ps()))
+    manifest = pipe.manifest()
+    name = os.path.join(out_dir, '%016x' % key)
+    for stage, _, hlsl in sources:
+        open('%s.%s57.hlsl' % (name, stage), 'w').write(hlsl)
+    if os.environ.get('X2W_FXC') != '':
+        compiler = find_dxc()
+        if compiler is None:
+            raise Unsupported('dxc not found (X2W_DXC=%s): a mesh stage needs shader model 6.5' % os.environ.get('X2W_DXC', '<unset>'))
+        import subprocess
+        # Publish only bytecode from a successful pair.
+        with tempfile.TemporaryDirectory(prefix='.dxc-', dir=out_dir) as staging:
+            for stage, profile, _ in sources:
+                bytecode = os.path.join(staging, stage + '.cso')
+                r = subprocess.run([compiler, '-Gis', '-T', profile, '-E', 'main', '-Fo', bytecode, '%s.%s57.hlsl' % (name, stage)],
+                                   capture_output=True, text=True)
+                if r.returncode or not has_bytecode(bytecode):
+                    # DXC names the source path; keep only the diagnostic after it.
+                    lines = [re.sub(r'^.*?57\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
+                    raise Unsupported('dxc %s: %s' % (stage, (lines[0] if lines else 'no bytecode produced')[:500]))
+            for stage, _, _ in sources:
+                os.replace(os.path.join(staging, stage + '.cso'), '%s.%s57.cso' % (name, stage))
+    temporary = '%s.ms57.txt.%d.tmp' % (name, os.getpid())
+    with open(temporary, 'w') as result:
+        result.write(manifest)
+    os.replace(temporary, name + '.ms57.txt')
+    with suppress(FileNotFoundError):
+        os.remove(name + '.fail')
+    return 'ok'
 
 
 def translate_request(out_dir, key):
@@ -5749,7 +6100,7 @@ def translate_request(out_dir, key):
         return translate_compute(out_dir, key)
     if os.path.isfile(os.path.join(out_dir, 'req_%016x.m57' % key)):
         try:
-            inspect_mesh57_request(out_dir, key)
+            return translate_mesh57(out_dir, key)
         except (Unsupported, OSError, UnicodeError, struct.error) as reason:
             open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(str(reason) + '\n')
             return 'unsupported: %s' % reason
@@ -6080,9 +6431,10 @@ def pending_keys(out_dir, skip_failed):
             continue
         key = int(m.group(1), 16)
         result = os.path.join(out_dir, '%016x' % key)
-        stages = ('.cs.cso',) if m.group(2) == 'c67' else ('.vs.cso', '.ps.cso')
+        mesh = m.group(2) == 'm57'
+        stages = ('.cs.cso',) if m.group(2) == 'c67' else ('.ms57.cso', '.ps57.cso') if mesh else ('.vs.cso', '.ps.cso')
         # A published manifest with bytecode (or manifest-only mode) is done; otherwise resume (#2008).
-        if m.group(2) != 'm57' and os.path.isfile(result + '.txt') and (manifest_only or all(has_bytecode(result + s) for s in stages)):
+        if os.path.isfile(result + ('.ms57.txt' if mesh else '.txt')) and (manifest_only or all(has_bytecode(result + s) for s in stages)):
             continue
         fail = os.path.join(out_dir, '%016x.fail' % key)
         # A repeated pass retries a failure only once its request is rewritten.
