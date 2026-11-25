@@ -2650,21 +2650,25 @@ def main():
 
 
 def watch_pass(out_dir, skip_failed):
-    """One --watch pass. A worker killed from outside (out of memory) breaks the pool; the pass is
-    reported and its requests are retried on the next pass instead of ending the watcher."""
+    """One --watch pass. A worker killed from outside (out of memory) breaks the pool, and a cache
+    file can fail to publish; the pass is reported and retried on the next pass instead of ending the watcher."""
     from concurrent.futures.process import BrokenProcessPool
     try:
         translate_pending(out_dir, skip_failed=skip_failed)
         return True
-    except BrokenProcessPool as error:
+    except (BrokenProcessPool, OSError) as error:
         print('translation pass interrupted, retrying: %s' % error, file=sys.stderr, flush=True)
         return False
 
 
 def translate_one(out_dir, key):
-    """translate_request, with an unexpected translator error recorded as <key>.fail instead of raised."""
+    """translate_request, with an unexpected translator error recorded as <key>.fail instead of raised.
+
+    A file system error (a cache file that cannot be published) is raised: it is not the request's fault."""
     try:
         return translate_request(out_dir, key)
+    except OSError:
+        raise
     except Exception as error:  # noqa: BLE001 - one bad request must not stop a scan or the watcher
         reason = 'translator error: %s: %s' % (type(error).__name__, error)
         with open(os.path.join(out_dir, '%016x.fail' % key), 'w') as fail:

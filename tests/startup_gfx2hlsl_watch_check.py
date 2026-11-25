@@ -1,12 +1,13 @@
 """gfx2hlsl.py pending scan and --watch on synthetic request files (pure Python, no Windows, no GPU).
 
-A request is consumed only once its ready marker (.a or .rtv) exists and it has no published .txt.
+A request is consumed only once its ready marker (.a or .rtv) exists and it has no published .txt
+with both .cso files beside it (the .txt alone under X2W_FXC=, which skips compilation).
 After the watcher's first pass, a request whose .fail is newer than its marker is not retried; the
 first pass and the one-shot --pending scan retry it. The --watch process must retry an earlier
 failure once, translate a new request while it runs and not rewrite a failure on later passes. A
 --pending scan with four parallel workers must print the same results and write the same failures
-as one worker, an unexpected translator error must become <key>.fail, a broken process pool must
-end one watcher pass and not the watcher, and an invalid X2W_TRANSLATE_JOBS must fall back to the
+as one worker, an unexpected translator error must become <key>.fail and a file system error must
+not, a broken process pool or a file system error must end one watcher pass and not the watcher, and an invalid X2W_TRANSLATE_JOBS must fall back to the
 processor count.
 """
 import os
@@ -53,13 +54,18 @@ with tempfile.TemporaryDirectory() as tmp:
     d = Path(tmp)
     now = time.time()
     # 1: complete request; 2: already published; 3: no ready marker yet (negative control);
-    # 4: failed after its marker was written; 5: marker rewritten after the failure; 6: RTV variant.
-    for key in (1, 2, 4, 5):
+    # 4: failed after its marker was written; 5: marker rewritten after the failure; 6: RTV variant;
+    # 7: manifest published without bytecode.
+    for key in (1, 2, 4, 5, 7):
         for ext in ('.b', '.root'):
             touch(d / ('req_%016x%s' % (key, ext)))
     touch(d / ('req_%016x.a' % 1))
     touch(d / ('req_%016x.a' % 2))
     touch(d / ('%016x.txt' % 2))
+    touch(d / ('%016x.vs.cso' % 2), b'vs')
+    touch(d / ('%016x.ps.cso' % 2), b'ps')
+    touch(d / ('req_%016x.a' % 7))
+    touch(d / ('%016x.txt' % 7))
     touch(d / ('req_%016x.b' % 3))
     touch(d / ('req_%016x.root' % 3))
     touch(d / ('req_%016x.a' % 4), mtime=now - 10)
@@ -67,8 +73,14 @@ with tempfile.TemporaryDirectory() as tmp:
     touch(d / ('%016x.fail' % 5), mtime=now - 10)
     touch(d / ('req_%016x.a' % 5), mtime=now - 5)
     touch(d / ('req_%016x.rtv' % 6))
-    expect('watch pass', scan(d, True), [1, 5, 6])
-    expect('one-shot pass', scan(d, False), [1, 4, 5, 6])
+    expect('watch pass', scan(d, True), [1, 5, 6, 7])
+    expect('one-shot pass', scan(d, False), [1, 4, 5, 6, 7])
+    saved_fxc = os.environ.get('X2W_FXC')
+    os.environ['X2W_FXC'] = ''
+    try:
+        expect('manifest-only pass', scan(d, False), [1, 4, 5, 6])
+    finally:
+        os.environ.pop('X2W_FXC', None) if saved_fxc is None else os.environ.__setitem__('X2W_FXC', saved_fxc)
 
 # Parallel --pending must give the same results as one worker. Sixteen RTV variants each name a
 # different missing base request, so each failure names its own base and a result reported against
@@ -101,23 +113,37 @@ with tempfile.TemporaryDirectory() as tmp:
         gfx2hlsl.translate_request = real
     fail = d / ('%016x.fail' % 9)
     expect('translator error recorded', fail.read_text().startswith('translator error: ZeroDivisionError') if fail.exists() else None, True)
+    fail.unlink()
+
+    def unwritable(out_dir, key):
+        raise PermissionError('synthetic publish failure')
+
+    gfx2hlsl.translate_request = unwritable
+    try:
+        gfx2hlsl.translate_pending(str(d), jobs=1)
+        failures.append('a file system error was recorded as a translator failure')
+    except PermissionError:
+        pass
+    finally:
+        gfx2hlsl.translate_request = real
+    expect('file system error not recorded as .fail', fail.exists(), False)
 
 # A broken process pool (a worker killed from outside) ends one pass, not the watcher.
 from concurrent.futures.process import BrokenProcessPool  # noqa: E402
 
 
-def broken(out_dir, skip_failed=False):
-    raise BrokenProcessPool('a worker was terminated abruptly')
-
-
 real = gfx2hlsl.translate_pending
-gfx2hlsl.translate_pending = broken
-try:
-    expect('broken pool: pass reported as incomplete', gfx2hlsl.watch_pass('.', True), False)
-except BrokenProcessPool:
-    failures.append('a broken process pool escaped watch_pass')
-finally:
-    gfx2hlsl.translate_pending = real
+for label, error in (('broken pool', BrokenProcessPool('a worker was terminated abruptly')),
+                     ('file system error', PermissionError('synthetic publish failure'))):
+    def failing(out_dir, skip_failed=False, error=error):
+        raise error
+    gfx2hlsl.translate_pending = failing
+    try:
+        expect('%s: pass reported as incomplete' % label, gfx2hlsl.watch_pass('.', True), False)
+    except (BrokenProcessPool, OSError):
+        failures.append('a %s escaped watch_pass' % label)
+    finally:
+        gfx2hlsl.translate_pending = real
 with tempfile.TemporaryDirectory() as tmp:
     expect('normal pass reported as complete', gfx2hlsl.watch_pass(tmp, True), True)
 
