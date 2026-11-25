@@ -35,12 +35,12 @@ SUFFIX = bytes.fromhex('703f8cbf0f1800f804050607000081bf')
 CHANNELS = ('Red', 'Green', 'Blue', 'Alpha')
 
 
-def shader(mask=1, dim=1, opcode=0x47, flags=0, high=0, prefix=PREFIX, nsa=False):
+def shader(mask=1, dim=1, opcode=0x47, flags=0, high=0, prefix=PREFIX, nsa=False, dst=4):
     first = 0xf0000000 | (opcode << 18) | (mask << 8) | (dim << 3) | flags
     if nsa:
         first |= 2
     extension = bytes((1, 0, 0, 0)) if nsa else b''
-    return prefix + struct.pack('<II', first, 0x00c40400 | high) + extension + SUFFIX
+    return prefix + struct.pack('<II', first, 0x00c40000 | (dst << 8) | high) + extension + SUFFIX
 
 
 def pipeline(code):
@@ -75,6 +75,10 @@ def controls(llvm_mc):
     refused(shader(high=1 << 31), 'modifier d16')
     refused(shader(flags=1 << 16), 'modifier tfe')
     refused(shader(nsa=True), 'two contiguous address registers')
+    # The destination must be four registers that fit in the file: bases 0xfe and 0xff decode to
+    # v[254:257] and v[255:258], which would otherwise write past v255.
+    refused(shader(dst=0xfe), 'four destination registers')
+    refused(shader(dst=0xff), 'four destination registers')
     refused(shader(opcode=0x40), 'image_gather4')
     refused(shader(opcode=0x44), 'image_gather4_l')
     refused(shader(opcode=0x4f), 'image_gather4_c_lz')

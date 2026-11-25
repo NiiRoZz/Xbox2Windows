@@ -43,8 +43,10 @@ def decode(raw):
     return raw.decode("utf-16" if wide else "utf-8-sig", errors="replace")
 
 
-def run_case(shell, script, code, work):
-    """Run one copy of the script on a stub that exits with `code`; return what is wrong."""
+def run_case(shell, script, code, work, switches=(), passed=()):
+    """Run one copy of the script on a stub that exits with `code`; return what is wrong.
+
+    `switches` are extra run.ps1 switches and `passed` the debugger arguments they must add."""
     root = Path(tempfile.mkdtemp(dir=work))
     startup = root / "tools" / "startup"
     startup.mkdir(parents=True)
@@ -63,7 +65,7 @@ def run_case(shell, script, code, work):
     env["PATH"] = os.path.dirname(sys.executable) + os.pathsep + env.get("PATH", "")
     command = [shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(startup / "run.ps1"),
                "-Exe", str(exe), "-DataDir", str(data), "-LogDir", str(log), "-BuildDir", "bld",
-               "-Seconds", "9", "-MemoryGiB", "3", "-ContinueAsserts", "4"]
+               "-Seconds", "9", "-MemoryGiB", "3", "-ContinueAsserts", "4", *switches]
     try:
         out = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True,
                              errors="replace", timeout=120)
@@ -82,7 +84,7 @@ def run_case(shell, script, code, work):
     elif [line.strip() for line in decode(summary.read_bytes()).splitlines() if line.strip()] != STUB_LINES:
         found.append(f"stub exit {code}: {summary.name} does not hold the debugger's output")
     want = [str(exe), str(data), str(log), "--timeout", "9", "--memory-gib", "3",
-            "--trace-files", "1", "--continue-asserts", "4"]
+            "--trace-files", "1", "--continue-asserts", "4", *passed]
     record = startup / "argv.json"
     got = json.loads(record.read_text(encoding="utf-8")) if record.is_file() else None
     if got != want:
@@ -96,6 +98,9 @@ def run_problems(shell, script, work, first_only):
         found += run_case(shell, script, code, work)
         if found and first_only:
             break
+    if not found or not first_only:
+        # -TraceCalls arms the debugger's call hooks; without it the arguments above stay as they are.
+        found += run_case(shell, script, 0, work, ["-TraceCalls"], ["--trace-calls", "1"])
     return found
 
 
