@@ -9472,7 +9472,7 @@ the shape and refuses every other program with the first difference. The
 lowering clamps both counts to the 128 threads of a group and each index to
 the last vertex. It reads 9-bit indices, ignores the edge flags, and gives a
 primitive whose null bit (31) is set one vertex three times, so it covers no
-pixel. A depth-only pixel program is refused. The source-built fixture draws
+pixel. A depth-only pixel program is translated (see below). The source-built fixture draws
 on WARP and a hardware
 adapter and matches a CPU rasteriser. The runtime does not load the
 translated pair, so the dispatch stays unforwarded.
@@ -9488,10 +9488,22 @@ The one-pixel negative control uses that same published pair.
 
 The translator also accepts the same slot 57 mesh shape with an empty
 `req_<key>.ps57`. It emits the mesh stage alone, keeping position and
-primitive exports, and records `ps none` in `<key>.ms57.txt`. A null-export
-depth-only pixel stage is still refused. Run
+primitive exports, and records `ps none` in `<key>.ms57.txt`. Run
 `python -B tests/startup_mesh57_skeleton_check.py` for the source and cache
 checks, or run the `startup_mesh57_skeleton` CTest checks below for the DXC mode.
+
+A pixel stage whose only export is `exp null off, off, off, off done vm` (the
+depth-only form of LLVM `SILateBranchLowering` and Mesa ACO
+`create_fs_null_export`) is translated with the pair. The null target writes
+no channel; when the stage narrowed EXEC first, as an alpha test does, the `vm`
+flag keeps its `discard`. The pixel stage is emitted as `void main(PSIn i)`
+with no `SV_Target`, and the manifest has an empty `targets` line instead of
+`ps none`, because the stage still decides coverage. Run
+`python -B tests/startup_mesh57_depth_only_check.py`: it checks the discard,
+the empty `targets` line, a control without the EXEC narrowing (no discard)
+and a null export followed by a position export (still refused). Nothing is
+drawn. The runtime does not load slot 57 results yet, so these draws are not
+submitted.
 
 The pending scan checks the DXContainer header and file length for every
 required slot 57 bytecode artifact. A `ps none` result needs the mesh artifact

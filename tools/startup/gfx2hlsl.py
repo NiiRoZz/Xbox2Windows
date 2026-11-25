@@ -7561,8 +7561,6 @@ def translate_mesh57(out_dir, key):
         null_only = {a.split()[1] for _, _, op, a in pixel if op == 'exp'} == {'null'}
         if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps' and not null_only:
             raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
-        if null_only:
-            raise Unsupported('slot 57 mesh with a depth-only pixel stage is not covered')
     pipe = MeshPipeline(ms, ps or None, root)
     sources = [('ms', 'ms_6_5', pipe.hlsl_ms())]
     if ps:
