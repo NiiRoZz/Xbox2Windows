@@ -149,6 +149,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_image_load_mip_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_operand_count_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_mad_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_compute_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_swap_check.py
 ./out/pe-env/bin/python -B tests/startup_image_2d_array_check.py
 ./out/pe-env/bin/python -B tests/startup_image_sample_a16_check.py

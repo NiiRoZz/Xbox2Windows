@@ -12061,6 +12061,40 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_mad_' -V
 python -B tests/startup_gfx2hlsl_mad_check.py binary llvm-mc-15
 ```
 
+## Compute stage in the startup translator
+
+`gfx2hlsl.ComputePipeline` translates one gfx1013 compute program with the root and resource model of
+the graphics stages. The caller passes `COMPUTE_PGM_RSRC2` and the thread group size, which are pipeline
+register state. Root parameters start at s4. Each group-ID axis enabled by `TGID_X/Y/Z_EN` gets the next
+SGPR after the user SGPRs, with no gap for an omitted axis (`SV_GroupID`), and v0-v2 hold
+`SV_GroupThreadID` up to `TIDIG_COMP_CNT`. This is the layout `compute_store_aot` uses (#1608).
+`TG_SIZE_EN` stays refused. A numeric read of a user SGPR that the root signature does not place,
+including s0-s3, is refused because its value is unknown.
+
+The output is a `cs` HLSL main with `[numthreads]` and a version 2 manifest. The manifest has
+`stage cs` and `group` lines, plus one `uav <slot> table <param> <byte offset>` line for each store
+target. The only store lowered is `buffer_store_dword[x2|x3|x4]` in the `offen` form: a per-lane byte VGPR, plus
+the scalar offset and the immediate, through a descriptor at a fixed root-table offset. It writes a
+`RWByteAddressBuffer`. Other forms are refused: `off`, `idxen`, the cache-policy flags, a store
+through a modified descriptor, and a descriptor that is also loaded.
+The runtime has no slot-67 path yet, so no translated compute program runs in the stand-in.
+
+`startup_gfx2hlsl_compute_check.py` translates two source-built programs. Case A enables all three
+group-ID axes and v0-v2, with group size 2x3x4 and 3x2x2 groups. Case B enables X and Z only, so Z
+is s8, with group size 5x2x1 and 4x1x3 groups, and stores two words at an immediate offset. Each thread
+reads a read buffer at its own index and stores to its own destination. DXC compiles the HLSL for
+`cs_6_0`, and a plain D3D12 device dispatches it with a root SRV, a root UAV and the root constants.
+All 320 words are compared, including the sentinels. The two controls swap the X and Y group IDs, or
+drop the store, and each must mismatch.
+
+On Windows 11 (26300), all 320 words matched in both cases on WARP (10.0.26100.10068) and on an
+RTX 5090 (32.0.16.2135), with the debug layer on.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
+python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
+```
+
 ## Startup translator: refusal census
 
 The startup shader translator normally stops a pipeline at its first refusal. Fixing that refusal can expose gaps that were previously hidden, as documented in the [issue #1723 census](https://github.com/R0Y00/Xbox2Windows/issues/1723).
