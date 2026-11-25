@@ -330,6 +330,28 @@ Checks:
   and never substituted; a packed view of a plain R8G8B8A8_UNORM texture and a
   B5G5R5A1 view of a B4G4R4A4 target must be refused.
 
+## Shared-exponent render and unordered-access targets
+
+The packed-target mapping also covers single-sample 2D textures and arrays in
+`R9G9B9E5_SHAREDEXP` (67) that request a render target, a typed UAV, or both.
+When the adapter lacks one of the requested uses and supports all of them for
+`R11G11B10_FLOAT` (26), the stand-in creates format 26. Sampled-only resources,
+depth-stencil, multisampled textures and other dimensions keep format 67.
+The format query also preserves native format 67 where it supports the requested
+uses. [Microsoft Direct3D format specification](https://microsoft.github.io/DirectX-Specs/d3d/D3D12R9G9B9E5Format.html)
+
+The stand-in carries a format-67 tag. RTVs, UAVs and SRVs naming 67 on that
+resource use format 26, including SRVs reconstructed by the translated draw.
+An optimized clear value naming 67 follows the replacement format. A format-67
+view on a native format-67 texture is passed through. A format-67 view on an
+incompatible texture is refused.
+
+Both formats use 32 bits per texel and clamp negative values to zero.
+Format 26 has 6/6/5 mantissa bits with a separate exponent per channel.
+Format 67 has three 9-bit mantissas with a shared exponent. Rendered and
+UAV-written values can round differently. Uploads and copies in the format-67
+bit layout are not converted.
+
 ## Descriptor heap starts that are not addresses
 
 A console executable treats the CPU start of a descriptor heap as an address. A desktop handle is
@@ -991,6 +1013,21 @@ text is grouped as `other (text omitted)` and never copied; raw snippets stay in
 outcome (`aliased`, `not_aliased`, `failed`) in a separate table, and a line with an HRESULT other than 0
 (or an uncommitted address) still counts as `failed` and as an unhandled `Device::slot133` event.
 
+The `ExecuteIndirect` table reports the highest sampled cumulative count for each outcome and
+command-signature kind in the `x2w-render indirect:` census. A repeated snapshot does not increase
+any count. Each cell can come from a different sample, so avoid summing the cells as one run's total
+when scanning multiple runs. The section appears only after a complete census line and can show zero
+forwarded `dispatchmesh` calls alongside a graphics-pipeline refusal count. Forwarded counts describe
+the runtime's forwarding path. GPU completion and image readback require separate evidence.
+
+The GPU Memory Budget section uses complete `x2w-budget` heartbeat lines from
+`X2W_D3D12_BUDGET=1`. It counts samples above the local DXGI budget and prints
+the sample with the highest usage-to-budget ratio, plus the sample with the most
+retained texture bytes. Each row keeps the usage, budget and texture counters
+from that same heartbeat. Samples with an unavailable or zero local budget
+still contribute texture counts. The over-budget count describes observations
+in the supplied logs.
+
 The `Run End-Point` section says how far a run got and how it ended, so that reports of runs with different
 memory caps can be told apart. It gives the largest `commit peak=` value of the `x2w-dstorage heartbeat` lines (not
 the last one), the highest heartbeat second, the counts of the last `failed requests by cause` heartbeat line (the
@@ -1054,6 +1091,20 @@ Every file in `OUT` is written by untrusted code. Read it; do not execute anythi
 Archive each run's logs together with a copy of `shader_cache/`, and leave the cache in place for the next run. With a cold cache, every draw whose pipeline has not been translated yet is counted as "not drawn" and is missing from the frame.
 
 When the translator handles more, the next `--pending` pass retries the waiting requests from the same cache. This holds only while the pipeline key is unchanged. The key hashes a translation revision string (`x2w-startup-shader-N`, in `pipeline_key` in `gfx2hlsl.py` and in the runtime). After a revision change the runtime asks for new keys, and the old requests stay in the cache.
+
+**Re-key the old requests after a revision change.** The new cache is cold, so a run would have to request every pipeline again. `tools/startup/shader_cache_rekey.py` copies the graphics, RTV variant and slot 67 compute requests of the old cache under the keys of the current revision, computed with `pipeline_key` and `compute_key` of the `gfx2hlsl.py` next to it. Stop the title and any `--pending` loop first; nothing else may write the cache. Then:
+
+```powershell
+.\out\pe-env\Scripts\python.exe -B tools\startup\shader_cache_rekey.py out\startup\shader_cache out\startup\shader_cache_rekeyed
+.\out\pe-env\Scripts\python.exe -B tools\startup\gfx2hlsl.py --pending out\startup\shader_cache_rekeyed
+robocopy out\startup\shader_cache_rekeyed out\startup\shader_cache /XC /XN /XO
+```
+
+1. The re-key step only reads the old cache and writes request files (`req_*`) only, never results or `.fail`. A file already in the new directory is left as it is, so a second run writes nothing. It reads every request before it writes: if a part is missing or unreadable, or an RTV variant is malformed or names a base that is not in the cache, it prints how many, writes nothing and exits with 1. Slot 57 and slot 86 mesh requests have their own key strings and are not re-keyed. `X2W_TRANSLATE_JOBS` sets the number of hashing processes.
+2. `--pending` translates the re-keyed requests offline, as it does for a running title's cache.
+3. The `robocopy` switches skip every file that already exists in the cache, so results the runtime or a later pass wrote are kept. A `robocopy` exit code below 8 means success: 1 is set when files were copied, and 2 is set because the cache holds files that the new directory does not. A code of 8 or more is a failure. On Linux, run the same steps with `./out/pe-env/bin/python` and merge with `cp -rn out/startup/shader_cache_rekeyed/. out/startup/shader_cache/`, which also keeps existing files.
+
+`tests/startup_shader_cache_rekey_check.py` checks the tool on synthetic requests only: the names match the current keys, a newer revision gives other names, a second run and a current cache change nothing, and an incomplete request or an RTV variant without its base writes nothing. Re-keying recovers the requests, not the translations: some re-keyed pipelines can still fail to translate, which is separate from the cache key. Nothing here shows that a title runs.
 
 When `fxc` is available, a request that later translates loses its `.fail`. In manifest-only mode (`X2W_FXC` empty) the old `.fail` stays, so on a kept cache the `.fail` categories in `triage.md` can include pipelines that now have a `.txt`. That table counts category tokens over all `.fail` files, up to `--max-items`.
 
