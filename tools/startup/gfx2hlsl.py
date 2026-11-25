@@ -3116,7 +3116,7 @@ class Stage:
             d = reg_range(dname)[1]
             own = self.sym.get(d)
             raw = (raw_descriptor_alu(base, syms, [self.const_u32(t) for t in srcs])
-                   if getattr(self, 'kind', None) == 'cs' and len(syms) == 2 else None)
+                   if getattr(self, 'kind', None) in ('cs', 'vs') and len(syms) == 2 else None)
             if base in ('s_mov_b32', 's_mov_b64'):
                 self.sym[d] = syms[0]
                 if pair:
@@ -3494,12 +3494,13 @@ class Stage:
                     self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, off + 4 * i))
                 return
             # The pointer symbol does not record an addend or a rewritten high word, so two loads through such a
-            # pointer may read different words under the same (source, offset). In a compute stage those loads
-            # are told apart by the offset of the s_load; loads through the untouched pair keep one identity.
+            # pointer may read different words under the same (source, offset). In a compute or vertex stage (the
+            # stages that accept a raw descriptor conversion before a store) those loads are told apart by the
+            # offset of the s_load; loads through the untouched pair keep one identity.
             # A 32-bit table pointer carries a high word the program sets to a constant: loads through the same
             # untouched low word and the same constant read the same words (tag -1 - constant).
             hi = self.sym.get(base[1] + 1)
-            if getattr(self, 'kind', None) != 'cs' or (p == ('ptr', p[1]) and hi == ('ptrhi', p[1])):
+            if getattr(self, 'kind', None) not in ('cs', 'vs') or (p == ('ptr', p[1]) and hi == ('ptrhi', p[1])):
                 load = ()
             elif p == ('ptr', p[1]) and hi and hi[0] == 'const' and len(hi) == 2:
                 load = (-1 - hi[1],)
@@ -3801,7 +3802,8 @@ class Stage:
         if key[0][0] != 'table' or key[1] is None:
             raise Unsupported('buffer store through %s' % (key,))
         if key in self.pipe.modified:
-            raise Unsupported('buffer store through a modified descriptor')
+            # Only the modifications a compute store accepts: the stride clear or the structured-to-raw conversion.
+            self.store_descriptor(ops[2], 4, 'buffer store', stride0_ok=True, raw_conversion_ok=True)
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             offset += int(ops[3], 0)
             soffset = ''
@@ -6022,7 +6024,7 @@ class Pipeline:
         self.uds = []         # entry-constant sources
         self.notes = set()    # shortcuts taken (written to the manifest as comments)
         self.lod_unvalidated = set()  # image_sample forms read through a heap sampler (LOD fields unchecked, #2221)
-        self.modified = set()
+        self.modified, self.other_modified = set(), set()  # other: unproved descriptor writes
         self.rect = self.ud(('rect',))
         if refusals is None:
             self.vs = Stage(self, self.vertex_kind, vs_code)
