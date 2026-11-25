@@ -182,9 +182,9 @@ def controls():
     base = 'v_mov_b32_dpp v5, v0 quad_perm:[1,0,3,2] row_mask:0xf bank_mask:0xf'
     check('the plain swap is accepted', refused(base) is None)
     check('bound_ctrl:1 is accepted (a quad_perm source is always in range)', refused(base + ' bound_ctrl:1') is None)
+    check('quad broadcast also translates', refused(base.replace('[1,0,3,2]', '[0,0,0,0]')) is None)
+    check('pair broadcast also translates', refused(base.replace('[1,0,3,2]', '[1,1,3,3]')) is None)
     cases = [
-        ('broadcast [0,0,0,0] (item A)', base.replace('[1,0,3,2]', '[0,0,0,0]'), {}),
-        ('pair broadcast [1,1,3,3] (item C)', base.replace('[1,0,3,2]', '[1,1,3,3]'), {}),
         ('identity [0,1,2,3]', base.replace('[1,0,3,2]', '[0,1,2,3]'), {}),
         ('partial row_mask', base.replace('row_mask:0xf', 'row_mask:0x3'), {}),
         ('partial bank_mask', base.replace('bank_mask:0xf', 'bank_mask:0x5'), {}),
@@ -233,12 +233,12 @@ def controls():
           'F(QuadReadAcrossX(v0))' in line and 'F(v1)' in line and 'QuadReadAcrossX(v1)' not in line)
 
     # 6. A pair that needs shader model 6.0 is refused when no DXC exists and published without bytecode otherwise.
-    saved = {k: os.environ.get(k) for k in ('X2W_FXC', 'X2W_DXC', 'PATH')}
+    saved = os.environ.get('X2W_FXC')
+    real_find = G.find_dxc
     try:
         with tempfile.TemporaryDirectory() as tmp:
             os.environ['X2W_FXC'] = sys.executable  # any existing file: only its presence is read before DXC is looked up
-            os.environ.pop('X2W_DXC', None)
-            os.environ['PATH'] = tmp
+            G.find_dxc = lambda: None
             message = G.translate_to(tmp, 1, VS_WORDS, fixture('or')[1], root_blob())
             check('without dxc the quad swap pair is refused with a reason: %s' % message,
                   'dxc not found' in message and os.path.exists(os.path.join(tmp, '%016x.fail' % 1)))
@@ -246,11 +246,11 @@ def controls():
             check('with check=False the pair is published without bytecode: %s' % message,
                   message == 'ok' and os.path.exists(os.path.join(tmp, '%016x.txt' % 2)))
     finally:
-        for key, value in saved.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        G.find_dxc = real_find
+        if saved is None:
+            os.environ.pop('X2W_FXC', None)
+        else:
+            os.environ['X2W_FXC'] = saved
 
 
 def check_binary(llvm_mc):
