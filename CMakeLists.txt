@@ -3398,6 +3398,15 @@ if(EXISTS "${INTAKE_PYTHON}")
     set_tests_properties(startup_small_texture_4k_xg startup_small_texture_4k_xg_no_limit_control
         PROPERTIES TIMEOUT 30 ENVIRONMENT "X2W_D3D12_PERMISSIVE=1")
     set_tests_properties(startup_small_texture_4k_xg_no_limit_control PROPERTIES WILL_FAIL TRUE)
+    # gfx2hlsl v_mul_hi_u32 (#870): CPU helper evaluation, refusal and mutation controls, then desktop draw (FXC 5_1 and DXC 6_0).
+    add_test(NAME startup_gfx2hlsl_mul_hi_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_mul_hi_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_hi_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_mul_hi_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     add_test(NAME startup_xg_bc_tiling COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_xg_bc_tiling_check.py" "$<TARGET_FILE:startup_stub_xg_xs>")
     set_tests_properties(startup_xg_bc_tiling PROPERTIES TIMEOUT 30 ENVIRONMENT "X2W_D3D12_PERMISSIVE=1")
@@ -3691,6 +3700,8 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Device slot 67 compute requests offline: key vector, --pending and --refusals (pure Python).
     add_test(NAME startup_compute_request_offline COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_request_offline_check.py")
+    add_test(NAME compute_container_index COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/compute_container_index_check.py")
     # Partial colour exports carry their channel mask to the manifest; compressed exports of whole pairs lower (#1674).
     add_test(NAME startup_gfx2hlsl_export_mask COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_export_mask_check.py")
