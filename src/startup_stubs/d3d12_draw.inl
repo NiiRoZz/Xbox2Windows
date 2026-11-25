@@ -226,6 +226,137 @@ Translation* cached_translation(const void* a, std::size_t a_bytes, const void* 
     return entry;
 }
 
+LONG compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words;
+
+// Device slot 67 (console compute program), 12 64-bit words: 0 (root signature), 1-2 and 3-4 (two state
+// blocks and sizes, a size of 0 meaning absent), 5-6 (program code and size), 7-8 (a second blob and size),
+// 9 and 10 (pointers whose targets are not decoded) and 11 (a value). The request carries .desc (the 12
+// words with the seven pointer words always zeroed, so no process address reaches a cache file or the key),
+// .sa, .sb, .data and .root, then .c67 (the code) last as the ready marker, for an offline compute stage
+// (tools/startup/gfx2hlsl.py). Any declared part that cannot be read refuses the whole request before a
+// file is written. The pipeline stays
+// a placeholder. Like the graphics path, a key is published once per cache whether or not a result exists.
+constexpr u64 compute_code_limit = 1u << 20, compute_data_limit = 1u << 20, compute_state_limit = 0x1000;
+
+// The key frames every part with its length, so moving bytes from one part to the next changes it.
+u64 fnv_part(const std::vector<unsigned char>& part, u64 key)
+{
+    const u64 bytes = part.size();
+    return fnv_bytes(part.data(), part.size(), fnv_bytes(&bytes, sizeof(bytes), key));
+}
+
+// A fault-safe copy of title memory: the parts are read once, then hashed, scanned and written from the copy,
+// so a title write in between cannot leave a file that does not match its key.
+bool copy_title_bytes(void* to, const void* from, std::size_t bytes) noexcept
+{
+    __try {
+        std::memcpy(to, from, bytes);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return true;
+}
+
+// Aligned qwords of a published blob that name committed memory of this process (one VirtualQuery each, so
+// no fault is taken): such a value makes the key run-dependent. They are counted and published, not refused
+// (shortcut: hash-like values can name memory by chance; refuse once a decoder names the pointer fields).
+LONG pointer_like_qwords(const std::vector<unsigned char>& blob)
+{
+    LONG found = 0;
+    for (std::size_t at = 0; at + 8 <= blob.size(); at += 8) {
+        u64 value;
+        std::memcpy(&value, blob.data() + at, sizeof(value));
+        MEMORY_BASIC_INFORMATION info{};
+        if (value >= 0x10000 && value < 0x800000000000ull &&
+            VirtualQuery(reinterpret_cast<const void*>(value), &info, sizeof(info)) == sizeof(info) && info.State == MEM_COMMIT)
+            ++found;
+    }
+    return found;
+}
+
+SRWLOCK compute_request_lock = SRWLOCK_INIT;
+std::unordered_set<u64>& compute_keys_seen() { static std::unordered_set<u64> s; return s; }
+
+void publish_compute_request(const void* desc)
+{
+    wchar_t marker[MAX_PATH];
+    if (!render_mode() || !cache_path(marker, L"req_", 0, L".c67")) return;  // publishing disabled
+    static LONG logged;
+    const char* refusal = nullptr;
+    u64 words[12]{};
+    std::vector<unsigned char> root_blob;
+    if (!desc || !x2w_local::readable(desc, sizeof(words)) || !copy_title_bytes(words, desc, sizeof(words)))
+        refusal = "description unreadable";
+    else {
+        if (Wrapper* root = as_wrapper(reinterpret_cast<const void*>(words[0]))) {
+            AcquireSRWLockShared(&note_lock);
+            const auto found = root_blobs().find(root);
+            if (found != root_blobs().end()) root_blob = found->second;
+            ReleaseSRWLockShared(&note_lock);
+        }
+        if (root_blob.empty()) refusal = "no root signature blob";
+    }
+    struct Part { int pointer; u64 limit; bool required; const char *zero, *over, *unreadable; };
+    static constexpr Part parts[4] = {
+        {5, compute_code_limit, true, "code size 0", "code size over 1 MiB", "code unreadable"},
+        {7, compute_data_limit, true, "data size 0", "data size over 1 MiB", "data unreadable"},
+        {1, compute_state_limit, false, nullptr, "state block A size over 4 KiB", "state block A unreadable"},
+        {3, compute_state_limit, false, nullptr, "state block B size over 4 KiB", "state block B unreadable"},
+    };
+    std::vector<unsigned char> copies[4];  // code, data, state A, state B
+    for (int i = 0; i < 4 && !refusal; ++i) {
+        const Part& p = parts[i];
+        const u64 bytes = words[p.pointer + 1];
+        const auto* at = reinterpret_cast<const void*>(words[p.pointer]);
+        if (!bytes) refusal = p.required ? p.zero : nullptr;
+        else if (bytes > p.limit) refusal = p.over;
+        else {
+            copies[i].resize(static_cast<std::size_t>(bytes));
+            if (!x2w_local::readable(at, copies[i].size()) || !copy_title_bytes(copies[i].data(), at, copies[i].size()))
+                refusal = p.unreadable;
+        }
+    }
+    if (refusal) {
+        InterlockedIncrement(&compute_requests_failed);
+        if (first_calls(logged, 12)) log("x2w-draw compute request not written: %s", refusal);
+        return;
+    }
+    const auto& [code, data, state_a, state_b] = copies;
+    // Pointer words never reach .desc or the key; 9 and 10 are not followed (shortcut: two descriptions that
+    // differ only in what they point to share a key; publish those targets once they are decoded).
+    std::vector<unsigned char> fields(sizeof(words));
+    words[0] = words[1] = words[3] = words[5] = words[7] = words[9] = words[10] = 0;
+    std::memcpy(fields.data(), words, sizeof(words));
+    constexpr char compute_revision[] = "x2w-startup-shader-8cs";  // tools/startup/gfx2hlsl.py compute_key
+    u64 key = fnv_bytes(compute_revision, sizeof(compute_revision) - 1);
+    const std::vector<unsigned char>* order[] = {&code, &data, &root_blob, &fields, &state_a, &state_b};
+    for (const auto* part : order) key = fnv_part(*part, key);
+    // A dedicated lock and an in-memory set: a key seen in this process costs no file access, and draws
+    // under draw_lock are not held up by request writes.
+    const auto write = [key](const wchar_t* ext, const std::vector<unsigned char>& part) {
+        static const unsigned char none = 0;  // a valid buffer for a 0-byte part
+        return publish_shader_request(key, ext, part.empty() ? &none : part.data(), part.size());
+    };
+    AcquireSRWLockExclusive(&compute_request_lock);
+    bool present = compute_keys_seen().count(key) != 0;
+    bool written = present;
+    if (!present) {
+        present = cache_path(marker, L"req_", key, L".c67") && GetFileAttributesW(marker) != INVALID_FILE_ATTRIBUTES;
+        // Parts left by an interrupted earlier write are kept; the marker comes last, so the request completes here.
+        written = present || (write(L".desc", fields) && write(L".sa", state_a) && write(L".sb", state_b) &&
+                              write(L".data", data) && write(L".root", root_blob) && write(L".c67", code));
+        if (written) compute_keys_seen().insert(key);
+    }
+    ReleaseSRWLockExclusive(&compute_request_lock);
+    const LONG pointers = written && !present ? pointer_like_qwords(data) + pointer_like_qwords(state_a) + pointer_like_qwords(state_b) : 0;
+    if (pointers) InterlockedAdd(&compute_blob_pointer_words, pointers);
+    InterlockedIncrement(present ? &compute_requests_present : written ? &compute_requests_published : &compute_requests_failed);
+    if (first_calls(logged, 12))
+        log("x2w-draw compute request %016llx %s (code %llu bytes, data %llu bytes, state blocks %llu + %llu bytes, "
+            "pointer-like blob qwords %ld)", key, present ? "already present" : written ? "published" : "not written",
+            words[6], words[8], words[2], words[4], pointers);
+}
+
 // The INPUT_LAYOUT subobject as the request text tools/startup/gfx2hlsl.py reads: "ia1 <count>", then one
 // "<semantic> <index> <format> <slot> <offset> <class> <step>" line per element. False when it cannot be read.
 bool stream_input_layout(const unsigned char* subobject, std::string& text)

@@ -2706,6 +2706,31 @@ def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
     return fnv(layout, key) if layout else key
 
 
+def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
+    """The runtime key of a device slot 67 compute request (req_<key>.c67, .data, .root, .desc, .sa, .sb): the
+    graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
+    the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
+    state blocks."""
+    key = fnv(b'x2w-startup-shader-8cs')
+    for part in (cs_code, data, root_blob, desc, state_a, state_b):
+        key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
+    return key
+
+
+COMPUTE_UNSUPPORTED = 'compute stage not supported'
+
+
+def compute_refusals(out_dir, key):
+    """Refusal sites of one slot 67 compute request. No compute stage yet: every request waits in the cache."""
+    return [(COMPUTE_UNSUPPORTED, 'pipeline')]
+
+
+def translate_compute(out_dir, key):
+    """Record why a slot 67 compute request is not translated, the way a refused graphics request is."""
+    open(os.path.join(out_dir, '%016x.fail' % key), 'w').write(COMPUTE_UNSUPPORTED + '\n')
+    return 'unsupported: %s' % COMPUTE_UNSUPPORTED
+
+
 DEFAULT_FXC = r'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\fxc.exe'
 KITS_BIN = r'C:\Program Files (x86)\Windows Kits\10\bin'
 
@@ -2905,7 +2930,9 @@ def load_request(out_dir, key, refusals=None, pair_info=None):
 
 
 def translate_request(out_dir, key):
-    """Translate a base shader request or an RTV variant referencing its source blobs."""
+    """Translate a base shader request, an RTV variant referencing its source blobs, or a slot 67 compute request."""
+    if is_compute_request(out_dir, key):
+        return translate_compute(out_dir, key)
     try:
         kinds, root, formats, request, fetch, _, attr_map = load_request(out_dir, key)
     except (Unsupported, OSError, UnicodeError) as reason:
@@ -2923,11 +2950,17 @@ REFUSALS_CAVEAT = ('Counts after the first refusal are approximate. Skipped inst
                    'so Only counts at pipeline scope reflect a lower bound on the reasons reached.')
 
 
-def request_keys(out_dir):
+def request_keys(out_dir, compute=False):
+    """Graphics request keys (ready marker .a or .rtv), or with compute, slot 67 compute keys (.c67)."""
+    pattern = r'req_([0-9a-f]{16})\.c67' if compute else r'req_([0-9a-f]{16})\.(?:a|rtv)'
     for name in sorted(os.listdir(out_dir)):
-        match = re.fullmatch(r'req_([0-9a-f]{16})\.(?:a|rtv)', name)
+        match = re.fullmatch(pattern, name)
         if match:
             yield int(match.group(1), 16)
+
+
+def is_compute_request(out_dir, key):
+    return os.path.isfile(os.path.join(out_dir, 'req_%016x.c67' % key))
 
 
 def normalize_refusal(reason):
@@ -3026,7 +3059,23 @@ def refusals_report(out_dir):
                                  reasons=sorted(rows.values(), key=lambda row: (-row['containing'], row['reason'], row['scope']))),
                 per_code_pair=dict(examined=len(pairs),
                                    reasons=sorted(pair_rows.values(), key=lambda row: (row['reason'], row['scope']))),
+                compute=compute_refusals_report(out_dir),
                 caveat=REFUSALS_CAVEAT)
+
+
+def compute_refusals_report(out_dir):
+    """Slot 67 compute requests, kept apart so the graphics statistics above do not move."""
+    examined, clean, rows = 0, 0, {}
+    for key in request_keys(out_dir, compute=True):
+        examined += 1
+        sites = [normalize_refusal(reason) for reason, _ in compute_refusals(out_dir, key)]
+        clean += not sites
+        for reason in set(sites):
+            row = rows.setdefault(reason, dict(reason=reason, containing=0, first=0))
+            row['containing'] += 1
+            row['first'] += reason == sites[0]
+    return dict(examined=examined, no_refusal=clean,
+                reasons=sorted(rows.values(), key=lambda row: (-row['containing'], row['reason'])))
 
 
 def refusals_main(argv):
@@ -3060,6 +3109,13 @@ def refusals_main(argv):
     print('Under every root\tUnder some roots\tScope\tReason')
     for row in pairs['reasons']:
         print('%(under_every_root)d\t%(under_some_roots)d\t%(scope)s\t%(reason)s' % row)
+    compute = report['compute']
+    print('Compute requests (device slot 67)')
+    print('Compute requests examined: %d' % compute['examined'])
+    print('No refusal recorded (not compiled): %d' % compute['no_refusal'])
+    print('Containing\tFirst\tReason')
+    for row in compute['reasons']:
+        print('%(containing)d\t%(first)d\t%(reason)s' % row)
     print(REFUSALS_CAVEAT)
 
 
@@ -3172,7 +3228,7 @@ def pending_keys(out_dir, skip_failed):
     keys = []
     manifest_only = os.environ.get('X2W_FXC') == ''
     for name in sorted(os.listdir(out_dir)):
-        m = re.fullmatch(r'req_([0-9a-f]{16})\.(?:a|rtv)', name)
+        m = re.fullmatch(r'req_([0-9a-f]{16})\.(a|rtv|c67)', name)
         if not m:
             continue
         key = int(m.group(1), 16)
