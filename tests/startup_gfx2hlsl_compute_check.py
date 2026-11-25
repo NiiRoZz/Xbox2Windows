@@ -160,6 +160,7 @@ SPLICE = {
     'image_sample_lz v[12:15], v[0:1], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D': '080f9cf0000ca600',
     'buffer_store_dword v5, v4, s[16:19], 0 offen': '001070e004050480',
     'buffer_store_dword v5, v4, s[16:19], 0 offen offset:6': '061070e004050480',
+    'buffer_store_dword v5, v4, s[16:19], 0 offen offset:4092': 'fc1f70e004050480',
 }
 
 
@@ -279,6 +280,16 @@ def check_controls():
     # An immediate offset that is not a multiple of 4 is refused, not rounded down.
     refused('unaligned immediate offset 6', lambda: translate(
         'A', code=patch(WORDS_A, store, SPLICE['buffer_store_dword v5, v4, s[16:19], 0 offen offset:6'])).hlsl_cs())
+    # Past the range: today the translation carries no range check (num_records and stride are not read) and the
+    # manifest no size, so an out-of-range store reaches the UAV unguarded and only a runtime that sizes the view
+    # to the descriptor's range drops it. Pinned so a change of that policy has to update this control.
+    far = translate('A', code=patch(WORDS_A, store, SPLICE['buffer_store_dword v5, v4, s[16:19], 0 offen offset:4092']))
+    lines = far.hlsl_cs().splitlines()
+    at = lines.index('    a = (v4 + 4092) & 0xfffffffcu;')
+    assert lines[at + 1] == '    u0.Store(a, v5);', lines[at:at + 2]
+    body = far.hlsl_cs().split('void main(', 1)[1]
+    assert not any(word in body for word in ('GetDimensions', 'min(', 'if (a')), body
+    assert far.manifest().splitlines()[-1] == 'uav 0 table 1 16', far.manifest()
     # Descriptor words: a word that is overwritten, moved or modified before the store refuses it, including a word
     # that is not the first of its s_load and a constant move. Each input below was accepted before.
     for lines in (['s_mov_b32 s18, 0'], ['s_or_b32 s17, s17, 0x40000'], ['s_and_b32 s18, s18, 0xffff'],
