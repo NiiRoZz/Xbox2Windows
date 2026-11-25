@@ -4,7 +4,8 @@ A 32x32 R8G8B8A8 texture with two mips, layout UNKNOWN, asked at Alignment 0x100
 alignment. Its desktop linear footprint (256-byte rows) would not fit; the stand-in uses one compact plan
 instead: mip 0 at offset 0 in 128-byte rows, mip 1 at 0x1000 in 64-byte rows.
 Cases:
-  limited      Slot 2 reports 0x2000 at 0x1000 and exactly those mip records. Slot 8 writes both mips into a
+  limited      Slot 2 reports 0x2000 at 0x1000 and exactly those mip records. Slot 8 writes both mips (mip 0 from
+               a source with padded 160-byte rows) into a
                0x2000-byte allocation followed by a no-access guard page. Every row is distinct (row index and
                mip in each texel); mip 0 and mip 1 carry different sentinels. Memory must equal the plan
                byte for byte, the bytes after the plan keep their fill, and the guard is not touched.
@@ -89,7 +90,9 @@ def limited(create, alignment):
             size = total
         block = guarded(size)
         mip0, mip1 = texels(0, 32, 32), texels(1, 16, 16)
-        hr0 = computer.copy(block, 0, mip0, 128)
+        # Mip 0 comes from a source with 160-byte rows (32 bytes of padding each): the plan's rows stay 128 bytes.
+        padded = b"".join(mip0[y * 128:(y + 1) * 128] + b"\x77" * 32 for y in range(32))
+        hr0 = computer.copy(block, 0, padded, 160)
         hr1 = computer.copy(block, 1, mip1, 64)
         print(f"limited: slot 8 mip 0 -> 0x{hr0:08x}, mip 1 -> 0x{hr1:08x} (0x{size:x} bytes before a guard page)")
         assert (hr0, hr1) == (0, 0), (hex(hr0), hex(hr1))
