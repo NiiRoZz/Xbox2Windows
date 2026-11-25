@@ -1904,9 +1904,14 @@ class Stage:
             elif own and own[0] in ('desc', 'ptr', 'ptrhi') and any(s == own for s in syms):
                 if own[0] == 'desc':
                     self.pipe.modified.add(desc_key(own))
-                    # The word keeps its descriptor identity for loads; an exact-word check (unmodified_descriptor)
-                    # sees the mark.
-                    self.sym[d] = own[:4] + ('modified',)
+                    # The word keeps its descriptor identity for loads; the store check (store_descriptor) sees the
+                    # mark. In a compute stage, clearing the stride field of dword 1 (bits 29:16, keeping the base
+                    # address bits 15:0 and bits 31:30) is marked on its own: a raw byte-address store accepts it.
+                    stride0 = (getattr(self, 'kind', None) == 'cs' and base == 's_and_b32' and len(own) == 4
+                               and own[3] % 4 == 1 and sorted(srcs) == sorted([dname, '0xc000ffff']))
+                    self.sym[d] = own[:4] + ('stride0' if stride0 else 'modified',)
+                    if not stride0:
+                        getattr(self.pipe, 'other_modified', set()).add(desc_key(own))
                 else:
                     self.sym[d] = own if len(own) > 2 else own + ('added',)  # the added offset is not tracked
             else:
@@ -2369,6 +2374,24 @@ class Stage:
     def op_buffer_load_dwordx4(self, ops, mods):
         self.op_buffer_load_dword(ops, mods, 4)
 
+    def store_descriptor(self, tok, words, what, stride0_ok=False):
+        """Resource key of a store's descriptor operand: all its words must still be the loaded words of one
+        descriptor at a fixed table offset. A moved, overwritten or modified word (stride, num_records, format)
+        would change what the store does. With stride0_ok (a raw byte-address store), dword 1 may carry a cleared
+        stride field: that is the raw descriptor such a store already assumes."""
+        rsrc = reg_range(tok)
+        first = self.sym.get(rsrc[1]) if rsrc and rsrc[0] == 's' and rsrc[2] - rsrc[1] == words - 1 else None
+        if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 4:
+            raise Unsupported('%s through %s holding %s' % (what, tok, first))
+        key = desc_key(first)
+        def word_ok(k):
+            sym, want = self.sym.get(rsrc[1] + k), first[:3] + (first[3] + k,)
+            return sym == want or (stride0_ok and k == 1 and sym == want + ('stride0',))
+        if (not all(word_ok(k) for k in range(words)) or key in getattr(self.pipe, 'other_modified', ())
+                or (key in self.pipe.modified and not stride0_ok)):
+            raise Unsupported('%s through a modified descriptor' % what)
+        return key
+
     def op_buffer_store_dword(self, ops, mods, count=1):
         # Compute-stage store in the offen form: per-lane byte VGPR plus the scalar offset and the 12-bit immediate,
         # through a descriptor read from a fixed root-table slot, to a RWByteAddressBuffer (manifest `uav` line).
@@ -2389,16 +2412,7 @@ class Stage:
             raise Unsupported('buffer store data %s' % ops[0])
         if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
             raise Unsupported('buffer store vaddr %s for offen' % ops[1])
-        # All four words must still be the loaded words of one descriptor at a fixed table offset: a moved,
-        # overwritten or modified word (stride, num_records) would change what the store does.
-        rsrc = reg_range(ops[2])
-        first = self.sym.get(rsrc[1]) if rsrc and rsrc[0] == 's' and rsrc[2] - rsrc[1] == 3 else None
-        if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 4:
-            raise Unsupported('buffer store through %s holding %s' % (ops[2], first))
-        if (any(self.sym.get(rsrc[1] + k) != first[:3] + (first[3] + k,) for k in range(4))
-                or desc_key(first) in self.pipe.modified):
-            raise Unsupported('buffer store through a modified descriptor')
-        key = desc_key(first)
+        key = self.store_descriptor(ops[2], 4, 'buffer store', stride0_ok=True)
         terms = [self.u(ops[1])]
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             offset += int(ops[3], 0)
@@ -4275,7 +4289,7 @@ class ComputePipeline(Pipeline):
         self.sampler_heap = os.environ.get('X2W_SAMPLER_HEAP') == '1' if sampler_heap is None else sampler_heap
         self.uses_sampler_heap = False
         self.resources, self.uavs, self.samplers, self.uds = {}, {}, {}, []
-        self.notes, self.modified = set(), set()
+        self.notes, self.modified, self.other_modified = set(), set(), set()  # other: anything but a stride clear
         self.lod_unvalidated = set()
         self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
 
