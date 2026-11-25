@@ -571,6 +571,28 @@ def exec_absorbs(name, asm, word):
                for w, e in pairs)
 
 
+def kept_halves(name, asm, word, clear):
+    """Wave halves whose lanes keep their bit of `word` through `s_andn2 R, R, X` when X is clear for them: R & ~X
+    keeps bit n of R when bit n of X is clear. Empty for any other write of `word`."""
+    lanes = mask_lanes(name, asm)
+    if not lanes or lanes[0] != 'andn2' or lanes[1] != lanes[2][0]:
+        return set()
+    return {h for p, w in enumerate(lanes[1]) if w == word for key, h in clear if key == lanes[2][1][p]}
+
+
+def lane_read(name, asm, word, halves):
+    """True when an instruction reads `word` as a lane mask, bit n of each result from bit n of the sources, with
+    `word` in a position whose lanes are in `halves`, any exec operand there the exec word of those lanes, and the
+    result there written to that exec word or back to `word`, not copied to another register."""
+    lanes = mask_lanes(name, asm)
+    if not lanes:
+        return False
+    _, dest, srcs = lanes
+    at = {p for src in srcs for p, w in enumerate(src) if w == word}
+    return bool(at) and at <= halves and all(dest[p] in (word, ('exec', 'exec_hi')[p]) for p in at) and all(
+        w == ('exec', 'exec_hi')[p] for src in srcs for p, w in enumerate(src) if p in at and w in EXEC_KEYS)
+
+
 def scalar_effects(name, asm):
     """(reads, must-writes, may-writes) of scalar state for one decoded instruction."""
     base = re.sub(r'_e(32|64)$', '', name)
@@ -1511,7 +1533,13 @@ class Stage:
                             if b < s < t and before.get(s, after) & after != before.get(s):
                                 before[s], changed = before.get(s, after) & after, True
             # A live definition is still accepted when every read of it from the join on is proven (execz_live_read):
-            # where exec is unchanged since the join on every path from it.
+            # the halves whose lanes keep their bit of the word through the block, and where exec is unchanged since
+            # the join on every path from it.
+            kept = {}
+            for i in range(b + 1, t):
+                for word in (effects[i][2] - EXEC_KEYS) & live:
+                    halves = kept_halves(*self.ins[i][2:], word, before[i]) if i in before and not entered else set()
+                    kept[word] = kept.get(word, halves) & halves
             quiet, work = {t: True}, [t]
             while work:
                 i = work.pop()
@@ -1520,8 +1548,7 @@ class Stage:
                     if quiet.get(s, True) and not keep or s not in quiet:
                         quiet[s] = quiet.get(s, True) and keep
                         work.append(s)
-            unread = {word: self.execz_live_read(t, word, effects, succ, quiet)
-                      for word in set().union(*(effects[i][2] for i in range(b + 1, t))) & live - EXEC_KEYS}
+            unread = {word: self.execz_live_read(t, word, halves, effects, succ, quiet) for word, halves in kept.items()}
             for i in range(b + 1, t):
                 at, _, inner, inner_asm = self.ins[i]
                 may = effects[i][2]
@@ -1543,7 +1570,7 @@ class Stage:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
 
-    def execz_live_read(self, t, word, effects, succ, quiet):
+    def execz_live_read(self, t, word, halves, effects, succ, quiet):
         """None when every read of `word` from the join t of an execz block on, until a write of it ends the block's
         definition, gives a lane the model skipped the wave's result; else the first read that is not proven, or -1
         for m0 and SCC, which have implicit readers.
@@ -1552,7 +1579,11 @@ class Stage:
         exec writes), and the two differ there at most in `word`. A read is proven when:
         - exec is unchanged on every path from the join to it (`quiet`) and it reads `word` only as W & exec,
           ~(W & exec) or W | ~exec, exec of the same lanes (exec_absorbs): the lane's bit of the result is fixed
-          whatever its bit of `word` is, so the result agrees, and when it overwrites `word` the definition ends.
+          whatever its bit of `word` is, so the result agrees, and when it overwrites `word` the definition ends;
+        - the block keeps the lane's bit of `word` for its half (kept_halves: every write of `word` in the block is
+          s_andn2 R, R, X with X clear for the lane, checked over every path from the branch) and the read is a lane
+          mask read of that half (lane_read): the lane's bit of `word` is the model's, so its bit of the result is
+          too, and `word` written back that way keeps the property.
         Any other read, a data read or a copy into another register included, is not proven."""
         if not re.fullmatch(r'vcc(_hi)?|s\d+', word):
             return -1
@@ -1564,6 +1595,9 @@ class Stage:
             seen.add(j)
             name, asm = self.ins[j][2:]
             if word in effects[j][0]:
+                if halves and lane_read(name, asm, word, halves):
+                    work.extend(succ[j])
+                    continue
                 if not (quiet.get(j) and exec_absorbs(name, asm, word)):
                     unproven.append(j)
                     continue
