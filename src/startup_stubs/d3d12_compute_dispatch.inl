@@ -14,9 +14,13 @@ struct ComputeTranslation {
     std::vector<Slot> uds, srvs, uavs;
     x2w_startup::ComPtr<ID3D12RootSignature> root;
     x2w_startup::ComPtr<ID3D12PipelineState> pipeline;
+    const char* unmodelled = nullptr;      // why a manifest that exists cannot be used
+    u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
+    const char* first_refusal = nullptr;   // reason of the first refused call
+    std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any
 };
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
-LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated;
+LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 
 // draw_lock held. Returns the reason the translation is unavailable, or null when it is ready or still absent.
 const char* load_compute_translation(ComputeTranslation& tr)
@@ -92,9 +96,12 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     const char* reason = nullptr;
     LONG* counter = &compute_dispatches_refused;
     struct View { ID3D12Resource* resource; u64 offset, bytes; bool transition; } views[40]{};
-    ComputeTranslation* tr = nullptr;
     const auto type = list->GetType();
     AcquireSRWLockExclusive(&draw_lock);
+    ComputeTranslation* const tr = &compute_translations()[key];
+    tr->key = key;
+    ++tr->dispatches;
+    std::uint32_t words[4] = {};
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) reason = "the list type has no Dispatch";
     else if (x > x2w_startup::max_dispatch_groups || y > x2w_startup::max_dispatch_groups || z > x2w_startup::max_dispatch_groups)
         reason = "a group count is over the limit";
@@ -102,15 +109,14 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         reason = "the compute root set is not the one the pipeline was created with";
     else if (!ensure_draw_heap(self->own().list_device)) reason = "no descriptor heap on this device";
     else {
-        tr = &compute_translations()[key];
-        tr->key = key;
         if (!tr->state || (tr->retry_manifest_at && GetTickCount64() >= tr->retry_manifest_at)) {
-            if (const char* why = load_compute_translation(*tr))
-                log("x2w-draw compute pipeline %016llx not translated: %s", key, why);
+            tr->unmodelled = load_compute_translation(*tr);
+            if (tr->unmodelled) log("x2w-draw compute pipeline %016llx not translated: %s", key, tr->unmodelled);
         }
         if (tr->state != 1) {
-            reason = "no translation";
-            counter = &compute_dispatches_untranslated;
+            // A manifest the runtime cannot bind is the dispatch side's work; an absent one is the translator's.
+            reason = tr->unmodelled ? tr->unmodelled : "no translation";
+            counter = tr->unmodelled ? &compute_dispatches_unmodelled : &compute_dispatches_untranslated;
         }
     }
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
@@ -118,7 +124,7 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
         const u64 entry = slot.a >= 0 && slot.b >= 0 ? pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), 16) : 0;
-        std::uint32_t words[4];
+        std::memset(words, 0, sizeof(words));
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(words))) {
             reason = "a table descriptor is not bound";
             break;
@@ -147,11 +153,15 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         views[i] = {placed.alias, offset, bytes, true};
     }
     if (reason) {
+        if (!tr->first_refusal) {
+            tr->first_refusal = reason;
+            std::memcpy(tr->refusal_words, words, sizeof(words));
+        }
         ReleaseSRWLockExclusive(&draw_lock);
         InterlockedIncrement(counter);
         // Dispatches that arrive before the offline translation must not use up the lines for bind refusals.
         static LONG untranslated, refusals;
-        if (first_calls(counter == &compute_dispatches_untranslated ? untranslated : refusals, 16)) log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
+        if (first_calls(counter == &compute_dispatches_refused ? refusals : untranslated, 16)) log("x2w-draw compute %016llx Dispatch(%u, %u, %u) refused: %s", key, x, y, z, reason);
         return true;
     }
     const UINT n = static_cast<UINT>(count);
@@ -201,6 +211,7 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
         for (UINT parameter = 0; parameter < pass.desktop_compute_upload_srvs.size(); ++parameter)
             if (const auto address = pass.desktop_compute_upload_srvs[parameter]) list->SetComputeRootShaderResourceView(parameter, address);
     }
+    ++tr->translated;
     ReleaseSRWLockExclusive(&draw_lock);
     check_device("translated dispatch", 14);
     InterlockedIncrement(&compute_dispatches_translated);
@@ -210,3 +221,42 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
             values[0], values[1], values[2], values[3], inputs, count - inputs);
     return true;
 }
+
+// With the periodic totals: refused dispatches by the first refusal reason of their key, then the keys with the
+// most dispatches. The per-call log lines above share one small budget, so they cannot rank keys.
+void log_compute_census()
+{
+    struct Reason { const char* text; u64 keys, dispatches; };
+    std::vector<Reason> reasons;
+    std::vector<ComputeTranslation> keys;
+    AcquireSRWLockShared(&draw_lock);
+    for (const auto& item : compute_translations()) {
+        const ComputeTranslation& tr = item.second;
+        ComputeTranslation copy;
+        copy.key = tr.key;
+        copy.dispatches = tr.dispatches;
+        copy.translated = tr.translated;
+        copy.first_refusal = tr.first_refusal;
+        std::memcpy(copy.refusal_words, tr.refusal_words, sizeof(copy.refusal_words));
+        keys.push_back(copy);
+        if (!tr.first_refusal) continue;
+        auto found = std::find_if(reasons.begin(), reasons.end(), [&](const Reason& r) { return !std::strcmp(r.text, tr.first_refusal); });
+        if (found == reasons.end()) found = reasons.insert(reasons.end(), Reason{tr.first_refusal, 0, 0});
+        ++found->keys;
+        found->dispatches += tr.dispatches - tr.translated;
+    }
+    ReleaseSRWLockShared(&draw_lock);
+    if (keys.empty()) return;
+    std::sort(reasons.begin(), reasons.end(), [](const Reason& a, const Reason& b) { return a.dispatches > b.dispatches; });
+    std::sort(keys.begin(), keys.end(), [](const ComputeTranslation& a, const ComputeTranslation& b) { return a.dispatches > b.dispatches; });
+    log("x2w-render compute census: %zu keys dispatched", keys.size());
+    for (const Reason& r : reasons)
+        log("x2w-render compute census reason \"%s\": %llu keys, %llu dispatches", r.text, r.keys, r.dispatches);
+    for (std::size_t i = 0; i < keys.size() && i < 40; ++i)
+        log("x2w-render compute census key %016llx: %llu dispatches, %llu translated, first refusal: %s [%08x %08x %08x %08x]",
+            keys[i].key, keys[i].dispatches, keys[i].translated, keys[i].first_refusal ? keys[i].first_refusal : "none",
+            keys[i].refusal_words[0], keys[i].refusal_words[1], keys[i].refusal_words[2], keys[i].refusal_words[3]);
+}
+
+// Fixtures: the census without waiting for the frame that logs it.
+extern "C" __declspec(dllexport) void x2w_d3d12_compute_census() { log_compute_census(); }

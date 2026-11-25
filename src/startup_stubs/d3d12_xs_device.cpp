@@ -4820,9 +4820,11 @@ HRESULT __stdcall queue_present(Wrapper* self, UINT planes, const void* plane_pa
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::both_heaps_missing)],
             heap_root_refusals[static_cast<int>(x2w_startup::RealRootDecision::state_not_restorable)], indirect_first_lookups,
             compute_requests_published, compute_requests_present, compute_requests_failed, compute_blob_pointer_words);
-    if (render_mode() && frame % 300 == 0)
-        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld", compute_dispatches_translated,
-            compute_dispatches_refused, compute_dispatches_untranslated);
+    if (render_mode() && frame % 300 == 0) {
+        log("x2w-render compute dispatches: translated %ld, refused %ld, no translation %ld, not modelled %ld",
+            compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled);
+        log_compute_census();
+    }
     if (render_mode() && frame % 300 == 0) {
         // Slot-61 calls since the start, by outcome, then by signature kind (zero kinds left out).
         static const char* const outcomes[] = {"forwarded", "refused graphics-pipeline", "compute-pipeline",

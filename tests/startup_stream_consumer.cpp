@@ -18,6 +18,7 @@
 
 using Microsoft::WRL::ComPtr;
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+extern "C" __declspec(dllimport) void x2w_d3d12_compute_census();
 
 // A slot-55 patch is a tagged union with room for the full eight-target blend state.
 struct Patch { UINT tag; D3D12_BLEND_DESC blend; };
@@ -226,6 +227,7 @@ static int dispatch_slot67(void* device, const std::string& mode)
     }
     for (UINT i = 0; i < words; ++i)
         if (buffers[0][i] != 0x8b02a7f1u + i * 0x413b1u) return 79;  // the input must stay as written
+    x2w_d3d12_compute_census();
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
     if (!n || n >= MAX_PATH) return 2;

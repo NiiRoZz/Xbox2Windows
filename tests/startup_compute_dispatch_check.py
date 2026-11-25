@@ -69,6 +69,11 @@ def main(consumer, dxc, adapter):
         published = lines(result, 'x2w-draw compute request')
         assert published and ' published ' in published[0], result.stderr[-3000:]
         key = int(published[0].split()[3], 16)
+        census = lines(result, 'x2w-render compute census')
+        assert census == ['x2w-render compute census: 1 keys dispatched',
+                          'x2w-render compute census reason "no translation": 1 keys, 1 dispatches',
+                          f'x2w-render compute census key {key:016x}: 1 dispatches, 0 translated, first refusal: '
+                          'no translation [00000000 00000000 00000000 00000000]'], census
 
         out = subprocess.run([sys.executable, '-B', G.__file__, '--pending', cache], check=True, capture_output=True,
                              text=True, env=dict(os.environ, X2W_DXC=dxc)).stdout
@@ -79,6 +84,9 @@ def main(consumer, dxc, adapter):
         assert not wrong, 'word=%d got=%08x expected=%08x (%d words differ)\n%s' % (
             wrong[0], got[wrong[0]], expected[wrong[0]], len(wrong), result.stderr[-3000:])
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not lines(result, 'refused'), result.stderr[-3000:]
+        census = lines(result, 'x2w-render compute census')
+        assert len(census) == 2 and census[1].endswith(': 1 dispatches, 1 translated, first refusal: none '
+                                                       '[00000000 00000000 00000000 00000000]'), census
         layer = lines(result, 'x2w-d3d12 debug layer: ')
         errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
         assert not errors, errors[0]
@@ -86,10 +94,14 @@ def main(consumer, dxc, adapter):
 
         got, result = dispatch(directory, consumer, env, 'dispatch-none')
         assert got == untouched and not lines(result, 'Dispatch('), 'the output changed without a Dispatch'
+        assert not lines(result, 'x2w-render compute census'), 'a census without a Dispatch'
 
         got, result = dispatch(directory, consumer, env, 'dispatch-swapped')
         assert got == untouched, 'a refused Dispatch wrote the output'
         refused = lines(result, 'refused: ')
+        census = lines(result, 'x2w-render compute census')
+        assert len(census) == 3 and census[1].endswith(
+            'reason "an output is not an aliased placed buffer range with unordered access": 1 keys, 1 dispatches')             and '[00000000 00000000 ' not in census[2], census
         assert len(refused) == 1 and 'an output is not an aliased placed buffer range with unordered access' in refused[0], \
             result.stderr[-3000:]
         print(f'startup_compute_dispatch: PASS on {adapter} (all {C.WORDS} words match after translation; untouched '
