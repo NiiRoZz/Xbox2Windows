@@ -1774,6 +1774,7 @@ class Stage:
     def u(self, tok, *, low16_only=False):
         """uint expression for a 32-bit operand."""
         if tok in ('vcc_lo', 'vcc'):
+            self.read_vcc()
             return 'vcc'
         if tok in ('exec_lo', 'exec'):
             return 'exec'
@@ -1857,8 +1858,66 @@ class Stage:
         except ValueError:
             return None
 
+    def read_vcc(self):
+        if getattr(self, 'has_branches', False):
+            self.vcc_events.setdefault(self.pc, []).append(('read_vcc', None))
+        elif getattr(self, 'vcc_lost', False):
+            raise Unsupported('vcc read after a descriptor load into s106/s107')
+
     def emit(self, text):
+        if 'vcc' in text:
+            assignment = re.match(r'vcc = (.*);$', text)
+            rhs = assignment.group(1) if assignment else text
+            if re.search(r'\bvcc\b', rhs):
+                self.read_vcc()
+            if assignment:
+                if getattr(self, 'has_branches', False):
+                    self.vcc_events.setdefault(self.pc, []).append(('write_vcc', None))
+                if getattr(self, 'vcc_lost', False):
+                    # The scalar symbols are provisional across branches, checked after translation.
+                    self.vcc_lost = False
+                    self.vcc_descriptor_overwritten = True
+                    if not getattr(self, 'has_branches', False):
+                        self.sym.pop(106, None)
+                        self.sym.pop(107, None)
         self.lines.append(text)
+
+    def check_vcc_paths(self):
+        """An overlapping descriptor must reach its use on every path, and VCC must be numeric at a mask read."""
+        if not self.has_branches or not any(event == 'load_descriptor' for events in self.vcc_events.values()
+                                           for event, _ in events):
+            return
+        offsets = [off for off, _, _ in self.blocks]
+        index = {off: i for i, off in enumerate(offsets)}
+        by_block = [[] for _ in offsets]
+        block = 0
+        for off, events in sorted(self.vcc_events.items()):
+            while block + 1 < len(offsets) and offsets[block + 1] <= off:
+                block += 1
+            by_block[block].extend(events)
+        todo = [(0, None)]
+        seen = set()
+        while todo:
+            block, state = todo.pop()
+            if (block, state) in seen:
+                continue
+            seen.add((block, state))
+            for event, value in by_block[block]:
+                if event == 'read_vcc' and state is not None:
+                    raise Unsupported('vcc read after a descriptor load into s106/s107')
+                if event == 'read_descriptor':
+                    if state is None or any(state[reg] != symbol for reg, symbol in value):
+                        raise Unsupported('descriptor operand overlaps s106/s107 without a matching load on every path')
+                if event == 'load_descriptor':
+                    state = value
+                elif event == 'write_vcc':
+                    state = None
+            term = self.blocks[block][2]
+            if term and term[0] in ('jump', 'branch'):
+                if term[-1] in index:
+                    todo.append((index[term[-1]], state))
+            if (not term or term[0] == 'branch') and block + 1 < len(offsets):
+                todo.append((block + 1, state))
 
     def clear_low16(self, n):
         if isinstance(self.low16_only_v, set) and self.exec_known and n not in self.pinned_low16_v:
@@ -1969,6 +2028,12 @@ class Stage:
         """Resource key for a descriptor operand like s[8:11]: (source, byte offset or None)."""
         r = reg_range(tok)
         s = self.sym.get(r[1]) if r else None
+        if r and r[0] == 's' and r[1] <= 107 and r[2] >= 106:
+            if getattr(self, 'has_branches', False):
+                expected = tuple((i - 106, self.sym.get(i)) for i in range(max(106, r[1]), min(107, r[2]) + 1))
+                self.vcc_events.setdefault(self.pc, []).append(('read_descriptor', expected))
+            elif getattr(self, 'vcc_descriptor_overwritten', False):
+                raise Unsupported('descriptor operand %s overlaps a redefined vcc' % tok)
         if s and s[0] == 'desc':
             # A descriptor can start inside a wider load (s_load_dwordx16 fetches two image
             # descriptors): its offset is the load's offset plus the first register's dword index.
@@ -2401,6 +2466,7 @@ class Stage:
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
             self.float_const_s = {}     # SGPR -> 32-bit pattern from s_mov_b32 of an inline float constant
             self.has_branches = bool(targets)
+            self.vcc_events = {}
             self.entry_table_pointers = {
                 reg: sym[1] for reg, sym in init_sym.items()
                 if isinstance(reg, int) and sym[0] == 'ptr' and sym[1][0] == 'table'
@@ -2599,6 +2665,12 @@ class Stage:
                     raise Unsupported(reason)
                 refusals.append((reason, self.kind))
         self.pinned_low16_v.update(self.low16_only_v)
+        try:
+            self.check_vcc_paths()
+        except Unsupported as reason:
+            if refusals is None:
+                raise
+            refusals.append((str(reason), self.kind))
         leak = self.pinned_low16_v & self.whole_read_v
         if leak:
             reason = 'whole-word read of v%d after odd d16 image_load' % min(leak)
@@ -2872,6 +2944,8 @@ class Stage:
             self.emit('GroupMemoryBarrierWithGroupSync();')
             return None
         if base.startswith('s_cbranch_'):
+            if base[10:].startswith('vcc'):
+                self.read_vcc()
             if getattr(self, 'kind', None) == 'ms' and base in ('s_cbranch_scc0', 's_cbranch_scc1') and not self.scc_uniform:
                 raise Unsupported('slot 57 mesh: a branch reads SCC that is not proven wave-uniform')
             cond = {'scc0': '!scc', 'scc1': 'scc', 'vccz': '(vcc & 1) == 0', 'vccnz': '(vcc & 1) != 0',
@@ -2942,6 +3016,8 @@ class Stage:
             return self.compare(base, ops, mods)
         if base.endswith('_sdwa'):
             return self.sdwa(base[:-len('_sdwa')], ops, mods)
+        if base in VEC_H:
+            return self.half_alu(base, ops, mods)
         if base in VEC_F:
             arity, text = VEC_F[base]
             # A missing source used to raise IndexError and an extra one was dropped without a word.
@@ -3144,6 +3220,50 @@ class Stage:
             args = [swapped] + [self.u(o) for o in ops[2:1 + arity]]
         expr = text.format(*args)
         self.set_v(reg_range(ops[0])[1], 'U(%s)' % expr if kind == 'f' else expr)
+
+    def half_operand(self, tok, kind):
+        """Float expression for a 16-bit operand: the low half of the register, or an inline constant."""
+        if kind in ('i16', 'u16'):
+            if tok in FLOATS:  # an inline float constant is a binary16 word at 16-bit width, not binary32
+                word = struct.unpack('<H', struct.pack('<e', FLOATS[tok]))[0]
+                src = '%du' % word
+            else:
+                src = self.u(tok)
+            if kind == 'i16':
+                return 'float(asint((%s & 0xffffu) << 16u) >> 16)' % src
+            return 'float(%s & 0xffffu)' % src
+        neg = False
+        if tok.startswith('-') and (not re.match(r'-[\d.]', tok) or re.match(r'-0x', tok)):
+            neg, tok = True, tok[1:]
+        absolute = tok.startswith('|') and tok.endswith('|')
+        if absolute:
+            tok = tok[1:-1]
+        if tok in FLOATS:
+            text = repr(struct.unpack('<e', struct.pack('<e', FLOATS[tok]))[0])  # inline constants are binary16 here
+        elif tok == '-0':
+            text = '0.0'
+        else:
+            text = 'f16tof32(%s & 0xffffu)' % self.u(tok)
+        if absolute:
+            text = 'abs(%s)' % text
+        return '(-%s)' % text if neg else text
+
+    def half_alu(self, base, ops, mods):
+        """16-bit VALU: operands are the low 16 bits, the result fills the low 16 bits and zeroes the rest (RDNA 2)."""
+        arity, kind, text, result = VEC_H[base]
+        if len(ops) != arity + 1:
+            raise Unsupported('%s with %d operands, expected %d' % (base, len(ops), arity + 1))
+        if any(m != 'clamp' for m in mods) or ('clamp' in mods and result != 'h'):
+            raise Unsupported('%s with %s' % (base, mods))
+        args = [self.half_operand(o, kind) for o in ops[1:1 + arity]]
+        if base in ('v_fmac_f16', 'v_mac_f16'):
+            args.append(self.half_operand(ops[0], 'h'))
+        expr = text.format(*args)
+        if result == 'h':
+            if 'clamp' in mods:
+                expr = 'saturate(%s)' % expr
+            expr = 'f16rn(%s)' % expr
+        self.set_v(reg_range(ops[0])[1], expr)
 
     # VOP1/VOP2 with sub-dword addressing: select the source fields, run the same operation, then place
     # the low bits of the result in the destination field. The integer forms reuse VEC_U unchanged,
@@ -3652,7 +3772,11 @@ class Stage:
         if len(ops) != 3:
             raise Unsupported('s_load with %d operands' % len(ops))
         dst, base = reg_range(ops[0]), reg_range(ops[1])
-        if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[2] > 105:
+        if not dst or dst[0] != 's' or dst[2] - dst[1] + 1 != count or dst[1] > 105 or dst[2] > 107:
+            raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
+        # s106/s107 are vcc: only a descriptor load, which emits no code, may end there (s[104:107]).
+        into_vcc = dst[2] > 105
+        if into_vcc and (dst[1] > 104 or dst[2] != 107):
             raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
         if not base or base[0] != 's' or base[2] - base[1] != 1 or base[2] > 105:
             raise Unsupported('s_load base %s' % ops[1])
@@ -3679,6 +3803,8 @@ class Stage:
             if imm is not None:
                 raise Unsupported('SMEM literal offset %s with offset:%#x' % (ops[2], imm))
             if p[1][0] == 'root':
+                if into_vcc:
+                    raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
                 buf = self.pipe.resource((p[1], None), 'buf')
                 for i in range(count):
                     self.set_s(dst[1] + i, '%s.Load(%d)' % (buf, off + 4 * i))
@@ -3698,7 +3824,15 @@ class Stage:
                 load = (self.pc,)
             for i in range(count):
                 self.sym[dst[1] + i] = ('desc', p[1], off, i) + load
+            if into_vcc:
+                self.vcc_lost = True
+                self.vcc_descriptor_overwritten = False
+                if getattr(self, 'has_branches', False):
+                    value = tuple(self.sym.get(i) for i in (106, 107))
+                    self.vcc_events.setdefault(self.pc, []).append(('load_descriptor', value))
             return
+        if into_vcc:
+            raise Unsupported('s_load destination %s for %d dwords' % (ops[0], count))
         if p[1] == ('smpheap',):
             if self.pipe.sampler_heap and count == 4:
                 # A sampler picked at run time from the sampler heap: keep the byte offset in the
@@ -6300,6 +6434,20 @@ VEC_F = {
     'v_sin_f32': (1, 'sin({0} * 6.283185307)'), 'v_cos_f32': (1, 'cos({0} * 6.283185307)'),
     'v_med3_f32': (3, 'med3_32({0}, {1}, {2})'), 'v_min3_f32': (3, 'min({0}, min({1}, {2}))'), 'v_max3_f32': (3, 'max({0}, max({1}, {2}))'),
 }
+# 16-bit VALU: (sources, source kind, float or uint expression of the sources, result kind). 'h' sources are
+# binary16 read from the low half and computed in binary32; an 'h' result is rounded back to binary16. The
+# i16/u16 conversions to binary16 read the low half as an integer; the conversions to integers truncate toward
+# zero, saturate to the 16-bit range and read NaN as 0.
+VEC_H = {
+    'v_add_f16': (2, 'h', '{0} + {1}', 'h'), 'v_sub_f16': (2, 'h', '{0} - {1}', 'h'),
+    'v_subrev_f16': (2, 'h', '{1} - {0}', 'h'), 'v_mul_f16': (2, 'h', '{0} * {1}', 'h'),
+    'v_min_f16': (2, 'h', 'min({0}, {1})', 'h'), 'v_max_f16': (2, 'h', 'max({0}, {1})', 'h'),
+    'v_fmac_f16': (2, 'h', 'fma16o({0}, {1}, {2})', 'h'), 'v_fmamk_f16': (3, 'h', 'fma16o({0}, {1}, {2})', 'h'),
+    'v_fmaak_f16': (3, 'h', 'fma16o({0}, {1}, {2})', 'h'),
+    'v_cvt_f16_i16': (1, 'i16', '{0}', 'h'), 'v_cvt_f16_u16': (1, 'u16', '{0}', 'h'),
+    'v_cvt_i16_f16': (1, 'h', 'isnan({0}) ? 0u : (uint(int(clamp(trunc({0}), -32768.0, 32767.0))) & 0xffffu)', 'u'),
+    'v_cvt_u16_f16': (1, 'h', 'isnan({0}) ? 0u : uint(clamp(trunc({0}), 0.0, 65535.0))', 'u'),
+}
 # Conversions whose result is binary32. The expression is the float value, so an output modifier
 # (clamp, mul:2, mul:4, div:2) can wrap it the way it wraps any other float result. The uint-result
 # conversions stay in VEC_U.
@@ -6643,6 +6791,7 @@ class Pipeline:
         return lines
 
     def common(self):
+        import pixel_aot
         out = ['#define F(x) asfloat(x)', '#define U(x) asuint(x)',
                'float mul_legacy(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }',
                # Match pixel_aot: round the product before adding and flush denormals to signed zero.
@@ -6680,6 +6829,20 @@ class Pipeline:
                'uint mul_hi_u32(uint a, uint b) { uint la = a & 0xffffu, lb = b & 0xffffu;'
                ' uint middle = (a >> 16) * lb + ((la * lb) >> 16);'
                ' return (a >> 16) * (b >> 16) + (middle >> 16) + (((middle & 0xffffu) + la * (b >> 16)) >> 16); }',
+               # a * b + c for binary16 inputs with one rounding (#2073). The first form recovered the binary32 sum error
+               # with a floating-point TwoSum; an NVIDIA driver (RTX 3070 Ti, 32.0.16.2101) simplified that error term to
+               # zero despite `precise`, so ties rounded the wrong way. fma16_rne works on the encodings in 32-bit integer
+               # arithmetic, so no driver floating-point rewrite can reach it. Infinities and NaNs keep float semantics.
+               pixel_aot.SALU_HELPERS['fma16_rne'],
+               'float fma16o(float a, float b, float c) {',
+               '    if (!isfinite(a) || !isfinite(b) || !isfinite(c)) return a * b + c;',
+               '    return f16tof32(fma16_rne(f32tof16(a), f32tof16(b), f32tof16(c)));',
+               '}',
+               # binary32 to binary16 rounded to nearest even: f32tof16 truncates, a binary16 result must round (#1723).
+               'uint f16rn(float v) { uint b = asuint(v), s = (b >> 16) & 0x8000u, a = b & 0x7fffffffu;'
+               ' if (a > 0x7f800000u) return s | 0x7e00u; if (a >= 0x47800000u) return s | 0x7c00u;'
+               ' if (a < 0x38800000u) return s | uint(round(asfloat(a) * 16777216.0));'
+               ' uint r = a + 0xfffu + ((a >> 13) & 1u); return s | min((r - 0x38000000u) >> 13, 0x7c00u); }',
                # The ten binary32 classes v_cmp_class_f32 tests, from the raw encoding (#1795).
                'uint class32(float value) { uint bits = asuint(value), magnitude = bits & 0x7fffffffu;'
                ' bool negative = bits >= 0x80000000u;'

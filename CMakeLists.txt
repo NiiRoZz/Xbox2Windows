@@ -3060,6 +3060,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     add_test(NAME startup_live_view COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_live_view_check.py")
     set_tests_properties(startup_live_view PROPERTIES TIMEOUT 60)
+    add_test(NAME runtime_startup_live_view_cli_check COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_live_view_cli_check.py")
+    set_tests_properties(runtime_startup_live_view_cli_check PROPERTIES TIMEOUT 60)
     add_test(NAME startup_uniform_lane COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_uniform_lane_check.py")
     # NGG primitive-shader cases (#1723): identity triangle against single-change contrasts, reference model.
@@ -3165,6 +3168,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The binary16 class comparison (#1855).
     add_test(NAME startup_gfx2hlsl_cmp_class_f16 COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_cmp_class_f16_check.py")
+    # The 16-bit vector ALU: add, sub, mul, min, max, fma forms and the i16/u16 conversions (#1723).
+    add_test(NAME startup_gfx2hlsl_f16_alu COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_f16_alu_check.py")
     # op_sel on a translated float operation is refused, not dropped (#1735).
     add_test(NAME startup_gfx2hlsl_opsel COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_opsel_check.py")
@@ -3572,6 +3578,16 @@ if(EXISTS "${INTAKE_PYTHON}")
     # The same spill slots across branches: a write must reach the read on every path, outside non-uniform regions.
     add_test(NAME startup_gfx2hlsl_spill_branches COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_spill_branches_check.py")
+    # gfx2hlsl 16-bit vector ALU (#1723): the translated pairs drawn on WARP and hardware (FXC 5_1 and DXC 6_0),
+    # four result words per draw against an exact binary16 reference.
+    add_test(NAME startup_gfx2hlsl_f16_alu_draw_controls COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f16_alu_draw_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_f16_alu_draw_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_f16_alu_draw_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_f16_alu_draw_${adapter} PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    endforeach()
     # gfx2hlsl v_cmpx_le_i32_sdwa on a sign-extended byte decides which of 16 x 16 pixels survive, checked
     # pixel by pixel (#1906); translations without the select or without sext() must fail the same draw.
     foreach(adapter IN ITEMS warp hardware)
@@ -3742,6 +3758,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_mul_mad_i24_check.py" draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_gfx2hlsl_mul_mad_i24_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
+    # gfx2hlsl s_load into s[104:107] followed by a vcc compare and select: WARP/hardware draw vs CPU reference (Refs #1723).
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_gfx2hlsl_sload_s104_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_sload_s104_check.py" draw "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
+        set_tests_properties(startup_gfx2hlsl_sload_s104_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     # gfx2hlsl dual-offset/stride-64 32-bit LDS ops and 32-bit LDS atomics (Refs #1541, #2274).
     add_test(NAME startup_compute_lds_dual_atomics_controls COMMAND "${INTAKE_PYTHON}" -B
@@ -4070,6 +4093,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: the SMEM offset 'off' is the literal 0; m0 and other operands keep their handling (#1674).
     add_test(NAME startup_gfx2hlsl_smem_offset COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_smem_offset_check.py")
+    # Startup shader translator: s_load descriptor into s[104:107] (vcc is s106/s107) (#1723).
+    add_test(NAME startup_gfx2hlsl_sload_s104 COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_sload_s104_check.py")
     # Startup shader translator: scalar constants are dropped at a branch join that another path writes (loop counters).
     add_test(NAME startup_gfx2hlsl_loop_constants COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_loop_constants_check.py")
