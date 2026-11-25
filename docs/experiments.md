@@ -15737,6 +15737,67 @@ reaching `s_cmp_*` whose source the model does not prove uniform. In 7 a differe
 path, and in 3 the path crosses a loop head.
 `ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_src_scc(_join)?$' -V`.
 
+## Startup shader request identity
+
+`startup_shader_cache_key` uses the explicit `X2W_FXC=''` manifest-only mode: no GPU
+or shader compiler is required, and it does not claim compiled bytecode. Real hashing,
+raw classification, container extraction and HLSL generation remain active. A wrapping
+translation spy requires every identity failure to occur before translation. All rejected
+fresh requests must publish only the exact `.fail` diagnostic, not a shader or manifest.
+
+The source-built raw VS/PS pair, reversed raw storage, full containers and a minimal
+RTS0 root cover accepted identities; wrong keys and independent VS/PS/root/input layout mutations
+cover rejection. Valid and invalid RTV requests preserve existing behavior and diagnostic.
+A literal known-answer vector independently executed with the runtime C++ `fnv_bytes`
+and revision/order (including optional `.ia`) (`src/startup_stubs/d3d12_draw.inl`) prevents a shared Python-key error
+from silently agreeing in both producer and validator.
+
+```powershell
+python -B tests/startup_shader_cache_key_check.py
+ctest --preset dev --no-tests=error -j 1 -R '^startup_shader_cache_key$' -V
+```
+
+Publication through `translate_request` validates base request identity as well as RTV source identity. The refusal-only diagnostic mode is unchanged.
+Before this guard, a base request could publish a manifest under a key that did not hash
+its inputs. This is malformed-request integrity hardening, not a demonstrated normal-game
+misrender, cryptographic authenticity, cleanup of already-published artifacts or driver
+PSO-cache change. Canonical output bytes remain unchanged.
+
+## Teardown of the per-device D3D12 caches
+
+Two caches keep desktop D3D12 objects for a device for as long as the module that holds them is loaded: the
+indexed-validation pipeline (`startup_stubs/d3d12_draw.inl`) and the rectangle-list argument converter
+(`startup_stubs/rect_indirect_args.h`). Both are function-local statics, so they are destroyed during the
+module's CRT teardown, and that teardown happens at two different moments. At process exit Windows has already
+detached the display driver: releasing a pipeline state then faults inside the driver (`amdxc64`, at
+`0x35f2a19`, through `D3D12Core!CPipelineState::FinalRelease`) and the loader turns it into `0xC0000409`.
+`FreeLibrary` unloads the module while the process and the driver stay alive, and there every owned object
+must be released.
+
+`DllMain` in `src/d3d12_xs_shim.cpp` tells the two apart: `lpReserved` is non-null only when the process is
+terminating, and the user entry runs before this module's `atexit` table. The flag it sets is declared in
+`startup_stubs/d3d12_teardown.h`, and each cache has an explicit destructor that detaches its references on
+that path and releases them otherwise. Device keying is unchanged.
+
+```powershell
+cmake --build --preset dev --target d3d12_xs_shim startup_teardown_unload startup_indirect_draw_indexed
+ctest --preset dev --no-tests=error -R "^startup_teardown_unload_(warp|hardware)$" -V
+ctest --preset dev --no-tests=error -R "^startup_indirect_(translated_indexed|rectlist)" -V
+```
+
+The fixture (`tests/startup_teardown_unload.cpp`) loads the built `d3d12_xs.dll` by path, warms both caches
+through the module's own probe, and unloads it: the caches must release what they own, the device's reference
+count must come back, and the module must be gone. A second load is warmed and left loaded, so process
+termination exercises the other path. It is source-built and loads no title.
+
+Measured on Windows 11 25H2 (26200.9974, MSVC 19.44.35230), AMD Radeon RX 9070 XT (`1002:7550`, driver
+`32.0.32029.2010`), debug layer unavailable: `startup_teardown_unload` passes on WARP and on the card, and the
+five `startup_indirect_*_hardware` runs that died with `0xC0000409` now reach their last assertion and exit
+`0`. Removing either destructor brings its own failure back and only its own: without the validation-pipeline
+destructor the four `translated_indexed*` runs fail and `rectlist` passes; without the converter destructor
+`rectlist` fails and the four pass. Not covered: an explicit unload while a device is still referenced by a
+title, and any adapter other than the one above.
+
 ## Exact binary16 min, max, fract, and frexp forms (VOP1/VOP2/VOP3/DPP16/DPP8/SDWA) in pixel_aot
 
 [The pixel shader translator](../tools/pixel_aot.py) adds 25 exact binary16 forms across all 5 encodings (counted in both `docs/coverage/gfx1013.tsv` and `docs/coverage/rdna2.tsv`):
@@ -15753,3 +15814,18 @@ ctest --preset dev --no-tests=error -R '^(pixel_aot_f16_exact_extra_warp|pixel_a
 ```
 
 Linux controls, `form_coverage_check.check_f16_exact_extra_forms`, and Python reference/mutation checks ran locally; LLVM 15 `pixel_aot_binary` round-trips and Windows WARP/hardware D3D12 draws run in CI.
+
+## Startup translator: saturating 32-to-16-bit integer packs (`v_cvt_pk_u16_u32`, `v_cvt_pk_i16_i32`)
+
+`tools/startup/gfx2hlsl.py` lowers the VOP3A-only 32-to-16-bit saturating integer pack pair (`0x36a` / `0x36b`, #1723) via `VEC_U`:
+
+- `v_cvt_pk_u16_u32`: `min({0}, 0xffffu) | (min({1}, 0xffffu) << 16u)` (`S0` clamped to `[0, 65535]` in `[15:0]`, `S1` in `[31:16]`).
+- `v_cvt_pk_i16_i32`: `(asuint(clamp(asint({0}), -32768, 32767)) & 0xffffu) | (asuint(clamp(asint({1}), -32768, 32767)) << 16u)` (`S0` signed-clamped to `[-32768, 32767]` in `[15:0]`, `S1` in `[31:16]`).
+- Both instructions accept VGPRs, SGPRs (`s0..s105`), 32-bit inline constants, and 32-bit literals across `Pipeline` and `ComputePipeline` (including explicit `_e64` spelling), propagate scalar uniformity through `UNIFORM_VALU` for `v_readfirstlane_b32`, require whole-32-bit source definitions (`low16_only=False`), and clear `low16_only_v` on their destination VGPR.
+- `check_encoding` refuses VOP3A source `abs` (`w0[10:8]`), `neg` (`w1[31:29]`), and non-zero unused `src2` (`w1[26:18]`) on the raw words before disassembly; `Stage` refuses `clamp`, `omod`, `op_sel`, printed `|vN|`/`-vN` modifiers, lane-mask sources (`vcc_lo`, `exec_lo`), non-VOP3 spellings (`_e32`, `_sdwa`, `_dpp`), and invalid operand counts or widths.
+
+[`tests/startup_gfx2hlsl_cvt_pk_int16_check.py`](../tests/startup_gfx2hlsl_cvt_pk_int16_check.py) constructs synthetic gfx1013 VOP3A words (no game data), verifies all 676 `(S0, S1)` boundary pairs per opcode against independent Python saturation references, checks LLVM 15 `llvm-mc` / `libLLVM` round-trips in Linux CI, tests `ComputePipeline`, `UNIFORM_VALU`, `low16_only_v`, and encoding/Stage refusal controls, and runs four mutated-HLSL negative controls per opcode (`trunc_lo`, `trunc_hi`, `swap_halves`, and opposite-signedness clamp). On Windows 11 with the D3D12 debug layer enabled (`0` errors, `0` warnings) across both FXC `ps_5_1` and DXC `ps_6_0`, all 16 good draws and 16 mutated-HLSL negative controls matched on Microsoft WARP (`1414:008c`, driver `10.0.26100.9818`) and on an AMD Radeon RX 9070 XT (`1002:7550`, driver `32.0.32029.2010`).
+
+```powershell
+ctest --test-dir out/build/release --no-tests=error -R "^startup_gfx2hlsl_cvt_pk_int16_(controls|warp|hardware)$" -V
+```
