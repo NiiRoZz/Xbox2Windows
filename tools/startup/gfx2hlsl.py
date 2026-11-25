@@ -411,19 +411,45 @@ def check_encoding(code, off, n, name, asm):
             fields[i + 1] = operand[:len(operand) - len(operand.lstrip())] + '0x%08x' % (bits ^ 0x80000000)
             asm = ','.join(fields)
     if n >= 8 and struct.unpack_from('<I', code, off)[0] >> 26 == 0b110101:
-        # VOP3 NEG (w1[31:29], bit 29 + i for source i) on a non-negative inline integer (128..192) or a literal (255).
-        # The decoder prints inline 1 with NEG as `-1`, the text of the plain inline -1 (193), so both would translate to
-        # 0xffffffff, and a literal 5 would become 0xfffffffb. Only v_cndmask_b32_e64 models NEG on its two data
-        # sources (above, as the sign bit flipped). Inline floats, registers and negative inlines are not affected.
-        # ABS is not tested: on the VOP3b forms w0[10:8] is SDST, not a modifier.
-        word1, = struct.unpack_from('<I', code, off + 4)
+        # Read the word from the encoding: NEG on inline 1 is printed as `-1`, indistinguishable
+        # from the plain inline -1 selector.
+        # LLVM AMDGPUAsmParser::applyInputFPModifiers folds NEG into an immediate by XOR with the
+        # FP sign mask. RDNA 2 lists VOP3 NEG as a float input modifier. Hardware behavior for
+        # these immediate sources has not been measured.
+        word0, word1 = struct.unpack_from('<2I', code, off)
+        base = name.removesuffix('_e64')
+        float_sources = 0
+        if base in VEC_F:
+            float_sources = VEC_F[base][0]
+        elif re.fullmatch(r'v_cmpx?_\w+_f32', base):
+            float_sources = 1 if base in ('v_cmp_class_f32', 'v_cmpx_class_f32') else 2
+        rewritten = {}
         for i in range(3):
             if name == 'v_cndmask_b32_e64' and i < 2 or not word1 & (1 << (29 + i)):
                 continue
             source = (word1 >> (9 * i)) & 0x1ff
-            if 128 <= source <= 192 or source == 255:
+            if not (128 <= source <= 192 or source == 255):
+                continue
+            # The selected float forms are VOP3A, where w0[10:8] holds ABS. Keep the
+            # refusal for NEG combined with ABS on this source.
+            if i >= float_sources or word0 & (1 << (8 + i)):
                 raise Unsupported('%s with NEG on an integer or literal source %d: the printed sign would read as inline -N'
                                   % (name, i))
+            if source == 255:
+                if n != 12 or off + n > len(code):
+                    raise Unsupported('%s missing literal dword' % name)
+                bits, = struct.unpack_from('<I', code, off + 8)
+            else:
+                bits = source - 128
+            # f() bitcasts this hex word through F(), the asfloat macro.
+            rewritten[i + 1] = '0x%08x' % (bits ^ 0x80000000)
+        if rewritten:
+            mnemonic, operands, mods = parse(asm)
+            if len(operands) <= max(rewritten):
+                raise Unsupported('malformed %s operands' % name)
+            for index, token in rewritten.items():
+                operands[index] = token
+            asm = ' '.join([mnemonic, ', '.join(operands), *mods])
     return asm
 
 
@@ -2939,7 +2965,22 @@ class Stage:
             (arity, text), kind = VEC_F[base], 'f'
         else:
             raise Unsupported('%s_dpp' % base)
-        if len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
+        src_neg_abs = []
+        if kind == 'f':
+            # Float quad swaps accept the source neg/abs of the plain operation (RDNA 2 ISA 12.19;
+            # LLVM 15 AMDGPU DPP prints them on the _dpp spelling). The permuted word is read first,
+            # then neg/abs apply, so -vN negates the neighbour lane value. VGPR-only is kept: an SGPR
+            # source stays refused below, as does a non-VGPR base.
+            if len(ops) != arity + 1 or not re.fullmatch(r'v\d+', ops[0]):
+                raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
+            for token in ops[1:1 + arity]:
+                neg, rest = self.split_neg(token)
+                absolute = rest.startswith('|') and rest.endswith('|')
+                base_tok = rest[1:-1] if absolute else rest
+                if not re.fullmatch(r'v\d+', base_tok):
+                    raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
+                src_neg_abs.append((neg, absolute, base_tok))
+        elif len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
         if (getattr(self, 'kind', None) != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', True)
                 or not getattr(self, 'exec_known', False)):
@@ -2949,9 +2990,18 @@ class Stage:
                               'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
         self.needs_sm6 = True
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
-        swapped = '%s(%s)' % (intrinsic, self.u(ops[1]))
-        args = [('F(%s)' % swapped) if kind == 'f' else swapped] + \
-               [self.f(o) if kind == 'f' else self.u(o) for o in ops[2:1 + arity]]
+        if kind == 'f':
+            neg0, abs0, base0 = src_neg_abs[0]
+            swapped = '%s(%s)' % (intrinsic, self.u(base0))
+            first = 'F(%s)' % swapped
+            if abs0:
+                first = 'abs(%s)' % first
+            if neg0:
+                first = '(-%s)' % first
+            args = [first] + [self.f(o) for o in ops[2:1 + arity]]
+        else:
+            swapped = '%s(%s)' % (intrinsic, self.u(ops[1]))
+            args = [swapped] + [self.u(o) for o in ops[2:1 + arity]]
         expr = text.format(*args)
         self.set_v(reg_range(ops[0])[1], 'U(%s)' % expr if kind == 'f' else expr)
 
