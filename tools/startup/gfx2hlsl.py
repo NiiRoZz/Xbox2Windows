@@ -702,6 +702,9 @@ class Stage:
                 self.blocks.append((start, self.lines, None))
                 self.lines, start = [], off
             self.pc = off
+            # Before the first branch target or terminator every path has run exactly the instructions above, so
+            # the program-order tracking is exact there even in a program with branches.
+            self.past_entry = self.has_branches and (bool(self.blocks) or 0 in targets)
             try:
                 term = self.one(name, asm)
             except Unsupported as reason:
@@ -752,7 +755,7 @@ class Stage:
         dst = None
         # Unit probes build a Stage without __init__: without the tracking state, prove nothing.
         if (base in UNIFORM_VALU and ops and self.tracks_uniformity() and
-                not getattr(self, 'has_branches', True) and getattr(self, 'exec_known', False) and
+                not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False) and
                 (not mods or (base in VEC_F or base in VEC_U_TO_F) and
                  all(m in ('clamp', 'mul:2', 'mul:4', 'div:2') for m in mods))):
             candidate = reg_range(ops[0])
@@ -1730,7 +1733,7 @@ class Stage:
 
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
-        if (mods or not self.tracks_uniformity() or getattr(self, 'has_branches', True) or
+        if (mods or not self.tracks_uniformity() or getattr(self, 'past_entry', True) or
                 not getattr(self, 'exec_known', False) or not dst or dst[0] != 's' or dst[1] != dst[2] or
                 not src or src[0] != 'v' or src[1] != src[2] or src[1] not in self.uniform_v):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
