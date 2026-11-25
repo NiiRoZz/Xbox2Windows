@@ -1219,7 +1219,8 @@ def check_controls():
         's_and_b32 s23, vcc_lo, exec_lo': '6a7e1787', 's_and_b32 s23, exec_lo, vcc_lo': '7e6a1787',
         's_nand_b32 s23, vcc_lo, exec_lo': '6a7e178c', 's_orn2_b32 s23, vcc_lo, exec_lo': '6a7e178b',
         's_and_b32 vcc_lo, vcc_lo, exec_lo': '6a7e6a87', 's_orn2_b32 s23, exec_lo, vcc_lo': '7e6a178b',
-        's_mov_b32 s23, vcc_lo': '6a0397be', 's_and_b32 s23, vcc_lo, exec_hi': '6a7f1787'})
+        's_mov_b32 s23, vcc_lo': '6a0397be', 's_and_b32 s23, vcc_lo, exec_hi': '6a7f1787',
+        's_cbranch_scc1 65533': 'fdff85bf'})
     compare = ['s_cbranch_execz 1', 'v_cmp_gt_u32 vcc_lo, 3, v0']
     for read in ('s_and_b32 s23, vcc_lo, exec_lo', 's_and_b32 s23, exec_lo, vcc_lo', 's_orn2_b32 s23, vcc_lo, exec_lo',
                  's_and_b32 vcc_lo, vcc_lo, exec_lo'):
@@ -1244,15 +1245,17 @@ def check_controls():
     }
 }
 ''')
-    # Refused: a read once exec has been restored, a copy, exec | ~vcc (vcc decides), exec_hi in the low half, and
-    # the vcc branch after an absorbed read. The reason names the first read that is not proven.
+    # Refused: a read once exec has been restored, a copy, exec | ~vcc (vcc decides), exec_hi in the low half, the
+    # vcc branch after an absorbed read, and an absorbed read at the join that a loop re-enters after the restore
+    # (exec is no longer the join's there). The reason names the first read that is not proven.
     live = 'v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc, live where the block joins'
     for before, after, name in (([], ['s_and_b32 s23, vcc_lo, exec_lo'], 's_and_b32'),
                                 (['s_mov_b32 s23, vcc_lo'], [], 's_mov_b32'),
                                 (['s_orn2_b32 s23, exec_lo, vcc_lo'], [], 's_orn2_b32'),
                                 (['s_and_b32 s23, vcc_lo, exec_hi'], [], 's_and_b32'),
                                 (['s_and_b32 s23, vcc_lo, exec_lo'], ['s_cbranch_vccz 1', 'v_mov_b32 v5, s20'],
-                                 's_cbranch_vccz')):
+                                 's_cbranch_vccz'),
+                                (['s_and_b32 s23, vcc_lo, exec_lo'], ['s_cbranch_scc1 65533'], 's_and_b32')):
         refused('%s: read by %s after the join' % (live, name), lambda before=before, after=after: translate(
             'A', code=splice(*enter, *compare, *before, *leave, *after)).hlsl_cs())
     # The rule on its own: which reads exec absorbs for a word.

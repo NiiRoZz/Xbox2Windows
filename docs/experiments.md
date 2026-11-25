@@ -14053,11 +14053,12 @@ a branch from outside enters.
 
 A definition of an SGPR or `vcc` that is live at the join is still accepted when exec absorbs every read of
 it. With the block's exec writes proven, a skipped lane's exec bit is clear at the join, in the wave and in
-the model. While no instruction on any path from the join has written exec, `W & exec` and `exec & W`
-(`s_and`) give that lane 0, and `~(W & exec)` (`s_nand`) and `W | ~exec` (`s_orn2` with exec second) give it
-1, whatever the block left in W. The search follows every path from the join until W is written again. Any
-other read, a copy, a data read, a branch on `vccz`, or an absorbed form after exec has changed, keeps the
-refusal, which names the first such read. `m0` and SCC have implicit readers and are not accepted this way.
+the model. In the straight run that starts at the join, which only the block enters, and before any exec
+write in it, `W & exec` and `exec & W` (`s_and`) give that lane 0, and `~(W & exec)` (`s_nand`) and
+`W | ~exec` (`s_orn2` with exec second) give it 1, whatever the block left in W. The search follows every path
+from the join until W is written again. Any other read keeps the refusal: a copy, a data read, a branch on
+`vccz`, an absorbed form after an exec write or a branch target, or one at a join that a loop re-enters. The
+reason names the first such read the search meets. `m0` and SCC have implicit readers and are not accepted this way.
 Case N runs a compare in a block whose join computes `s_and_b32 s23, vcc_lo, exec_lo` before it restores
 exec; its control `n-unmasked` drops the AND, so the two lanes that skip the block store with a stale `vcc`.
 `s_nand` on a lane mask is still refused by the lane-mask lowering itself.

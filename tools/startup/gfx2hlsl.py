@@ -1791,7 +1791,9 @@ class Stage:
                 value = reads | (out - writes)
                 if value != live_in[i]:
                     live_in[i], changed = value, True
-        refused = {}
+        refused, into = {}, {}
+        for k, target in jumps:
+            into.setdefault(index.get(target), []).append(k)
         for b, (off, n, name, asm) in enumerate(self.ins):
             if name != 's_cbranch_execz':
                 continue
@@ -1824,17 +1826,14 @@ class Stage:
             kept = {}
             for i in range(b + 1, t):
                 for word in (effects[i][2] - EXEC_KEYS) & live:
-                    halves = kept_halves(*self.ins[i][2:], word, before[i]) if i in before and not entered else set()
-                    kept[word] = kept.get(word, halves) & halves
-            quiet, work = {t: True}, [t]
-            while work:
-                i = work.pop()
-                keep = quiet[i] and not effects[i][2] & EXEC_KEYS
-                for s in succ[i]:
-                    if quiet.get(s, True) and not keep or s not in quiet:
-                        quiet[s] = quiet.get(s, True) and keep
-                        work.append(s)
-            unread = {word: self.execz_live_read(t, word, halves, effects, succ, quiet) for word, halves in kept.items()}
+                    if kept.get(word, True):  # an empty set stays empty
+                        andn2 = i in before and not entered and self.ins[i][2].startswith('s_andn2')
+                        halves = kept_halves(*self.ins[i][2:], word, before[i]) if andn2 else set()
+                        kept[word] = kept.get(word, halves) & halves
+            def quiet(j):  # exec unchanged since the join on every path to j: a straight run from t, entered at t only
+                return t <= j and all(b <= k < t for k in into.get(t, ())) and not any(
+                    effects[k][2] & EXEC_KEYS for k in range(t, j)) and not any(k in into for k in range(t + 1, j + 1))
+            unread = {}
             for i in range(b + 1, t):
                 at, _, inner, inner_asm = self.ins[i]
                 may = effects[i][2]
@@ -1847,8 +1846,8 @@ class Stage:
                 elif may & EXEC_KEYS and (entered or i in before and
                                           not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
-                elif any(unread[word] is not None for word in (may - EXEC_KEYS - ok_masks) & live):
-                    words = sorted(word for word in (may - EXEC_KEYS - ok_masks) & live if unread[word] is not None)
+                elif words := [word for word in sorted((may - EXEC_KEYS - ok_masks) & live)
+                               if self.execz_live_read(t, word, kept[word], effects, succ, quiet, unread) is not None]:
                     named = [unread[word] for word in words if unread[word] >= 0]
                     reason = 'definition of %s, live where the block joins' % ', '.join(words) + (
                         ': read by %s after the join' % self.ins[min(named)][2] if named else '')
@@ -1856,40 +1855,42 @@ class Stage:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
 
-    def execz_live_read(self, t, word, halves, effects, succ, quiet):
+    def execz_live_read(self, t, word, halves, effects, succ, quiet, unread):
         """None when every read of `word` from the join t of an execz block on, until a write of it ends the block's
         definition, gives a lane the model skipped the wave's result; else the first read that is not proven, or -1
         for m0 and SCC, which have implicit readers.
 
         Such a lane's exec bit is clear at the join, in the model and in the wave (execz_refusals proves the block's
         exec writes), and the two differ there at most in `word`. A read is proven when:
-        - exec is unchanged on every path from the join to it (`quiet`) and it reads `word` only as W & exec,
+        - exec is unchanged on every path from the join to it (`quiet`: the read ends a straight run that starts at
+          the join, which only the block enters, with no exec write in it) and it reads `word` only as W & exec,
           ~(W & exec) or W | ~exec, exec of the same lanes (exec_absorbs): the lane's bit of the result is fixed
           whatever its bit of `word` is, so the result agrees, and when it overwrites `word` the definition ends;
         - the block keeps the lane's bit of `word` for its half (kept_halves: every write of `word` in the block is
           s_andn2 R, R, X with X clear for the lane, checked over every path from the branch) and the read is a lane
           mask read of that half (lane_read): the lane's bit of `word` is the model's, so its bit of the result is
           too, and `word` written back that way keeps the property.
-        Any other read, a data read or a copy into another register included, is not proven."""
+        Any other read, a data read or a copy into another register included, is not proven. The search stops at
+        the first such read, nearest the join; the result is kept in `unread` for the block."""
+        if word in unread:
+            return unread[word]
         if not re.fullmatch(r'vcc(_hi)?|s\d+', word):
+            unread[word] = -1
             return -1
-        seen, work, unproven = set(), [t], []
-        while work:
-            j = work.pop()
-            if j in seen:
-                continue
-            seen.add(j)
+        seen, work = {t}, [t]
+        for j in work:  # breadth first: the list grows while it is read
             name, asm = self.ins[j][2:]
-            if word in effects[j][0]:
-                if halves and lane_read(name, asm, word, halves):
-                    work.extend(succ[j])
-                    continue
-                if not (quiet.get(j) and exec_absorbs(name, asm, word)):
-                    unproven.append(j)
-                    continue
-            if word not in effects[j][1]:
-                work.extend(succ[j])
-        return min(unproven, default=None)
+            kept_read = word in effects[j][0] and halves and lane_read(name, asm, word, halves)
+            if word in effects[j][0] and not kept_read and not (exec_absorbs(name, asm, word) and quiet(j)):
+                unread[word] = j
+                return j
+            if kept_read or word not in effects[j][1]:
+                for s in succ[j]:
+                    if s not in seen:
+                        seen.add(s)
+                        work.append(s)
+        unread[word] = None
+        return None
 
     def phi_mask_ok(self, key, b, t, effects, succ, targets, index):
         """True when lane mask `key` ('vcc' for vcc_lo, or 'sN'), live at the join t of the s_cbranch_execz at b, is
