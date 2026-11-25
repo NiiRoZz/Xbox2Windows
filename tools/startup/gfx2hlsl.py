@@ -1753,11 +1753,11 @@ class Stage:
                         if reg != 'm0':
                             self.used_s.add(reg)
                     # A joined register the fall-through wrote as a plain run-time number: every other path into
-                    # this target has exec bit 0, so the instruction at the target may AND it with exec (scalar()).
+                    # this target has exec bit 0, so the instruction at the target may AND it with exec (scalar()). A register that still holds a plain
+                    # variable reads the same either way.
                     self.exec_zero_join = (off, {
                         reg for reg in here
-                        if falls and off in execz_targets and self.sym.get(reg) == ('joined at a branch target',)
-                        and reg in arriving[0][1] and arriving[0][0][reg] is None})
+                        if falls and off in execz_targets and reg in arriving[0][1] and arriving[0][0][reg] is None})
                     clobber = here if off in joined else every_sgpr
                     fwd_clobber = forward_splits.get(off, clobber)
                     blocked = force_unproven | force_at.get(off, set())
@@ -2395,8 +2395,7 @@ class Stage:
             return None
         for i in {'s_and_b64': (0, 1), 's_orn2_b64': (0,)}.get(base, ()):
             reg = reg_range(srcs[i])
-            if (srcs[1 - i] == 'exec' and reg and reg[0] == 's' and reg[1] in regs
-                    and self.sym.get(reg[1]) == ('joined at a branch target',)):
+            if srcs[1 - i] == 'exec' and reg and reg[0] == 's' and reg[1] in regs:
                 return i
         return None
 
