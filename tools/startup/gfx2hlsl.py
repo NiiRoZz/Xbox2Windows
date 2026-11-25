@@ -5731,7 +5731,9 @@ def inspect_mesh57_request(out_dir, key):
         raise Unsupported('slot 57 mesh stage has no verified allocation and primitive export')
     if ps:
         pixel = decode(strip_header(ps))
-        if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps':
+        # A pixel shader with no colour output ends in a null-target export (LLVM SILateBranchLowering, Mesa ACO create_fs_null_export): depth-only.
+        null_only = {a.split()[1] for _, _, op, a in pixel if op == 'exp'} == {'null'}
+        if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps' and not null_only:
             raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
     for offset, _, op, _ in mesh:
         if op.startswith('ds_'):
