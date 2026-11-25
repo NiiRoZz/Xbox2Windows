@@ -1,13 +1,14 @@
 // Translated compute programs at Dispatch (list slot 14). A device slot 67 pipeline is a placeholder that keeps
 // the key of its published request; gfx2hlsl.py --pending answers the request with <key>.txt (`stage cs`) and
-// <key>.cs.cso. This first slice binds raw buffers only: `srv <i> buf table <param> <byte>` inputs and
-// `uav <i> table <param> <byte>` outputs named by hardware buffer descriptors in the compute tables recorded by
-// slot 35, with entry values from the compute root constants of slots 37 and 39. Any other manifest line makes
-// the translation unavailable; a dispatch that cannot be bound completely is refused with one reason and records
-// nothing on the desktop list.
+// <key>.cs.cso. Bound from the compute tables recorded by slot 35: raw buffers (`srv <i> buf table <param> <byte>`
+// inputs, `uav <i> table <param> <byte>` outputs) named by hardware buffer descriptors, and 2D texture outputs
+// (`uav <i> tex2d float table <param> <byte> channels 4`) named by the token of an unordered access view the title
+// created (device slot 19). Entry values come from the compute root constants of slots 37 and 39. Any other
+// manifest line makes the translation unavailable; a dispatch that cannot be bound completely is refused with one
+// reason and records nothing on the desktop list.
 
 struct ComputeTranslation {
-    struct Slot { int a, b; };  // root parameter and byte offset (views), or parameter and word (entry values)
+    struct Slot { int a, b; bool texture; };  // root parameter and byte offset (views), or parameter and word (entry values)
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
@@ -17,8 +18,25 @@ struct ComputeTranslation {
     const char* unmodelled = nullptr;      // why a manifest that exists cannot be used
     u64 dispatches = 0, translated = 0;    // census: Dispatch calls with this key bound, and those recorded
     const char* first_refusal = nullptr;   // reason of the first refused call
-    std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any
+    std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any; a view token's
+                                           // last word is replaced by its view format | dimension << 16
 };
+
+// Formats a `float` typed output may be viewed with: the program stores float4.
+bool float_output_format(DXGI_FORMAT format)
+{
+    switch (format) {
+    case DXGI_FORMAT_R32G32B32A32_FLOAT: case DXGI_FORMAT_R16G16B16A16_FLOAT: case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_SNORM: case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R10G10B10A2_UNORM:
+    case DXGI_FORMAT_R11G11B10_FLOAT: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_SNORM:
+    case DXGI_FORMAT_R16G16_FLOAT: case DXGI_FORMAT_R16G16_UNORM: case DXGI_FORMAT_R16G16_SNORM: case DXGI_FORMAT_R32_FLOAT:
+    case DXGI_FORMAT_R8G8_UNORM: case DXGI_FORMAT_R8G8_SNORM: case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_SNORM: case DXGI_FORMAT_R8_UNORM: case DXGI_FORMAT_R8_SNORM: case DXGI_FORMAT_B8G8R8A8_UNORM:
+        return true;
+    default:
+        return false;
+    }
+}
 std::unordered_map<u64, ComputeTranslation>& compute_translations() { static std::unordered_map<u64, ComputeTranslation> m; return m; }
 LONG compute_dispatches_translated, compute_dispatches_refused, compute_dispatches_untranslated, compute_dispatches_unmodelled;
 
@@ -59,19 +77,20 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.srvs.push_back({a, b});
         else if (std::sscanf(line.c_str(), "uav %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uavs.size())
             tr.uavs.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "uav %u tex2d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
+                 i == tr.uavs.size())
+            tr.uavs.push_back({a, b, true});
         else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer"
-                  : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer"
+                  : line.rfind("uav", 0) == 0 ? "an output that is not a raw table buffer or a 2D float texture"
                   : line.rfind("udsrc", 0) == 0 ? "an entry value that is not a root constant"
                   : line.rfind("smp", 0) == 0 ? "a sampler" : "an unknown manifest line";
     }
-    // shortcut: one constants parameter and one table with both ranges; lift when a program without entry values,
-    // inputs or outputs is requested.
-    if (tr.uds.empty() || tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.empty() || tr.srvs.size() > 32 ||
-        tr.uavs.empty() || tr.uavs.size() > 8)
+    if (tr.uds.size() != declared_uds || tr.uds.size() > 32 || tr.srvs.size() > 32 || tr.uavs.size() > 8)
         return "entry value, input or output count";
     x2w_startup::ComPtr<ID3DBlob> code;
     if (!cache_path(path, L"", tr.key, L".cs.cso") || FAILED(D3DReadFileToBlob(path, &code))) return "no compiled program";
-    if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.size()),
+    // Parameter 0 keeps one constant for a program without entry values: a constants parameter cannot be empty.
+    if (FAILED(x2w_startup::create_translated_root(device_of(the_device), static_cast<UINT>(tr.uds.empty() ? 1 : tr.uds.size()),
             static_cast<UINT>(tr.srvs.size()), {}, &tr.root, static_cast<UINT>(tr.uavs.size()))))
         return "root signature creation failed";
     D3D12_COMPUTE_PIPELINE_STATE_DESC desc{};
@@ -95,13 +114,13 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     if (!key) return false;
     const char* reason = nullptr;
     LONG* counter = &compute_dispatches_refused;
-    struct View { ID3D12Resource* resource; u64 offset, bytes; bool transition; } views[40]{};
+    struct View { ID3D12Resource* resource; u64 offset, bytes; bool transition, texture, described; unsigned char desc[40]; } views[40]{};
     const auto type = list->GetType();
     AcquireSRWLockExclusive(&draw_lock);
     ComputeTranslation* const tr = &compute_translations()[key];
     tr->key = key;
     ++tr->dispatches;
-    std::uint32_t words[4] = {};
+    std::uint32_t words[8] = {};
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE) reason = "the list type has no Dispatch";
     else if (x > x2w_startup::max_dispatch_groups || y > x2w_startup::max_dispatch_groups || z > x2w_startup::max_dispatch_groups)
         reason = "a group count is over the limit";
@@ -123,13 +142,51 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
-        const u64 entry = slot.a >= 0 && slot.b >= 0 ? pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), 16) : 0;
+        const u64 entry = slot.a >= 0 && slot.b >= 0 ? pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16) : 0;
         std::memset(words, 0, sizeof(words));
-        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), sizeof(words))) {
+        const std::size_t entry_bytes = slot.texture ? 32 : 16;
+        if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
             reason = "a table descriptor is not bound";
             break;
         }
-        std::memcpy(words, reinterpret_cast<const void*>(entry), sizeof(words));
+        std::memcpy(words, reinterpret_cast<const void*>(entry), entry_bytes);
+        if (slot.texture) {
+            // The title's descriptor memory carries the id of the view it created there. Nothing else is bound:
+            // a null output would drop the program's stores without a trace.
+            ViewRecord record{};
+            bool known = false, created = false;
+            if (words[0] == view_token_magic) {
+                AcquireSRWLockShared(&note_lock);
+                known = words[1] < view_records().size();
+                if (known) {
+                    record = view_records()[words[1]];
+                    created = view_materialized()[words[1]] != 0;
+                }
+                ReleaseSRWLockShared(&note_lock);
+            }
+            Wrapper* const wrapper = known ? as_wrapper(reinterpret_cast<const void*>(record.resource)) : nullptr;
+            ID3D12Resource* const texture = wrapper && wrapper->own().kind == resource_kind &&
+                InterlockedCompareExchange(&wrapper->own().refs, 0, 0) > 0 ? static_cast<ID3D12Resource*>(wrapper->own().real) : nullptr;
+            const D3D12_RESOURCE_DESC resource = texture ? texture->GetDesc() : D3D12_RESOURCE_DESC{};
+            D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
+            const bool described = record.desc_bytes >= sizeof(desc);
+            if (described) std::memcpy(&desc, record.desc, sizeof(desc));
+            if (desc.Format) desc.Format = desktop_format(desc.Format);
+            const DXGI_FORMAT format = desc.Format ? desc.Format : resource.Format;
+            words[3] = static_cast<std::uint32_t>(format) | static_cast<std::uint32_t>(desc.ViewDimension) << 16;
+            if (!known || record.slot != 19) reason = "an output texture entry is not the token of an unordered access view";
+            else if (!created || !texture || !(resource.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))
+                reason = "an output texture view was not created on the desktop";
+            else if (described ? desc.ViewDimension != D3D12_UAV_DIMENSION_TEXTURE2D || desc.Texture2D.PlaneSlice
+                               : resource.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || resource.DepthOrArraySize != 1)
+                reason = "an output texture view is not 2D";
+            else if (!float_output_format(format)) reason = "an output texture format is not a float or normalized one";
+            for (std::size_t other = 0; other < i && !reason; ++other)
+                if (views[other].resource == texture) reason = "an output texture is bound to another slot of the dispatch";
+            views[i] = {texture, 0, 0, true, true, described};
+            std::memcpy(views[i].desc, &desc, sizeof(desc));
+            continue;
+        }
         if (!output) {
             const IndirectBufferView view = indirect_table_buffer(self, words);
             if (!view.resource || view.offset % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT) reason = "an input is not a complete GPU-backed buffer range";
@@ -155,7 +212,7 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     if (reason) {
         if (!tr->first_refusal) {
             tr->first_refusal = reason;
-            std::memcpy(tr->refusal_words, words, sizeof(words));
+            std::memcpy(tr->refusal_words, words, sizeof(tr->refusal_words));
         }
         ReleaseSRWLockExclusive(&draw_lock);
         InterlockedIncrement(counter);
@@ -179,6 +236,11 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
             continue;
         }
         require_state(self, view.resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        if (view.texture) {
+            device_of(the_device)->CreateUnorderedAccessView(view.resource, nullptr,
+                view.described ? reinterpret_cast<const D3D12_UNORDERED_ACCESS_VIEW_DESC*>(view.desc) : nullptr, dest);
+            continue;
+        }
         D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
         desc.Format = DXGI_FORMAT_R32_TYPELESS;
         desc.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
@@ -196,8 +258,8 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     }
     list->SetPipelineState(tr->pipeline.Get());
     list->SetComputeRootSignature(tr->root.Get());
-    list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
-    list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
+    if (!tr->uds.empty()) list->SetComputeRoot32BitConstants(0, static_cast<UINT>(tr->uds.size()), values, 0);
+    if (n) list->SetComputeRootDescriptorTable(1, D3D12_GPU_DESCRIPTOR_HANDLE{draw_heap->GetGPUDescriptorHandleForHeapStart().ptr + u64{first} * draw_heap_increment});
     list->Dispatch(x, y, z);
     for (std::size_t i = inputs; i < count; ++i) {  // a later dispatch on this list reads what this one wrote
         D3D12_RESOURCE_BARRIER barrier{};
