@@ -18,6 +18,9 @@ reads the read buffer at that index and stores to its own destination:
   words at an immediate offset of 8 bytes;
 - case C enables Y only (s7), v0 only, group size 8x1x1 and 1x5x1 groups, stores four words with every lane, then
   three words at offset 16 under an exec mask set from a compare (lanes with tid.x < 6), and restores exec;
+- case E enables TG_SIZE_EN in a 4x2x4 group and forms the local invocation index the way a wave64 compiler does:
+  s_and_b32 R, TG, 0xfc0 (the wave's first thread index) combined with the full-mask v_mbcnt_lo/hi lane. It stores
+  the lane, the combined index, v_mbcnt_lo reading R as its base, and R alone, at an address built from the index;
 - case D counts sparse mask bits below each lane with v_mbcnt_lo/hi, then obtains the full-mask count in lanes
   16-31 under partial EXEC. Two 4x2x4 groups write separate records to the raw buffer.
 
@@ -164,6 +167,30 @@ WORDS_D = bytes.fromhex(
 SOURCE_D_WRAP = SOURCE_D.replace('v_mov_b32 v6, 7', 's_mov_b32 s22, -1').replace('v8, s20, v6', 'v8, s20, s22')
 WORDS_D_WRAP = WORDS_D.replace(bytes.fromhex('87020c7e080065d7140c0200'), bytes.fromhex('c10396be080065d7142c0000'))
 
+# TG_SIZE_EN puts the TG_SIZE word in the SGPR after the group IDs (s8 here). Either operand order is one form.
+SOURCE_E = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx4 s[16:19], s[10:11], 0
+s_and_b32 s9, s8, 0xfc0
+v_mbcnt_lo_u32_b32 v8, -1, 0
+v_mbcnt_hi_u32_b32 v8, -1, v8
+v_or_b32 v9, s9, v8
+v_mbcnt_lo_u32_b32 v10, -1, s9
+v_mov_b32 v11, s9
+v_lshlrev_b32 v4, 5, s7
+v_add_nc_u32 v4, v4, v9
+v_lshlrev_b32 v4, 4, v4
+s_waitcnt lgkmcnt(0)
+buffer_store_dwordx4 v[8:11], v4, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_E = bytes.fromhex(
+    '06038abe80038bbe050408f4000000fa08ff0987c00f0000080065d7c1000100080066d7c110020009101238'
+    '0a0065d7c11200000902167e04001ad5850e00000413084a840808347fc08cbf001078e004080480000081bf')
+SOURCE_E_SWAP = SOURCE_E.replace('s_and_b32 s9, s8, 0xfc0', 's_and_b32 s9, 0xfc0, s8')
+WORDS_E_SWAP = WORDS_E.replace(bytes.fromhex('08ff0987c00f0000'), bytes.fromhex('ff080987c00f0000'))
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
@@ -171,6 +198,8 @@ CASES = {
     'C': (SOURCE_C, WORDS_C, USER7 | TGID_Y | tidig(1), (8, 1, 1), (1, 5, 1)),
     'D': (SOURCE_D, WORDS_D, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
     'D-wrap': (SOURCE_D_WRAP, WORDS_D_WRAP, USER7 | TGID_X | tidig(3), (4, 2, 4), (2, 1, 1)),
+    'E': (SOURCE_E, WORDS_E, USER7 | TGID_X | TG_SIZE_EN | tidig(3), (4, 2, 4), (2, 1, 1)),
+    'E-swap': (SOURCE_E_SWAP, WORDS_E_SWAP, USER7 | TGID_X | TG_SIZE_EN | tidig(3), (4, 2, 4), (2, 1, 1)),
 }
 
 # Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
@@ -222,6 +251,13 @@ def input_word(i):
 def expected(name):
     out = [SENTINEL] * WORDS
     _, _, _, local, groups = CASES[name]
+    if name in ('E', 'E-swap'):
+        # One wave per group: wave index 0, so the index is the flat lane and the masked TG_SIZE field is zero.
+        for group in range(groups[0]):
+            for lane in range(32):
+                i = 4 * (32 * group + lane)
+                out[i:i + 4] = [lane, lane, lane, 0]
+        return out
     if name in ('D', 'D-wrap'):
         for group in range(groups[0]):
             count = 7 if name == 'D' else MASK
@@ -283,6 +319,38 @@ MBCNT_REFUSALS = (
 )
 
 
+# Every other read of the TG_SIZE word stays refused; recorded from llvm-mc 15. s8 is TG_SIZE in case E.
+TG_SIZE_REFUSALS = (
+    ('s_and_b32 s9, s8, 63', '08bf0987', 'literal mask 0xfc0'),
+    ('s_and_b32 s9, s8, 0xfc1', '08ff0987c10f0000', 'literal mask 0xfc0'),
+    ('s_mov_b32 s20, 0xfc0\ns_and_b32 s9, s8, s20', 'ff0394bec00f0000' '08140987', 'literal mask 0xfc0'),
+    ('s_and_b32 exec_lo, s8, 0xfc0', '08ff7e87c00f0000', 'wave field destination'),
+    ('s_mov_b32 s9, s8', '080389be', 'TG_SIZE read other than s_and_b32'),
+    ('s_bfe_u32 s9, s8, 0x60006', '08ff899306000600', 'TG_SIZE read other than s_and_b32'),
+    ('s_lshr_b32 s9, s8, 6', '08860990', 'TG_SIZE read other than s_and_b32'),
+    ('v_mov_b32 v11, s8', '0802167e', 'holding tg_size'),
+    ('v_mbcnt_lo_u32_b32 v10, -1, s8', '0a0065d7c1100000', 'VGPR or known base'),
+)
+
+
+def check_tg_size():
+    for name in ('E', 'E-swap'):
+        e = translate(name)
+        hlsl = e.hlsl_cs()
+        assert 's8' not in hlsl and '    s9 = 0x00000000u;' in hlsl.splitlines(), hlsl  # TG_SIZE itself has no value
+        assert any('TG_SIZE bits 11:6 assumed' in note for note in e.notes), e.notes
+    for _, words, reason in TG_SIZE_REFUSALS:
+        refused(reason, lambda: translate('E', code=bytes.fromhex(words + '000081bf')))
+    read = bytes.fromhex('08ff0987c00f0000' '000081bf')
+    translate('E', code=read)
+    # A 33-thread group may be two waves, and the field is then not known.
+    refused('at most 32 threads', lambda: translate('E', code=read, group=(3, 11, 1)))
+    # With Y also enabled the TG_SIZE word moves to s9: s8 is the Y group ID, so nothing reads TG_SIZE.
+    refused('without a proven TG_SIZE read', lambda: translate('E', code=read, rsrc2=CASES['E'][2] | TGID_Y))
+    # The same read without TG_SIZE_EN is an ordinary AND of an SGPR.
+    assert 's9 = s8 & 0x00000fc0u;' in translate('E', code=read, rsrc2=CASES['E'][2] & ~TG_SIZE_EN).hlsl_cs()
+
+
 def check_mbcnt():
     for _, words, reason in MBCNT_REFUSALS:
         refused(reason, lambda: translate('D', code=bytes.fromhex(words + '000081bf')))
@@ -303,6 +371,7 @@ def check_mbcnt():
 
 def check_controls():
     check_mbcnt()
+    check_tg_size()
     a = translate('A')
     # This buffer-only compute program has no typed UAV declaration or image manifest entry.
     assert a.uavs and a.stored_images() == {}, (a.uavs, a.stored_images())
@@ -417,7 +486,7 @@ def check_binary(llvm_mc):
     for line, words in SPLICE.items():
         built = assemble(llvm_mc, line + '\n').hex()
         assert built == words, '%s: assembled %s, recorded %s' % (line, built, words)
-    for line, words, _ in MBCNT_REFUSALS:
+    for line, words, _ in MBCNT_REFUSALS + TG_SIZE_REFUSALS:
         assert assemble(llvm_mc, line + '\n').hex() == words, line
     print('fixture words match llvm-mc')
 
@@ -436,6 +505,8 @@ CONTROLS = {
     'd-base': ('D', MBCNT_COUNT + ' + v6', MBCNT_COUNT),
     'd-hi': ('D', 'v9 = v8;', f'v9 = v8 + {MBCNT_COUNT};'),
     'd-exec': ('D', 'if (exec & 1) v10 =', 'v10 ='),
+    'e-wave': ('E', 'v9 = 0x00000000u | v8;', 'v9 = 0x00000040u | v8;'),
+    'e-field': ('E', '    v11 = 0x00000000u;', '    v11 = 0x00000fc0u;'),
 }
 
 # Independent first bad word for each D mutation, including lane zero and the
@@ -448,6 +519,14 @@ MBCNT_MISMATCH = {
     'd-hi': 'word=5 expected=00000008 actual=00000009',
     'd-exec': 'word=2 expected=ffffffff actual=00000000',
 }
+
+
+# A masked field of one wave further (64) moves every record; a field that is not zero shows in the stored word.
+TG_SIZE_MISMATCH = {
+    'e-wave': 'word=0 expected=00000000 actual=c5c5c5c5',
+    'e-field': 'word=3 expected=00000000 actual=00000fc0',
+}
+PINNED = {'mbcnt': MBCNT_MISMATCH, 'tg-size': TG_SIZE_MISMATCH}
 
 
 def mutate(hlsl, control):
@@ -475,8 +554,8 @@ def check_dispatch(dxc, runner, adapter, control=None):
     out = HERE.parent / 'out'
     out.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
-        if control == 'mbcnt':
-            runs = [('D', mutation) for mutation in MBCNT_MISMATCH]
+        if control in PINNED:
+            runs = [(CONTROLS[mutation][0], mutation) for mutation in PINNED[control]]
         elif control:
             runs = [(CONTROLS[control][0], control)]
         else:
@@ -489,7 +568,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
             if mutation:
                 first = run.stderr.strip().splitlines()[:1]
                 if (run.returncode != 1 or 'expected=' not in run.stderr or
-                        mutation in MBCNT_MISMATCH and first != [MBCNT_MISMATCH[mutation]]):
+                        control in PINNED and first != [PINNED[control][mutation]]):
                     raise AssertionError('control %s: unexpected result (exit %d) %s' % (mutation, run.returncode, run.stderr))
                 print('control %s: rejected at %s' % (mutation, first[0]))
             elif run.returncode or run.stderr:

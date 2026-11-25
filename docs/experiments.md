@@ -13429,7 +13429,7 @@ the graphics stages. The caller passes `COMPUTE_PGM_RSRC2` and the thread group 
 register state. Each group-ID axis enabled by `TGID_X/Y/Z_EN` gets the next SGPR after the user
 SGPRs, with no gap for an omitted axis (`SV_GroupID`). v0-v2 hold `SV_GroupThreadID` up to
 `TIDIG_COMP_CNT`. This is how `compute_store_aot` decodes `COMPUTE_PGM_RSRC2` (#1608).
-`TG_SIZE_EN` stays refused.
+`TG_SIZE_EN` is refused except for [one masked read](#startup-compute-thread-group-wave-field).
 
 Root parameters are placed from s4, which is an inference, like the graphics stages' s8. #1608 defines no
 root placement. The only in-repo evidence is the local compute-record scan above, whose table bindings
@@ -13502,6 +13502,40 @@ inactive lanes.
 ```powershell
 cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(mbcnt_)?(warp|hardware))$' -V
+```
+
+### Startup compute thread-group wave field
+
+With `TG_SIZE_EN` (bit 10 of `COMPUTE_PGM_RSRC2`) the startup translator accepts one read of the
+TG_SIZE word: `s_and_b32 R, TG, 0xfc0`, in either operand order, with the literal mask, in a group
+of at most 32 threads. R is then the constant 0 and SCC is clear. The TG_SIZE register itself is
+never given a value. A copy, a shift, a bit-field extract, a vector read, any other mask, the mask
+taken from a register, a mask destination and a larger group are refused by name, and so is
+`TG_SIZE_EN` in a program that has no such read. `compute_store_aot` still refuses `TG_SIZE_EN`.
+
+This rests on three assumptions. None of them is measured in this repository, and a desktop
+read-back cannot measure them:
+
+- The TG_SIZE word takes the SGPR after the enabled group IDs (the argument order of Mesa's AMD
+  compute ABI).
+- Bits 11:6 of the word hold the index of the wave within its thread group, which is Mesa's GFX6-10
+  layout. Mesa reads bits 24:20 on GFX10.3 and later. Which layout a gfx1013 guest uses is the open
+  question [the entry layout section](#entry-registers-from-compute_pgm_rsrc2) records. The
+  read itself is the only support: `& 0xfc0` with no shift is how a wave64 compiler forms the index
+  of the wave's first thread, 64 times the wave index.
+- A group of at most 32 threads is one wave under either guest wave width, so its wave index is 0.
+  The masked-bit-count lowering above uses the same limit and the same lane order.
+
+Fixture E dispatches two 4x2x4 groups. Each thread forms its local index from the masked field and
+the full-mask `v_mbcnt_lo/hi` lane, and stores the lane, the index, `v_mbcnt_lo` with R as its
+base, and R alone, at an address built from the index. A variant swaps the operands of the AND.
+Every dispatch checks all 320 words. Two controls pin the first incorrect word: a field of one wave
+further (64) moves every record, and a field that keeps the mask bits shows in the stored word.
+The read-back shows that the HLSL computes what the assumptions say. It does not test them.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(tg_size_)?(warp|hardware))$' -V
 ```
 
 ## Startup translator: refusal census

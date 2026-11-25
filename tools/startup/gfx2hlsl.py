@@ -837,6 +837,34 @@ class Stage:
         for i in range(threads):
             self.used_v.add(i)
             self.entry.append('v%d = tid.%s;' % (i, 'xyz'[i]))
+        if self.pipe.tg_size is not None:
+            self.sym[self.pipe.tg_size] = ('tg_size',)  # no value: tg_wave_base is its only accepted read
+
+    def holds_tg_size(self, tok):
+        r = reg_range(tok)
+        return bool(r) and r[0] == 's' and r[1] == r[2] and self.sym.get(r[1]) == ('tg_size',)
+
+    def tg_wave_base(self, ops):
+        """s_and_b32 R, TG, 0xfc0: the wave's first thread index in its group, as a wave64 compiler forms it.
+
+        Assumption, not measured in this repository: bits 11:6 of the TG_SIZE word hold the index of the wave
+        within its thread group (Mesa's AMD compiler, GFX6-10 layout; GFX10.3 and later use bits 24:20, and which
+        one a gfx1013 guest uses is not established). The whole word is therefore never given a value. A group
+        of at most 32 threads is one wave under either guest wave width, so only there is the masked field known:
+        wave index 0."""
+        dst = reg_range(ops[0])
+        other = [t for t in ops[1:] if not self.holds_tg_size(t)]
+        if (len(ops) != 3 or len(other) != 1 or reg_range(other[0]) or self.const_u32(other[0]) != 0xfc0
+                or other[0] in FLOATS):
+            raise Unsupported('TG_SIZE read other than s_and_b32 with the literal mask 0xfc0')
+        if not dst or dst[0] != 's' or dst[1] != dst[2] or dst[1] > 105:
+            raise Unsupported('TG_SIZE wave field destination %s' % ops[0])
+        x, y, z = self.pipe.group
+        if x * y * z > 32:
+            raise Unsupported('TG_SIZE wave field requires at most 32 threads per group')
+        self.pipe.tg_read = True
+        self.pipe.notes.add('TG_SIZE bits 11:6 assumed to be the wave index within the thread group')
+        self.set_s(dst[1], '0x00000000u', ('const', 0), scc='false')
 
     # ---- operand helpers ---------------------------------------------------------------------
     def S(self, n):
@@ -1593,6 +1621,10 @@ class Stage:
         if base == 's_movk_i32' and len(ops) != 2:
             raise Unsupported('s_movk_i32 with %d operands, expected 2' % len(ops))
         text, scc = SCA[base]
+        if any(self.holds_tg_size(t) for t in ops[1:]):
+            if base != 's_and_b32':
+                raise Unsupported('TG_SIZE read other than s_and_b32 with the literal mask 0xfc0')
+            return self.tg_wave_base(ops)
         if base in SCC_UNMODELLED and self.tracks_uniformity():
             self.scc_uniform = False
         dst = reg_range(ops[0])
@@ -4014,8 +4046,14 @@ class ComputePipeline(Pipeline):
 
     def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None):
         from compute_store_aot import checked_group, entry_registers
+        # TG_SIZE_EN (bit 10): entry_registers refuses it, so it is decoded here. Assumption (LLVM/Mesa AMD compute
+        # ABI, not measured in this repository): the TG_SIZE word takes the SGPR after the enabled group IDs.
+        tg = type(rsrc2) is int and rsrc2 >> 10 & 1
+        self.tg_size, self.tg_read = None, False
         try:
-            self.entry = entry_registers(rsrc2)  # (user SGPRs, {axis: group-ID SGPR}, thread-ID VGPRs)
+            self.entry = entry_registers(rsrc2 & ~(1 << 10) if tg else rsrc2)  # (user SGPRs, {axis: group-ID SGPR}, thread-ID VGPRs)
+            if tg:
+                self.tg_size = self.entry[0] + len(self.entry[1])
             self.group = checked_group(group)
         except ValueError as reason:
             raise Unsupported(str(reason)) from None
@@ -4027,6 +4065,8 @@ class ComputePipeline(Pipeline):
         self.notes, self.modified = set(), set()
         self.lod_unvalidated = set()
         self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
+        if self.tg_size is not None and not self.tg_read:
+            raise Unsupported('COMPUTE_PGM_RSRC2 TG_SIZE_EN is not supported without a proven TG_SIZE read')
 
     def resource(self, key, kind):
         if key in self.uavs:
