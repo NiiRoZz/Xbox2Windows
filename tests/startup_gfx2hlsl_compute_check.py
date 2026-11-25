@@ -328,9 +328,14 @@ TG_SIZE_REFUSALS = (
     ('s_mov_b32 s9, s8', '080389be', 'TG_SIZE read other than s_and_b32'),
     ('s_bfe_u32 s9, s8, 0x60006', '08ff899306000600', 'TG_SIZE read other than s_and_b32'),
     ('s_lshr_b32 s9, s8, 6', '08860990', 'TG_SIZE read other than s_and_b32'),
-    ('v_mov_b32 v11, s8', '0802167e', 'holding tg_size'),
-    ('v_mbcnt_lo_u32_b32 v10, -1, s8', '0a0065d7c1100000', 'VGPR or known base'),
+    ('v_mov_b32 v11, s8', '0802167e', 'TG_SIZE read by v_mov_b32'),
+    ('v_mbcnt_lo_u32_b32 v10, -1, s8', '0a0065d7c1100000', 'TG_SIZE read by v_mbcnt_lo_u32_b32'),
+    ('s_cmp_eq_u32 s8, 0', '088006bf', 'TG_SIZE read by s_cmp_eq_u32'),
+    ('s_or_b64 s[10:11], s[8:9], s[12:13]', '080c8a88', 'TG_SIZE read other than s_and_b32'),
+    ('s_lshl_b64 s[10:11], s[8:9], 1', '08818a8f', 'TG_SIZE read by s_lshl_b64'),
 )
+# With X and Y enabled the word is s9, the high half of s[8:9]; the accepted read comes first.
+TG_SIZE_HIGH_HALF = ('s_and_b32 s10, s9, 0xfc0', '09ff0a87c00f0000', 's_and_b64 s[12:13], s[8:9], s[8:9]', '08088c87')
 
 
 def check_tg_size():
@@ -347,6 +352,14 @@ def check_tg_size():
     refused('at most 32 threads', lambda: translate('E', code=read, group=(3, 11, 1)))
     # With Y also enabled the TG_SIZE word moves to s9: s8 is the Y group ID, so nothing reads TG_SIZE.
     refused('without a proven TG_SIZE read', lambda: translate('E', code=read, rsrc2=CASES['E'][2] | TGID_Y))
+    high = bytes.fromhex(TG_SIZE_HIGH_HALF[1] + TG_SIZE_HIGH_HALF[3] + '000081bf')
+    refused('TG_SIZE read other than s_and_b32', lambda: translate('E', code=high, rsrc2=CASES['E'][2] | TGID_Y))
+    # The refusal census keeps the reason of a refused read next to the missing-read reason.
+    census = []
+    G.ComputePipeline(read, root_blob(), CASES['E'][2], (3, 11, 1), refusals=census)
+    assert [reason for reason, _ in census] == [
+        'TG_SIZE wave field requires at most 32 threads per group',
+        'COMPUTE_PGM_RSRC2 TG_SIZE_EN is not supported without a proven TG_SIZE read'], census
     # The same read without TG_SIZE_EN is an ordinary AND of an SGPR.
     assert 's9 = s8 & 0x00000fc0u;' in translate('E', code=read, rsrc2=CASES['E'][2] & ~TG_SIZE_EN).hlsl_cs()
 
@@ -486,6 +499,8 @@ def check_binary(llvm_mc):
     for line, words in SPLICE.items():
         built = assemble(llvm_mc, line + '\n').hex()
         assert built == words, '%s: assembled %s, recorded %s' % (line, built, words)
+    for line, words in zip(TG_SIZE_HIGH_HALF[::2], TG_SIZE_HIGH_HALF[1::2]):
+        assert assemble(llvm_mc, line + chr(10)).hex() == words, line
     for line, words, _ in MBCNT_REFUSALS + TG_SIZE_REFUSALS:
         assert assemble(llvm_mc, line + '\n').hex() == words, line
     print('fixture words match llvm-mc')

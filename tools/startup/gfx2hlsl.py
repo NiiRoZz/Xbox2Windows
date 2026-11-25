@@ -841,8 +841,9 @@ class Stage:
             self.sym[self.pipe.tg_size] = ('tg_size',)  # no value: tg_wave_base is its only accepted read
 
     def holds_tg_size(self, tok):
-        r = reg_range(tok)
-        return bool(r) and r[0] == 's' and r[1] == r[2] and self.sym.get(r[1]) == ('tg_size',)
+        """The operand names the SGPR that still holds the TG_SIZE word, alone or inside a register pair."""
+        tg = getattr(getattr(self, 'pipe', None), 'tg_size', None)  # unit probes build a Stage without a pipeline
+        return tg is not None and self.sym.get(tg) == ('tg_size',) and tg in scalar_registers(tok)
 
     def tg_wave_base(self, ops):
         """s_and_b32 R, TG, 0xfc0: the wave's first thread index in its group, as a wave64 compiler forms it.
@@ -1261,6 +1262,9 @@ class Stage:
                 if sources and all(self.uniform_source(tok) for tok in sources):
                     dst = candidate[1]
         self.last_v = None
+        # The scalar ALU table writes ops[0] and has its own TG_SIZE rule; anywhere else the word has no meaning.
+        if base not in SCA and any(self.holds_tg_size(tok) for tok in ops):
+            raise Unsupported('TG_SIZE read by %s' % base)
         term = self.lower(base, asm, ops, mods)
         if dst is not None:
             self.uniform_v.add(dst)
@@ -4067,7 +4071,10 @@ class ComputePipeline(Pipeline):
         self.lod_unvalidated = set()
         self.cs = Stage(self, 'cs', cs_code, refusals=refusals, decoded=decoded)
         if self.tg_size is not None and not self.tg_read:
-            raise Unsupported('COMPUTE_PGM_RSRC2 TG_SIZE_EN is not supported without a proven TG_SIZE read')
+            reason = 'COMPUTE_PGM_RSRC2 TG_SIZE_EN is not supported without a proven TG_SIZE read'
+            if refusals is None:
+                raise Unsupported(reason)
+            refusals.append((reason, 'cs'))
 
     def resource(self, key, kind):
         if key in self.uavs:
