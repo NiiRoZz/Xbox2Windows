@@ -316,8 +316,12 @@ def check_controls():
     load = ('s_mov_b64 s[20:21], 0', 's_mov_b64 s[22:23], 0', 's_load_dwordx8 s[24:31], s[10:11], 0x40')
     sample = 'image_sample v[12:15], v[0:1], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D'
     refused('image_sample with implicit LOD', lambda: translate('A', code=splice(*load, sample)).hlsl_cs())
-    lz = translate('A', code=splice(*load, sample.replace('image_sample', 'image_sample_lz'))).hlsl_cs()
+    pipeline = translate('A', code=splice(*load, sample.replace('image_sample', 'image_sample_lz')))
+    lz = pipeline.hlsl_cs()
     assert '.SampleLevel(' in lz, lz
+    refused('compute d16 image load requires validated SRV formats',
+            lambda: pipeline.cs.image(['v12', 'v[0:1]', 's[24:31]'],
+                                      ['dim:SQ_RSRC_IMG_2D', 'dmask:0x3', 'd16'], 'load'))
     print('compute entry, numthreads, manifest, offen store forms and the store, descriptor, execz and sample '
           'refusals pass')
 
