@@ -926,6 +926,9 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_indirect_mesh_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
 endforeach()
 set_tests_properties(startup_indirect_draw_indexed_hardware startup_indirect_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+# Negative control for the x2w-render indirect line: one forwarded call too many must be reported as a mismatch.
+add_test(NAME startup_indirect_counts_control_warp COMMAND startup_indirect_draw_indexed warp count-control)
+set_tests_properties(startup_indirect_counts_control_warp PROPERTIES TIMEOUT 30 PASS_REGULAR_EXPRESSION "indirect line mismatch")
 
 # OMSetRenderTargets with a single descriptor range, handles that hold no view, and a cleared copied descriptor.
 add_executable(startup_rtv_bind tests/startup_rtv_bind.cpp)
