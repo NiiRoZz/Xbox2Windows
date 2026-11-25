@@ -244,8 +244,10 @@ def controls():
     stages = [Probe(), Probe()]
     stages[0].one('v_subrev_f32_dpp', with_fi)
     stages[1].one('v_subrev_f32_dpp', with_fi[:-len(' fi:1')])
-    check('fi:1 does not change the broadcast lowering', stages[0].lines == stages[1].lines and
-          any('QuadReadLaneAt(v0, 0u)' in line for line in stages[0].lines), str(stages[0].lines))
+    check('fi:1 does not change the broadcast lowering', stages[0].lines == stages[1].lines)
+    # The DPP source is SRC0 and v_subrev computes SRC1 - SRC0 (#1996 item B): the lane's own word minus lane 0.
+    check('v_subrev_f32_dpp of a register with itself is own lane minus quad lane 0',
+          stages[0].lines == ['v256 = QuadReadLaneAt(v0, 0u);', 'v1 = U(F(v0) - F(v256));'], str(stages[0].lines))
     check('refused: fi:1 without s_wqm exec, exec', refused(with_fi, quad_exec=False))
     check('refused: fi:1 with EXEC no longer the entry mask', refused(with_fi, exec_known=False))
     check('refused: fi:1 in a pixel stage with branches', refused(with_fi, branches=True))
