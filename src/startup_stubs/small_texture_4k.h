@@ -7,7 +7,8 @@
 //
 // The size is the GFX10 4 KiB thin-block layout as AMD addrlib computes it (Gfx10Lib, Mesa 25.1.0): each
 // level is padded to whole blocks until the first level that fits a tail of half a block's width and a
-// block's height while at most 8 levels remain; that level and every smaller one share one block.
+// block's height; that level and every smaller one share one block. (addrlib also caps a tail at 8 levels;
+// a 4 KiB thin tail never holds more than 7, so the cap never applies.)
 //
 // Scope, any other description keeps the desktop answer: a 2D texture with layout UNKNOWN, Alignment
 // 0x1000, one sample, one array slice, power-of-two width and height up to 16384 (so block-compressed mip
@@ -16,9 +17,12 @@
 // (small_texture_4k_bits), the top level within the executable's 0x80007-bit bound, and a desktop answer
 // that is not a failure.
 //
-// Once a description gets this answer, the executable's memory for it is that many bytes. The stand-in's
-// own reads and writes of that memory (texture upload, XG copies) are limited to it with
-// small_texture_4k_extent() and small_texture_4k_within().
+// Once a description gets this answer, the executable's memory for it is that many bytes, which the desktop
+// linear footprint (256-byte row pitch, 512-byte level placement) can exceed. XG slot 2 describes, XG slot 8
+// writes and texture upload reads such a texture in one compact linear plan instead (small_texture_4k_plan):
+// every row at its exact byte width, levels back to back from the top level. It always fits inside the
+// answer (tests/startup_small_texture_4k_check.cpp checks every accepted shape). The texels are linear, not
+// the console's 4 KiB swizzle; a GFX10 4 KiB tiling plan (such as PR 1469's Gfx10Texture) can replace it.
 #pragma once
 
 #include <d3d12.h>
@@ -45,6 +49,12 @@ inline Block block(unsigned bits)
 inline bool power_of_two(std::uint64_t v) { return v && !(v & (v - 1)); }
 }  // namespace small_texture_4k_detail
 
+// True for the block-compressed formats among those answered (4x4 texel blocks).
+inline bool small_texture_4k_compressed(unsigned f)
+{
+    return (f >= 70 && f <= 84) || (f >= 94 && f <= 99);
+}
+
 // Bits per texel of the single-plane formats answered; 0 for every other format (depth with stencil in
 // the R32G8X24 and R24G8 families has two planes on the console and is not answered here).
 inline unsigned small_texture_4k_bits(unsigned format)
@@ -67,7 +77,7 @@ inline std::uint64_t small_texture_4k_bytes(std::uint64_t width, std::uint64_t h
     std::uint64_t blocks = 0;
     for (unsigned m = 0; m < mips; ++m) {
         const std::uint64_t w = (width >> m) ? (width >> m) : 1, h = (height >> m) ? (height >> m) : 1;
-        if (mips > 1 && w <= b.width / 2 && h <= b.height && mips - m <= 8) return (blocks + 1) * 0x1000;
+        if (mips > 1 && w <= b.width / 2 && h <= b.height) return (blocks + 1) * 0x1000;
         blocks += (w + b.width - 1) / b.width * ((h + b.height - 1) / b.height);
     }
     return blocks * 0x1000;
@@ -112,12 +122,33 @@ inline std::uint64_t small_texture_4k_extent(const D3D12_RESOURCE_DESC& d)
     return d.Alignment == 0x1000 ? small_texture_4k_shape(d) : 0;
 }
 
-// Bytes of [offset, offset + bytes) that lie inside the first extent bytes; extent 0 means no limit.
-inline std::uint64_t small_texture_4k_within(std::uint64_t offset, std::uint64_t bytes, std::uint64_t extent)
+// The compact linear plan of a description with an extent: per level its offset, row bytes (a row of texels,
+// or of 4x4 blocks), row count and bytes; levels follow each other with no padding.
+struct SmallTexturePlan {
+    struct Level { std::uint64_t offset, row_bytes, rows, bytes; };
+    unsigned levels = 0;
+    std::uint64_t bytes = 0;
+    Level level[15]{};
+};
+inline bool small_texture_4k_plan(const D3D12_RESOURCE_DESC& d, SmallTexturePlan& plan)
 {
-    if (!extent) return bytes;
-    if (offset >= extent) return 0;
-    return bytes < extent - offset ? bytes : extent - offset;
+    if (!small_texture_4k_extent(d)) return false;
+    unsigned full = 0;
+    for (std::uint64_t e = d.Width > d.Height ? d.Width : d.Height; e; e >>= 1) ++full;
+    const bool compressed = small_texture_4k_compressed(d.Format);
+    const unsigned bits = small_texture_4k_bits(d.Format);
+    plan = {};
+    plan.levels = d.MipLevels ? d.MipLevels : full;
+    for (unsigned m = 0; m < plan.levels; ++m) {
+        const std::uint64_t w = (d.Width >> m) ? (d.Width >> m) : 1, h = (d.Height >> m) ? (d.Height >> m) : 1;
+        auto& l = plan.level[m];
+        l.offset = plan.bytes;
+        l.row_bytes = compressed ? (w + 3) / 4 * bits * 2 : w * bits / 8;  // a 4x4 block holds 16 texels
+        l.rows = compressed ? (h + 3) / 4 : h;
+        l.bytes = l.row_bytes * l.rows;
+        plan.bytes += l.bytes;
+    }
+    return true;
 }
 
 }  // namespace x2w_startup

@@ -152,12 +152,66 @@ HRESULT copy_bc7_4k_s(const D3D12_RESOURCE_DESC& desc, unsigned char* dest, cons
     return S_OK;
 }
 
+// A description given the 4 KiB allocation answer (small_texture_4k.h): slot 2 describes the compact plan
+// that slot 8 writes and the texture upload reads, inside the answered size at 4 KiB alignment.
+void write_compact_layout(const D3D12_RESOURCE_DESC& desc, const x2w_startup::SmallTexturePlan& compact, unsigned char* layout)
+{
+    const u64 total = x2w_startup::small_texture_4k_extent(desc);
+    const bool blocks = x2w_startup::small_texture_4k_compressed(desc.Format);
+    put64(layout + 0x00, total);
+    put64(layout + 0x08, 0x1000);
+    put32(layout + 0x10, compact.levels);
+    put32(layout + 0x14, 1);
+    unsigned char* plane = layout + layout_header;
+    put64(plane + 0x08, total);
+    put64(plane + 0x18, 0x1000);
+    for (unsigned m = 0; m < compact.levels; ++m) {
+        const auto& level = compact.level[m];
+        const UINT width = static_cast<UINT>((desc.Width >> m) ? (desc.Width >> m) : 1), height = (desc.Height >> m) ? (desc.Height >> m) : 1;
+        const UINT padded_width = blocks ? (width + 3) & ~3u : width, padded_height = blocks ? (height + 3) & ~3u : height;
+        unsigned char* mip = plane + mip_base + m * mip_bytes;
+        put64(mip + 0x00, level.bytes);
+        put64(mip + 0x08, level.offset);
+        put64(mip + 0x10, level.bytes);
+        put32(mip + 0x18, padded_width);
+        put32(mip + 0x1c, static_cast<std::uint32_t>(level.row_bytes));
+        put32(mip + 0x20, 1);
+        put32(mip + 0x24, padded_width);
+        put32(mip + 0x28, padded_height);
+        put32(mip + 0x2c, 1);
+        put32(mip + 0x30, width);
+        put32(mip + 0x34, height);
+        put32(mip + 0x38, 1);
+        put32(mip + 0x3c, 1);
+    }
+}
+
+// Slot 8 for the compact plan: every row of one level, or nothing when the call cannot be served whole.
+long copy_compact(const D3D12_RESOURCE_DESC& desc, const x2w_startup::SmallTexturePlan& compact, unsigned char* base, unsigned plane,
+                  unsigned subresource, const unsigned char* linear, unsigned row_pitch)
+{
+    if (!base || !linear || plane || subresource >= compact.levels) return static_cast<long>(0x80070057);
+    const auto& level = compact.level[subresource];
+    if (row_pitch < level.row_bytes) return static_cast<long>(0x80070057);
+    if (!x2w_local::writable(base + level.offset, level.bytes) ||
+        !x2w_local::readable(linear, u64{row_pitch} * (level.rows - 1) + level.row_bytes))
+        return static_cast<long>(0x80004005);
+    for (u64 y = 0; y < level.rows; ++y)
+        std::memcpy(base + level.offset + y * level.row_bytes, linear + y * row_pitch, static_cast<std::size_t>(level.row_bytes));
+    notify_texture_write(base, x2w_startup::small_texture_4k_extent(desc));
+    return 0;
+}
+
 long __stdcall computer_layout(Computer* self, unsigned char* layout)
 {
     if (!layout) return static_cast<long>(0x80004003);
     std::memset(layout, 0, layout_header + 4 * plane_bytes + 8);
     if (self->bc7_4k_s_layout) {
         write_bc7_4k_s_layout(self->desc, layout);
+        return S_OK;
+    }
+    if (x2w_startup::SmallTexturePlan compact; x2w_startup::small_texture_4k_plan(self->desc, compact)) {
+        write_compact_layout(self->desc, compact, layout);
         return S_OK;
     }
     ID3D12Device* device = layout_device();
@@ -173,13 +227,9 @@ long __stdcall computer_layout(Computer* self, unsigned char* layout)
     UINT64 slice_total = plan.size;
     const bool valid = slice_total != ~0ull && slice_total != 0;
     if (!valid) slice_total = 0x10000;
-    // A description the allocation-info entries answer with 4 KiB gets the same size and alignment here
-    // (small_texture_4k.h). Limit: its mip records still describe the desktop linear footprint, which can
-    // reach past that size; slot 8 writes only the part inside it.
-    const u64 extent = x2w_startup::small_texture_4k_extent(self->desc);
-    const u64 stride = extent ? extent : (slice_total + 0xFFFF) & ~u64{0xFFFF};
+    const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
     const u64 total = stride * slices;
-    const u64 alignment = extent ? 0x1000 : 0x10000;
+    const u64 alignment = 0x10000;
 
     put64(layout + 0x00, total);
     put64(layout + 0x08, alignment);
@@ -308,6 +358,14 @@ long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned 
         return hr;
     }
     static LONG calls, refused;
+    if (x2w_startup::SmallTexturePlan compact; x2w_startup::small_texture_4k_plan(self->desc, compact)) {
+        const long hr = copy_compact(self->desc, compact, base, plane, subresource, linear, row_pitch);
+        if (x2w_local::first_calls(calls, 12) || hr)
+            x2w_local::logf("x2w-xg TextureComputer::slot8(copy into) base=%p subresource=%u %llux%u fmt=%d pitch %u compact plan of "
+                            "the 4 KiB answer -> 0x%08lx", static_cast<void*>(base), subresource, self->desc.Width, self->desc.Height,
+                            self->desc.Format, row_pitch, static_cast<unsigned long>(hr));
+        return hr;
+    }
     ID3D12Device* device = layout_device();
     const D3D12_RESOURCE_DESC desc = desktop_desc(self->desc);
     const bool volume = desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
@@ -328,31 +386,24 @@ long __stdcall computer_copy_into(Computer* self, unsigned char* base, unsigned 
                             static_cast<void*>(base), plane, subresource, static_cast<const void*>(linear), row_pitch, slice_pitch);
         return static_cast<long>(0x80070057);
     }
-    // A description given the 4 KiB allocation answer has only that much memory at base: rows past it are
-    // not written (small_texture_4k.h).
-    const u64 extent = x2w_startup::small_texture_4k_extent(self->desc);
     const u64 stride = (slice_total + 0xFFFF) & ~u64{0xFFFF};
     const auto& fp = footprints[i].Footprint;
     const u64 used = row_bytes[i] < row_pitch ? row_bytes[i] : row_pitch;
-    const u64 start = stride * slice + footprints[i].Offset;
-    unsigned char* target = base + start;
-    const u64 target_bytes = x2w_startup::small_texture_4k_within(start, plan.bytes(i), extent);
+    unsigned char* target = base + stride * slice + footprints[i].Offset;
+    const u64 target_bytes = plan.bytes(i);
     const u64 source_slice = slice_pitch ? slice_pitch : u64{row_pitch} * rows[i];
-    const bool ok = (!target_bytes || x2w_local::writable(target, target_bytes)) &&
+    const bool ok = x2w_local::writable(target, target_bytes) &&
                     x2w_local::readable(linear, source_slice * (fp.Depth - 1) + u64{row_pitch} * (rows[i] - 1) + used);
     if (ok) {
         for (unsigned z = 0; z < fp.Depth; ++z)
-            for (unsigned y = 0; y < rows[i]; ++y) {
-                const u64 row = (u64{z} * rows[i] + y) * fp.RowPitch;
-                const u64 inside = x2w_startup::small_texture_4k_within(start + row, used, extent);
-                if (inside) std::memcpy(target + row, linear + z * source_slice + u64{y} * row_pitch, inside);
-            }
-        notify_texture_write(base, extent ? extent : stride * slices);
+            for (unsigned y = 0; y < rows[i]; ++y)
+                std::memcpy(target + (u64{z} * rows[i] + y) * fp.RowPitch, linear + z * source_slice + u64{y} * row_pitch, used);
+        notify_texture_write(base, stride * slices);
     }
     if (x2w_local::first_calls(calls, 12) || !ok)
         x2w_local::logf("x2w-xg TextureComputer::slot8(copy into) base=%p subresource=%u (mip %u slice %u) %ux%u fmt=%d rows=%u "
-                        "pitch %u->%u extent=0x%llx -> %s", static_cast<void*>(base), subresource, mip, slice, fp.Width, fp.Height, desc.Format,
-                        rows[i], row_pitch, fp.RowPitch, extent, ok ? "copied" : "MEMORY NOT ACCESSIBLE");
+                        "pitch %u->%u -> %s", static_cast<void*>(base), subresource, mip, slice, fp.Width, fp.Height, desc.Format,
+                        rows[i], row_pitch, fp.RowPitch, ok ? "copied" : "MEMORY NOT ACCESSIBLE");
     return ok ? 0 : static_cast<long>(0x80004005);
 }
 

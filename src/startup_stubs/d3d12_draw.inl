@@ -731,12 +731,18 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     }
     if (tiled && !tiled_chain && (plan.count != 1 || plan.rows[0] != surface.rows ||
                   plan.row_bytes[0] != u64{surface.columns} * surface.block_bytes)) return;
-    // A texture given the 4 KiB allocation answer has only that much executable memory behind it; the linear
-    // footprint can be larger (small_texture_4k.h), and nothing past the answer is read.
-    const u64 extent = original && !tiled ? x2w_startup::small_texture_4k_extent(original->console) : 0;
-    const u64 linear_total = stride * (slices - 1) + slice_total;
+    // A texture given the 4 KiB allocation answer is read in the compact plan XG describes and writes for it
+    // (small_texture_4k.h); its rows must be the footprint's rows, level by level.
+    x2w_startup::SmallTexturePlan compact;
+    const bool is_compact = original && !tiled && x2w_startup::small_texture_4k_plan(original->console, compact);
+    if (is_compact) {
+        bool rows_match = compact.levels == plan.count;
+        for (UINT i = 0; rows_match && i < plan.count; ++i)
+            rows_match = compact.level[i].rows == plan.rows[i] && compact.level[i].row_bytes == plan.row_bytes[i];
+        if (!rows_match) return;
+    }
     const u64 total = tiled_chain ? x2w_startup::bc64::Chain(original->console).bytes() : tiled ? surface.size()
-        : extent && extent < linear_total ? extent : linear_total;
+        : is_compact ? compact.bytes : stride * (slices - 1) + slice_total;
     const bool announced = state.generation != generation;
     const UINT elapsed = static_cast<UINT>(frame_number) - static_cast<UINT>(state.checked_frame);
     const bool recheck = (tiled_address || tiled_chain) ? elapsed != 0
@@ -787,16 +793,21 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
             for (UINT i = 0; i < plan.count; ++i) {
                 const auto& fp = plan.placed[i];
                 const u64 bytes = plan.bytes(i);
-                const u64 at = stride * s + fp.Offset;
-                const u64 inside = x2w_startup::small_texture_4k_within(at, bytes, extent);
                 u64 offset = 0;
-                auto* const rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
-                if (!rows) {
+                if (is_compact) {
+                    auto* const rows = reserve_upload_ring(static_cast<std::size_t>(bytes), &offset);
+                    if (!rows) {
+                        state.done = false;
+                        return;
+                    }
+                    const auto& level = compact.level[i];
+                    for (u64 y = 0; y < level.rows; ++y)
+                        std::memcpy(rows + y * fp.Footprint.RowPitch, memory + level.offset + y * level.row_bytes,
+                                    static_cast<std::size_t>(level.row_bytes));
+                } else if (!ring_copy(reinterpret_cast<u64>(memory) + stride * s + fp.Offset, static_cast<std::size_t>(bytes), &offset)) {
                     state.done = false;
                     return;
                 }
-                std::memcpy(rows, memory + at, static_cast<std::size_t>(inside));
-                if (inside < bytes) std::memset(rows + inside, 0, static_cast<std::size_t>(bytes - inside));
                 plan.upload(list, texture, upload_ring, mips, slices, s, i, offset);
             }
     }
@@ -810,7 +821,7 @@ void upload_texture(Wrapper* self, Wrapper* resource, ID3D12Resource* texture)
     if (first_calls(shown, 12))
         log("x2w-draw texture upload %p %llux%u x%u mips %u format %d from %p (%llu KiB)%s%s", static_cast<void*>(texture), desc.Width,
             desc.Height, slices, mips, desc.Format, static_cast<const void*>(memory), total >> 10, announced ? " (announced write)" : "",
-            extent && extent < linear_total ? " (limited to the 4 KiB allocation answer)" : "");
+            is_compact ? " (compact plan of the 4 KiB allocation answer)" : "");
 }
 
 // Per-draw dumps (X2W_DRAW_DUMP_FRAME=<frame>, X2W_DRAW_DUMP_DIR=<folder>): during that frame, render

@@ -15,6 +15,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 
 namespace {
 int failures;
@@ -74,6 +75,7 @@ int literal(bool whole_width_tail)
     answered("128x32 BC1 4 mips: 1 + tail", texture(71, 128, 32, 4), rule(0x2000, 0x1000));
     answered("128x128 R8G8B8A8 8 mips: 16 + 4 + 1 + tail", texture(28, 128, 128, 8), rule(0x16000, 0x15000));
     answered("1024x1 R8 full chain (MipLevels 0): 16+8+4+2+1 + tail", texture(61, 1024, 1, 0), 0x20000);
+    answered("64x64 BC1 full chain: all 7 levels in one tail block", texture(71, 64, 64, 7), 0x1000);
 
     // Refused: the desktop answer stays.
     kept("alignment 0", texture(28, 32, 16, 1, 0));
@@ -113,7 +115,7 @@ int literal(bool whole_width_tail)
     {
         D3D12_RESOURCE_ALLOCATION_INFO failed{~0ull, 0};
         if (x2w_startup::small_texture_4k(texture(71, 2, 2), failed) || failed.SizeInBytes != ~0ull) {
-            std::printf("FAIL 2x2 BC1: a desktop failure was replaced\n");
+            std::printf("FAIL 2x2 BC1: a desktop failure was replaced\n");
             ++failures;
         }
     }
@@ -135,7 +137,7 @@ int literal(bool whole_width_tail)
     for (unsigned f : bits4) expected_bits[f] = 4;
     for (unsigned f = 0; f < 256; ++f)
         if (x2w_startup::small_texture_4k_bits(f) != expected_bits[f]) {
-            std::printf("FAIL format %u: %u bits per texel, expected %u\n", f, x2w_startup::small_texture_4k_bits(f), expected_bits[f]);
+            std::printf("FAIL format %u: %u bits per texel, expected %u\n", f, x2w_startup::small_texture_4k_bits(f), expected_bits[f]);
             ++failures;
         }
 
@@ -143,7 +145,7 @@ int literal(bool whole_width_tail)
     const auto extent_is = [](const char* name, const D3D12_RESOURCE_DESC& desc, unsigned long long expected) {
         const unsigned long long got = x2w_startup::small_texture_4k_extent(desc);
         if (got != expected) {
-            std::printf("FAIL extent %s: 0x%llx, expected 0x%llx\n", name, got, expected);
+            std::printf("FAIL extent %s: 0x%llx, expected 0x%llx\n", name, got, expected);
             ++failures;
         }
     };
@@ -151,19 +153,63 @@ int literal(bool whole_width_tail)
     extent_is("32x32 R8G8B8A8 at 4 KiB", texture(28, 32, 32), 0x1000);
     extent_is("32x32 R8G8B8A8 at 64 KiB", texture(28, 32, 32, 1, 0x10000), 0);
     extent_is("256x128 R8G8B8A8, over the bound", texture(28, 256, 128), 0);
-    struct { unsigned long long offset, bytes, extent, inside; } spans[] = {
-        {0, 0x1f80, 0x1000, 0x1000}, {0xf00, 0x80, 0x1000, 0x80}, {0xf80, 0x100, 0x1000, 0x80},
-        {0x1000, 0x80, 0x1000, 0}, {0x2000, 0x80, 0x1000, 0}, {0x1800, 0x80, 0, 0x80}};
-    for (const auto& c : spans)
-        if (x2w_startup::small_texture_4k_within(c.offset, c.bytes, c.extent) != c.inside) {
-            std::printf("FAIL within(0x%llx, 0x%llx, 0x%llx) != 0x%llx\n", c.offset, c.bytes, c.extent, c.inside);
+
+    // The compact plan slot 2 describes, slot 8 writes and upload reads: levels back to back at exact row bytes.
+    struct Level { unsigned long long offset, row_bytes, rows; };
+    const auto plan_is = [](const char* name, const D3D12_RESOURCE_DESC& desc, std::initializer_list<Level> levels) {
+        x2w_startup::SmallTexturePlan plan;
+        bool ok = x2w_startup::small_texture_4k_plan(desc, plan) && plan.levels == levels.size();
+        unsigned i = 0;
+        for (const Level& l : levels) {
+            ok = ok && plan.level[i].offset == l.offset && plan.level[i].row_bytes == l.row_bytes && plan.level[i].rows == l.rows &&
+                 plan.level[i].bytes == l.row_bytes * l.rows;
+            ++i;
+        }
+        if (!ok) {
+            std::printf("FAIL plan %s\n", name);
             ++failures;
         }
+    };
+    plan_is("32x32 R8G8B8A8 2 mips", texture(28, 32, 32, 2), {{0, 128, 32}, {0x1000, 64, 16}});
+    plan_is("128x128 BC1 3 mips", texture(71, 128, 128, 3), {{0, 256, 32}, {0x2000, 128, 16}, {0x2800, 64, 8}});
+    plan_is("4x4 BC7 full chain", texture(98, 4, 4, 0), {{0, 16, 1}, {16, 16, 1}, {32, 16, 1}});
+    {
+        x2w_startup::SmallTexturePlan plan;
+        if (x2w_startup::small_texture_4k_plan(texture(28, 32, 32, 1, 0), plan)) {
+            std::printf("FAIL plan at alignment 0: a description without the 4 KiB answer got a compact plan\n");
+            ++failures;
+        }
+    }
+
+    // Every accepted shape (one format of each bit depth and both block sizes, power-of-two sides up to 4096,
+    // every mip count): the compact plan ends inside the answer, and no tail holds more than 7 levels, so
+    // addrlib's 8-level tail limit never applies to 4 KiB thin blocks.
+    const unsigned formats[] = {71, 98, 61, 54, 28, 11, 2};
+    unsigned shapes = 0, overflow = 0, long_tails = 0;
+    for (unsigned f : formats)
+        for (unsigned w = 1; w <= 4096; w <<= 1)
+            for (unsigned h = 1; h <= 4096; h <<= 1)
+                for (unsigned mips = 1; mips <= 13; ++mips) {
+                    const D3D12_RESOURCE_DESC desc = texture(f, w, h, mips);
+                    D3D12_RESOURCE_ALLOCATION_INFO info = desktop;
+                    x2w_startup::SmallTexturePlan plan;
+                    if (!x2w_startup::small_texture_4k(desc, info) || !x2w_startup::small_texture_4k_plan(desc, plan)) continue;
+                    ++shapes;
+                    if (plan.bytes > info.SizeInBytes) ++overflow;
+                    const auto block = x2w_startup::small_texture_4k_detail::block(x2w_startup::small_texture_4k_bits(f));
+                    for (unsigned m = 0; m < mips; ++m)
+                        if (((w >> m) ? (w >> m) : 1u) <= block.width / 2 && ((h >> m) ? (h >> m) : 1u) <= block.height) {
+                            if (mips - m > 7) ++long_tails;
+                            break;
+                        }
+                }
+    std::printf("compact plan: %u accepted shapes, %u past the answer, %u tails over 7 levels\n", shapes, overflow, long_tails);
+    if (shapes != 4943 || overflow || long_tails) ++failures;
     if (failures) {
         std::printf("startup_small_texture_4k: %d failure(s)\n", failures);
         return 1;
     }
-    std::printf("startup_small_texture_4k: PASS (14 sizes, 19 refused descriptions, 256 format values, extent and span limits)\n");
+    std::printf("startup_small_texture_4k: PASS (15 sizes, 19 refused descriptions, 256 format values, extents, compact plans)\n");
     return 0;
 }
 }  // namespace
