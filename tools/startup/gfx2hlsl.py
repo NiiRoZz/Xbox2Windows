@@ -1870,8 +1870,6 @@ class Stage:
         last write dominates the target and no block on a path from that write to the target writes the register
         again."""
         index, block_of, succ, dom, writes, reached = self.flow
-        if target not in index:
-            return set(regs)
         def after(block):  # blocks reached from block over at least one edge
             if block not in reached:
                 seen, todo = set(), list(succ[block])
