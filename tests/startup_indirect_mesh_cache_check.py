@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import re
 import struct
 import subprocess
 import sys
@@ -25,13 +26,56 @@ def source_envelope(stage):
     return b'DXBC' + bytes(16) + struct.pack('<IIII', 1, 36 + len(part), 1, 36) + part
 
 
+def trace_paired_submission(cmd, environment):
+    # The dual fixture records the missing-writer control, the unsubmitted
+    # argument writer, the ordered draw, then each remap and its recovery.
+    for ordinal, changed_input in ((2, None), (3, None), (4, 'root-srv'), (6, 'arguments')):
+        traced = dict(environment, X2W_MESH86_WRITER_TRACE=str(ordinal))
+        result = subprocess.run(cmd, env=traced, stderr=subprocess.PIPE, encoding='utf-8', errors='replace')
+        sys.stderr.write(result.stderr)
+        if result.returncode:
+            return result.returncode
+        prefix = f'x2w-mesh86-trace call={ordinal} '
+        rows = [line[len(prefix):] for line in result.stderr.splitlines() if line.startswith(prefix)]
+        forwarded = [row for row in rows if row.startswith('stage=submit outcome=forwarded')]
+        if ordinal == 2:
+            assert any(row.startswith('input=root-srv range=fixed-span bytes=4 placement=copy lease=matched')
+                       for row in rows), rows
+            assert 'input=arguments range=fixed-span bytes=12 placement=copy lease=absent writer-submit=0' in rows, rows
+            assert 'stage=record outcome=refused reason=mesh XMem read has no submitted writer for the required size' in rows, rows
+            assert not forwarded, rows
+            continue
+        assert 'stage=record outcome=recorded' in rows, rows
+        if changed_input:
+            assert f'stage=submit outcome=refused reason={changed_input}-identity-changed' in rows, rows
+            assert not forwarded, rows
+            continue
+
+        writers = set()
+        for name, width, source, queue in (('root-srv', 4, 'upload', 'copy'),
+                                           ('arguments', 12, 'default-uav', 'compute')):
+            input_row = f'input={name}'
+            publication = re.compile(
+                rf'{input_row} range=fixed-span bytes={width} placement=copy lease=matched writer-submit=([1-9]\d*)')
+            matches = [match for row in rows if (match := publication.fullmatch(row))]
+            assert len(matches) == 1, rows
+            writer = matches[0][1]
+            writers.add(writer)
+            assert f'{input_row} copy-slot=15 source={source} queue={queue} submit={writer} range=covers-placement' in rows, rows
+            assert f'{input_row} order=wait writer-submit={writer} fence-submit={writer}' in rows, rows
+        assert len(writers) == 2, rows
+        assert len(forwarded) == 1, rows
+        assert re.fullmatch(r'stage=submit outcome=forwarded submit=[1-9]\d* queue=direct signal=enqueued',
+                            forwarded[0]), rows
+    return 0
+
+
 def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, mode=None, depth_pixel=None):
     for suffix, stage in (('ms', 13), ('ps', 0)):
         (work / f'source.{suffix}.dxbc').write_bytes(source_envelope(stage))
     environment = dict(os.environ, X2W_MESH86_FIXTURE_DIR=str(work), X2W_SHADER_CACHE=str(work))
-    environment.pop('X2W_MESH86_FIXTURE_READY', None)
-    environment.pop('X2W_MESH86_FIXTURE_DEPTH', None)
-    environment.pop('X2W_MESH86_FIXTURE_DEPTH_PIXEL', None)
+    for flag in ('READY', 'DEPTH', 'DEPTH_PIXEL', 'PADDING', 'SAMPLE_MASK'):
+        environment.pop(f'X2W_MESH86_FIXTURE_{flag}', None)
     if depth_only:
         environment['X2W_MESH86_FIXTURE_DEPTH'] = '1'
     if depth_pixel:
@@ -45,7 +89,7 @@ def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, mode=None, dep
             environment.pop(flag, None)
         if mode == 'skip-wait':
             environment['X2W_TEST_MESH_XMEM_SKIP_WAIT'] = '1'
-        elif mode in ('dual', 'dual-skip-srv', 'dual-skip-argument', 'dual-init-only'):
+        elif mode in ('dual', 'dual-skip-srv', 'dual-skip-argument', 'dual-init-only', 'dual-trace'):
             environment.update(X2W_MESH86_FIXTURE_DUAL='1', X2W_MESH_INDIRECT_XMEM='1')
             if mode == 'dual-skip-srv':
                 environment['X2W_TEST_MESH_XMEM_SKIP_SRV_WAIT'] = '1'
@@ -85,7 +129,33 @@ def run(dxc, fixture, backend, work, depth_only, lease_xmem=None, mode=None, dep
     # WARP keeps the existing MS-only depth refusal.
     if has_pixel or backend == 'hardware':
         environment['X2W_MESH86_FIXTURE_READY'] = '1'
-    return subprocess.run(cmd, env=environment).returncode
+    if mode == 'dual-trace':
+        return trace_paired_submission(cmd, environment)
+    if lease_xmem or depth_only:
+        return subprocess.run(cmd, env=environment).returncode
+
+    # Change only the blend and depth-stencil object padding between capture
+    # and replay. A cache miss leaves the fixture's color attachments clear.
+    padded = dict(environment, X2W_MESH86_FIXTURE_PADDING='1')
+    replay = subprocess.run(cmd, env=padded)
+    if replay.returncode:
+        return replay.returncode
+    assert list(work.glob('req_*.m86')) == [marker]
+
+    # A real sample-mask change must instead publish a different request and
+    # refuse the previously cached PSO, leaving all attachments clear.
+    padded.pop('X2W_MESH86_FIXTURE_READY')
+    changed = subprocess.run(cmd, env=dict(padded, X2W_MESH86_FIXTURE_SAMPLE_MASK='1'))
+    if changed.returncode:
+        return changed.returncode
+    changed_marker, = set(work.glob('req_*.m86')) - {marker}
+    changed_key = int(changed_marker.stem.removeprefix('req_'), 16)
+    changed_ms, changed_ps, changed_root, changed_stream = mesh86_cache.load_request(work, changed_key)
+    assert (changed_ms, changed_ps, changed_root) == (source_ms, source_ps, root)
+    assert stream[-8:] == struct.pack('<II', 9, 0xffffffff)
+    assert changed_stream == stream[:-4] + struct.pack('<I', 0xfffffffe)
+    print('mesh cache padding replay reused the PSO; sample-mask change generated a new key')
+    return 0
 
 
 if __name__ == '__main__':
