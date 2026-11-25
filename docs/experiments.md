@@ -13388,6 +13388,46 @@ ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_' -V
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
+In the entry block of a compute program the store's four descriptor registers decide alone (#2274). Before
+the first branch, terminator or branch target, and with no branch back to the first instruction, every
+instruction has run once in program order. A store whose registers hold the four words of one `s_load` then
+uses the descriptor the table holds, even if an earlier state of those registers, or a copy in other registers,
+was modified. Three forms that were refused now translate there:
+- a modified or overwritten word followed by a reload of all four words;
+- a modification of a copy held in other registers, with the store through the untouched registers;
+- a changed word restored by `s_mov` from an unchanged copy of the same word.
+
+No descriptor field is interpreted. Past the entry block any modification of the descriptor still refuses the
+store, because another path can reach it with other words. A store whose own words are modified is refused
+everywhere. That includes the stride clear and the structured-to-raw conversion (stride cleared, OOB_SELECT
+set to 3, NUM_RECORDS multiplied by the stride). Measured with this change over one local cache of 2689
+compute requests: 54 reach this refusal, as before, and none of the 17 accepted store sites is an entry-block
+store through a marked descriptor. The rule translates no additional cached request.
+
+`startup_gfx2hlsl_store_descriptor_check.py` translates two source-built programs:
+- Case R modifies word 1, overwrites word 2 and sets bits in word 3, reloads the four words, then stores one
+  word at offset 8 of 28-byte records. Group size 8x1x1, 1x5x1 groups.
+- Case K copies the descriptor to other registers, modifies words 1 to 3 of the copy, then stores two words at
+  offset 4 of 12-byte records through the loaded registers. Group size 5x2x1, 2x1x3 groups.
+
+Both are dispatched like the compute cases above, with the test runner's root signature, and all 320 words are
+compared. The runner binds the buffers itself, so the descriptor words are not visible to the GPU; the read-back
+checks the store address and data, not the descriptor rule. Two controls must each mismatch: dropping case R's
+immediate offset and dropping case K's store. The descriptor rule is covered by the pure-Python controls: 8
+entry-block programs translate and are refused under the previous guard, 5 of them with exactly the output of
+the same program without the change, and 13 word and 6 path cases stay refused (a word changed after the reload, a partial
+reload, a word in the wrong register, a store through the modified copy, a reload or a copy's modification that
+a branch skips, a store after the first branch, a branch to the first instruction, a loop). A refused store
+leaves the HLSL and the manifest as they are without it.
+
+On Windows 11 (26300), all 320 words matched in both cases on WARP (10.0.26100.10068) and on an RTX 5090
+(32.0.16.2135), with the debug layer on.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_store_descriptor_' -V
+python -B tests/startup_gfx2hlsl_store_descriptor_check.py binary llvm-mc-15
+```
+
 ## Startup translator: refusal census
 
 The startup shader translator normally stops a pipeline at its first refusal. Fixing that refusal can expose gaps that were previously hidden, as documented in the [issue #1723 census](https://github.com/R0Y00/Xbox2Windows/issues/1723).
