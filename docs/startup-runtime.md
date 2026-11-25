@@ -31,6 +31,38 @@ records. The control expects the first blend patch to win and must fail.
 
 Command-list slot 24 (`OMSetStencilRef`, the desktop slot) passes its reference to the desktop list, as slots 21 to 23 do for viewports, scissors and the blend factor, so a translated draw whose pipeline enables the stencil test compares against it. A closed list ignores the call. The slot number is the desktop one and has not been seen in a title log; `startup_stream_depth_{warp,hardware}` checks the references 0x5A, 0x5B, 0 and 0xFF against a stencil cleared to the matching value.
 
+## Occlusion queries
+
+Which console methods sit at command-list slots 28 to 30 is not established by any fixture here. The repository
+shows only that four console methods sit in 26 to 31 (32 is `SetDescriptorHeaps`, desktop 28 plus four) and that
+the plus-four run has ended by 61 (`ExecuteIndirect`, desktop 59 plus two). As a hypothesis, slots 28 to 30 are
+implemented as `BeginQuery(heap, type, index)`, `EndQuery(heap, type, index)` and
+`ResolveQueryData(heap, type, start, count, buffer, offset)`. Because that is a hypothesis, the bindings are a
+diagnostic opt-in: only with `X2W_D3D12_QUERY_SLOTS=1` (in render mode) are the three slots bound. Unset, they stay
+no-ops as before. The fixture below calls those slots directly, so it checks the forwarding, the refusals and the
+end at Close, not the numbering.
+
+The query heap comes from device slot 39 with the desktop desc, which the stand-in keeps. Only occlusion and
+binary-occlusion queries on an occlusion heap, recorded on a DIRECT list, are forwarded to the desktop list. A
+resolve is forwarded only when every index in its range was ended, with the same query type, on the current
+recording; a new `BeginQuery` on an index clears its completion, and Close clears all of them. These calls are
+refused and logged (`x2w-render ... refused`, the first 16 of each method): another command-list type, an index
+outside the heap, an `EndQuery` without a `BeginQuery` on the same list, a resolve over an index not so ended, and
+a resolve to anything but a committed readback buffer without title memory, or past that buffer's end. A query
+still open at Close is ended there, since the desktop Close would otherwise fail and drop the list. The readback
+buffer stays in `COPY_DEST` and is not moved through the list's state tracking.
+
+Known limit: a resolve recorded on a later list than the `EndQuery` calls it covers is refused. Whether a caller
+resolves on the recording that ended its queries has not been observed.
+
+`startup_list_queries_{warp,hardware}` sets `X2W_D3D12_QUERY_SLOTS=1`. It resolves a query around a draw over an
+8x8 target (64 samples) and an empty one (0) into a readback buffer filled with a sentinel, and reads it through
+the console `Map`. It then checks that the refused calls, among them resolves over a never-begun index, a range
+with a hole and an index ended with the other occlusion type, leave the sentinel untouched with no debug-layer
+error, and it leaves one query open at Close. `startup_list_queries_default_{warp,hardware}_control` runs it
+without the switch: the slots stay no-ops and it must report the untouched sentinel in the first word.
+`command_list_slot_names.h` still names 56 to 58 as the query methods by the plus-four rule.
+
 ## Default viewport and scissor
 
 A desktop command list that never sets a viewport or scissor rectangle draws no pixel. A translated
@@ -115,8 +147,48 @@ these refusals:
 - a record of kind 7, or one that reaches past v255;
 - a header record count that disagrees with the table.
 
-The pixel stage still reads attribute N from vertex output N. It does not yet pair the two by semantic, so a
-pixel shader that reads only some of the vertex outputs can receive the wrong one. That is a separate problem.
+## Stream stage interface by semantic
+
+In a slot-86 stream pipeline, the pixel shader's attribute N is not vertex parameter N. Each container states its
+side of the interface in its native header:
+- **Vertex shader:** from +0x1dc, one 6-byte record per exported parameter: kind 6, output-signature register,
+  parameter index, then three zero bytes. The count is at +0x29c.
+- **Pixel shader** (a header of 0xef8 bytes): from +0x138, one 8-byte record per attribute: kind 6, input-signature
+  register, component mask, attribute index, two zero bytes, the register again, and interpolation 1 or 2. The
+  count is at +0x238.
+
+`gfx2hlsl.py` links each attribute to the vertex parameter whose output register carries the same semantics with the
+same components as the attribute's input register. Raw programs without signatures still pair by number. A pixel shader that declares no inputs reads no tables, and any attribute read it makes is refused.
+
+The translation is refused when:
+- a record has any other values (these forms pack two signature registers into one parameter or attribute), or the
+  pixel table lists one register twice;
+- a pixel record's component mask differs from the input signature's mask for its register;
+- a semantic of the attribute's register has no vertex output with the same semantic index and the same components.
+  So a four-component vertex output that feeds a two-component pixel input is refused;
+- the attribute's semantics come from more than one vertex register;
+- either header has another size;
+- the code reads an attribute the table does not list.
+
+The shader cache revision is `x2w-startup-shader-8`, so translations paired by number are not reused.
+
+The record layouts were checked offline against the signatures of one title's shader archive (local files only, not
+in the repository). The counts below apply the translator's own record checks.
+- **Vertex shaders:** the population is the 2,041 programs whose native image inflates. 1,536 have only simple
+  records. Of the 1,983 whose code also decodes, 1,496 have simple records that match the output signature register
+  for register, with parameters in register order. 505 use packed records and are refused when a pixel stage with
+  inputs needs them.
+- **Pixel shaders:** the population is the 10,862 programs whose image inflates and whose input signature declares
+  a non-system input. 5,975 have only simple records, and each record's mask equals the signature mask. 4,887 use
+  packed or other records and are refused. The 1,239 without inputs need no table.
+
+The translator-only cases need no device: `python -B tests/startup_stream_interface_check.py`, or
+`ctest --preset release --no-tests=error -R "^startup_stream_interface_translate$"`. They check that attribute 0
+reads the TEXCOORD parameter, and they check each refusal. The draw is
+`ctest --preset release --no-tests=error -R "^startup_stream_interface_(warp|hardware)$" -V`, after building
+`startup_stream_consumer`. The vertex shader exports a constant COLOR as parameter 0 and a varying TEXCOORD as
+parameter 1. The pixel shader reads only TEXCOORD, as attribute 0. On an 8×4 target, red follows TEXCOORD column by
+column. The same pipeline translated with pairing by number reads COLOR and fails the check.
 
 ## Output window and fallback diagnostics
 
@@ -395,7 +467,7 @@ Then:
 
 ```powershell
 .\tools\startup\run.ps1 -Exe <folder>\<title>.exe -DataDir <package root> -LogDir out\startup\run1 `
-    -Seconds 180 -Render -FakeUser -GpuMirror -ContinueAsserts 1000 -InputScript "4@70"
+    -Seconds 180 -Render -Translate -FakeUser -GpuMirror -ContinueAsserts 1000 -InputScript "4@70"
 ```
 
 `run.ps1` copies the stand-ins next to the executable and starts `tools/startup/debug_launch.py`.
@@ -411,9 +483,13 @@ close, next frame, frame buffers, pause, skip) are armed only with `--trace-call
 (`run.ps1 -TraceCalls`), because every hooked call stops the whole process under the debugger.
 Without it those calls are not written to `files.txt`, and the movie-player report at the end of
 `<log>.out` (call counts, movie header, frame buffers and the luma-plane PNG) is absent; with it both
-are as before. The summary states `call tracing: on` or `off`. `startup_debug` checks that a
-source-built DLL loaded under the movie-player module name is not hooked by default and that each of
-its 7 export calls is counted with `--trace-calls 1`.
+are as before. The call hooks are armed together with the file hooks, so with file tracing off
+(`--offline 0` without `--trace-files 1`) `--trace-calls 1` arms nothing. The summary states
+`call tracing: on`, `off`, or, in that case, that `--trace-calls 1` needs file tracing. The hooked
+exports are `RUNTIME_CALL_HOOKS` and `MOVIE_CALL_HOOKS` in `debug_launch.py`. `startup_debug` checks
+that its fixture's module and export are in that list, that a source-built DLL loaded under the
+movie-player module name is not hooked by default, that each of its 7 export calls is counted with
+`--trace-calls 1`, and that `--trace-calls 1` with file tracing off counts nothing and says why.
 
 A process that Windows creates under a debugger normally gets the debug heap: the loader sets the
 heap tail-check, free-check and parameter-validation flags and the low-fragmentation heap is not
@@ -447,6 +523,36 @@ It writes:
 | `<log>/events.txt` | module loads and every exception with its time |
 | `<log>/stderr.txt` | the stand-ins' logs (`x2w-d3d12`, `x2w-dstorage`, `x2w-xmem`, `x2w-runtime`, ...) |
 | `<log>/files.txt` | every file the process opened |
+| `<log>/translate.txt` | with `-Translate`: one line per shader request translated during the run |
+
+### Translating shaders during a run
+
+With `-Render -Translate`, `run.ps1` starts `tools/startup/gfx2hlsl.py --watch <shader cache>` beside
+the debugger and stops it, with its worker processes, when the debugger returns (`-Translate`
+without `-Render` is ignored with a warning). The watcher repeats the `--pending` scan every
+2 seconds (`--watch <dir> <seconds>` sets another interval), so a pipeline the title creates during
+the run is translated within seconds, and the runtime picks it up on a later draw instead of on the
+next run. The cache persists: a later run reads every published `<key>.txt` and translates only new
+requests. The watcher's first pass retries every earlier failure once, so a translator update reaches
+requests that failed in an earlier run; after that, a request whose `<key>.fail` is newer than its
+ready marker is not retried during the run (the runtime writes each request once and never rewrites
+it). The one-shot `--pending` scan retries every failure. An unexpected translator error is written
+to `<key>.fail` as `translator error: ...` instead of stopping the scan. A worker killed from outside
+(for example out of memory) ends that watcher pass only; its requests are retried on the next pass.
+FXC is located as described for `X2W_SHADER_CACHE` under [Switches](#switches). A scan with more than
+one pending request translates them in parallel processes, one per logical processor (at most 61 on
+Windows, the `ProcessPoolExecutor` limit) unless `X2W_TRANSLATE_JOBS` sets the count; each request
+writes only its own files. On a 16-thread host,
+3,513 requests (132 translated, 3,381 refused) took 56.9 s with one process and 7.8 s in parallel,
+with byte-identical results.
+
+Check with `python3 -B tests/startup_gfx2hlsl_watch_check.py` (ctest `startup_gfx2hlsl_watch`): a
+request without its ready marker is not consumed, the watcher retries an earlier failure once and
+then leaves failures alone, it translates a request written while it runs, four parallel workers
+print the same results and write the same failures as one, an unexpected translator error becomes
+`<key>.fail`, and an invalid `X2W_TRANSLATE_JOBS` falls back to the processor count.
+`startup_run_ps1` checks that `-Translate` starts the watcher on the cache and stops it together
+with a child process.
 
 `run.ps1` prints the first five lines of `<log>.out` and exits with the debugger's exit code: 2 when
 the process could not be created, 0 when the debugger finished its report, whatever the process
@@ -739,7 +845,8 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
-| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running. Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
+| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
+| `X2W_D3D12_QUERY_SLOTS=1` | diagnostic, in render mode: binds command-list slots 28 to 30 to the hypothesised occlusion query methods (see [Occlusion queries](#occlusion-queries)). Unset, the three slots stay no-ops |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
 | `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
@@ -995,8 +1102,33 @@ can then hold some blobs of the new generation and some of the old one, with `.x
 The slot numbers and argument layouts follow the public header order and stay a hypothesis.
 Persisted: create container (16), delete container (10, 11), create and close update (23, 24), blob
 write and delete staged in an update (25, 26) and published by submit (27, 28 with its result in 29).
-Asynchronous read (21, with its result in 22) returns committed blobs. Slot 20 still reports no blob.
-The enumerations and queries (12 to 15, 18, 19) still report nothing.
+Asynchronous read (21, with its result in 22) returns committed blobs.
+
+For provider `704c3f58-e629-4cc2-b197-30511b996fe2` and interface `1bfff3af-f14a-40a3-8e35-9ada906593f9`,
+container lookup (13), container enumeration (14), blob enumeration (18) and blob enumeration by
+name prefix (19) call back with what the store holds. Each container's blob count and size come from
+one listing under its shared publication lock, and no store lock is held while a callback runs. A
+container created through slot 16 but never submitted exists and is reported with 0 blobs. Names
+match case-insensitively, as the store's directories and files do. The display name is the
+container name. Synchronous read (20) reads the requested blobs under one shared lock (`read_blobs`);
+for a count of 0 it lists and reads every blob under one lock and checks the needed size against the
+capacity before it reads any payload. The capacity is checked against that one snapshot, and only
+then is the layout of `save_blob_pack.h` (records, then names, NUL terminators and payloads) written
+into the caller's buffer. The count is in records, the capacity in bytes. A closed container handle
+is refused (E_INVALIDARG). A lookup of a name with no container directory keeps the stand-in's
+empty result (S_OK, zero callbacks). Slots 12 and 15 still report nothing, and other interface identities keep
+the empty results.
+[PC GDK thunk mapping](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L261-L270) ·
+[enumeration and sizing sample](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesaveenumerateblobinfo) ·
+[synchronous read contract](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xgamesave/functions/xgamesavereadblobdata)
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_read(_after_async_submit)?$'` runs two source-built processes
+through the provider vtable: a writer commits two blobs under a generated name (through slot 27, or
+through slots 28 and 29 on a Windows gaming runtime queue in `startup_gamesave_read_after_async_submit`,
+which returns 77 when that runtime is absent), and a restarted reader discovers the container, lists
+the blobs (all, and by a prefix given in another case) and reads them. It also checks early enumeration stop, an unknown interface identity, a
+short buffer (also for a count of 0) and a missing blob, both leaving the destination untouched, a
+lookup of an absent name that does not call back, a slot 18 callback that runs with no store lock
+held, and slots 18, 19 and 20 refusing a closed container handle.
 `ctest --preset dev --no-tests=error -R '^startup_gamesave_persist$' -V` checks the storage code the
 slots call, not the slots: it writes in one process and reads in a second, including a close without
 submit, a failing second action, a second process that sees only committed state, and a redirected
@@ -1009,6 +1141,16 @@ existing failing-second-action control checks that the previous generation stays
 holder that ends without unlocking checks the bounded wait and the recovery. The `_unlocked` test runs
 the same checks on a generated copy of the headers whose lock does nothing and must be caught (a reader
 sees a mixed or incomplete generation). The pause points and that copy exist only in the test build.
+`ctest --preset dev --no-tests=error -R '^startup_gamesave_read_publish_'` runs the synchronous read
+(slot 20, by name and for every blob) through the provider vtable against the same paused writer.
+During the pause the read waits for the store's lock timeout and fails with its destination
+untouched. A read still waiting when the writer goes on returns the whole new generation. Racing
+cases stop the reader instead, through a hook the generated copy adds to `read_blobs` and
+`list_blobs` (null unless the test sets it; production builds keep only the anchor comments):
+between two blob reads of slot 20, and at a second store read inside one slot 20 or slot 14 call,
+another process commits a whole new generation (a third blob for slot 14). The reader must return
+the old generation whole: a reader that locks per blob or lists twice mixes the two. The `_unlocked`
+copy must be caught with a mixed or incomplete generation.
 
 Slot 28 first asks the Windows gaming runtime to accept the caller's async block. On rejection it returns before taking staged actions. Once accepted it commits the files and calls `XAsyncComplete` with the status for that block. Slot 29 retrieves the status with the matching operation identity. File publication is synchronous within slot 28. The caller's completion routine can run inline or through its selected completion queue. [XAsyncBegin](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasyncbegin) · [XAsyncComplete](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/xasyncprovider/functions/xasynccomplete) · [PC GDK async interface slots](https://github.com/ivall/xcl/blob/64b3f35599bb7102f55d640e1a791e7d6dd3b175/crates/xcl/src/hle/xgameruntime/gdk_table.rs#L57-L64)
 
@@ -1418,6 +1560,18 @@ These are measured on one executable; treat them as hypotheses for others.
   reason of each refusal. Its `_dest_alpha_control` run, which expects a destination alpha factor
   in its colour form, is the negative control
   (`ctest --preset dev --no-tests=error -R "^startup_cb_blend_decode" -V`).
+- Depth-stencil registers are decoded but not applied yet (#1999, item A). State block A of a
+  slot 57 pipeline holds `DB_DEPTH_CONTROL` at +0xB8, `DB_STENCIL_CONTROL` at +0xBC and
+  `DB_STENCILREFMASK` / `_BF` at +0xC0 / +0xC4, measured locally. Other pipeline layouts are not
+  covered. `src/startup_stubs/pipeline_state_decode.h`
+  reads the four words and decodes them into a `D3D12_DEPTH_STENCIL_DESC` and a stencil reference
+  with the field layouts of Mesa's `src/amd/registers/gfx10.json`. It refuses stencil ops D3D12
+  can't express (`ONES`, `REPLACE_OP`, the logic ops, add or subtract by other than one) and colour
+  writes tied to the depth result. It flags, without applying, `DEPTH_BOUNDS_ENABLE` and back-face
+  masks or references that differ from the front. A device-free check decodes hand-built words for
+  each compare function and each stencil op with a D3D12 form, the refusals and a synthetic block.
+  Its `_offset_control` run (words one word later) is the negative control
+  (`ctest --preset dev --no-tests=error -R "^startup_pipeline_state" -V`).
 - Audio produces no output from the console audio path. A separate desktop render sink exists
   (see "Audio output"); nothing connects the console path to it yet.
 
