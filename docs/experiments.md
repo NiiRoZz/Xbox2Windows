@@ -14058,8 +14058,8 @@ write in it, `W & exec` and `exec & W` (`s_and`) give that lane 0, and `~(W & ex
 `W | ~exec` (`s_orn2` with exec second) give it 1, whatever the block left in W. The search follows every path
 from the join until W is written again. Any other read keeps the refusal: a copy, a data read, a branch on
 `vccz`, an absorbed form after an exec write or a branch target, or one at a join that a loop re-enters. The
-reason names the first such read the search meets. `m0` and SCC have implicit readers and are not accepted this way.
-Case N runs a compare in a block whose join computes `s_and_b32 s23, vcc_lo, exec_lo` before it restores
+reason names the first such read the search meets. `m0` and SCC have implicit readers and are not accepted
+this way. Case N runs a compare in a block whose join computes `s_and_b32 s23, vcc_lo, exec_lo` before it restores
 exec; its control `n-unmasked` drops the AND, so the two lanes that skip the block store with a stale `vcc`.
 `s_nand` on a lane mask is still refused by the lane-mask lowering itself.
 
@@ -14091,10 +14091,10 @@ be the lane select of `v_cndmask`, the carry-in of `v_addc`, `v_subb`, `v_add_co
 as a data operand see the other lanes' bits, which the one-lane model does not have, and keep the refusal.
 
 The block is still refused in these cases:
-- a definition that is live at the join, unless the absorbed-read or narrowed-mask rule proves its reads or it
-  is the lane mask above (or one of its conditions fails: zeroing with a value other than 0 or missing, a branch
-  or a branch target between the zeroing and the branch, a write of M that is not from exec, a `vcc_hi` or 64-bit
-  write, a whole-mask read after the join);
+- a definition that is live at the join, unless the absorbed-read or narrowed-mask rule proves every read of it
+  or it is the lane mask above; a lane mask with a failed condition stays refused (zeroing with a value other
+  than 0 or missing, a branch or a branch target between the zeroing and the branch, a write of M that is not
+  from exec, a `vcc_hi` or 64-bit write, a whole-mask read after the join);
 - any other exec write: exec set from a compare alone, restored from a mask saved before the block or on only
   some of the paths, written by a form the pass does not follow (`s_orn2`, `s_nand`, `s_nor`, `s_xnor`, `s_not`,
   the other saveexec and wrexec forms), written in a block that a branch from outside enters (a proven
