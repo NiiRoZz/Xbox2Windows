@@ -198,6 +198,12 @@ class Wave:
             if self.vcc is None:
                 raise ValueError("Undefined wave predicate")
             return self.vcc
+        if t == "src_scc":
+            if self.scc is None:
+                raise ValueError("Undefined scalar predicate in src_scc")
+            if isinstance(self.scc, Dyn):
+                raise ValueError("Dynamic scalar predicate in src_scc")
+            return int(self.scc)
         if re.fullmatch(r"-?\d+\.\d+", t):
             return struct.unpack("<I", struct.pack("<f", float(t)))[0]
         return int(t, 0)
@@ -379,6 +385,20 @@ class Wave:
             "s_buffer_load_dwordx16",
         ):
             self.load(op, args)
+            return
+        if op in ("s_bitcmp0_b32", "s_bitcmp1_b32", "s_bitcmp0_b64", "s_bitcmp1_b64"):
+            if len(args) != 2:
+                raise ValueError(f"Expected two operands for {op}")
+            a, b = (self.scalar(t, True) for t in args)
+            if a is UNDEF or b is UNDEF:
+                self.scc = None
+                return
+            if type(a) is not int or type(b) is not int:
+                raise ValueError("Dynamic scalar predicate")
+            mask = 63 if op.endswith("_b64") else 31
+            width = WAVE if op.endswith("_b64") else U32
+            bit = ((a & width) >> (b & mask)) & 1
+            self.scc = bit == (1 if op.startswith("s_bitcmp1_") else 0)
             return
         if op.startswith("s_cmp_"):
             a, b = (self.scalar(t, True) for t in args)
@@ -760,6 +780,10 @@ class Wave:
             if op == "s_endpgm":
                 return True
             if op in ("s_inst_prefetch", "s_nop"):
+                continue
+            if op == "s_clause":
+                if not re.fullmatch(r"0x[0-9a-fA-F]+|0|[1-9]\d*", tail) or not 0 <= int(tail, 0) <= 0x3F:
+                    raise ValueError(f"Invalid s_clause operand: {tail}")
                 continue
             if op == "s_barrier":
                 if self.ds_writes_pending:
