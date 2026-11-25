@@ -10,7 +10,9 @@
 // syncs content).
 
 struct ComputeTranslation {
-    struct Slot { int a, b; bool texture; };  // root parameter and byte offset (views), or parameter and word (entry values)
+    // Root parameter and byte offset (views), or parameter and word (entry values). A heap view names the root
+    // constant (parameter and word) that indexes its 32-byte record in the list's view heap.
+    struct Slot { int a, b; bool texture, heap; };
     u64 key = 0;
     int state = 0;                    // 0 not loaded, 1 ready, 2 unavailable
     ULONGLONG retry_manifest_at = 0;  // only an absent manifest can become ready later
@@ -78,6 +80,9 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uds.push_back({a, b});
         else if (std::sscanf(line.c_str(), "srv %u buf table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b});
+        else if (std::sscanf(line.c_str(), "srv %u buf heap rootconst %d %d%n", &i, &a, &b, &used) == 3 && whole() &&
+                 i == tr.srvs.size())
+            tr.srvs.push_back({a, b, false, true});
         else if (std::sscanf(line.c_str(), "uav %u table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.uavs.size())
             tr.uavs.push_back({a, b});
         else if (std::sscanf(line.c_str(), "uav %u tex2d float table %d %d channels 4%n", &i, &a, &b, &used) == 3 && whole() &&
@@ -157,11 +162,15 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
         const ComputeTranslation::Slot slot = output ? tr->uavs[i - inputs] : tr->srvs[i];
-        const u64 entry = slot.a >= 0 && slot.b >= 0 ? pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16) : 0;
+        // A heap record sits at the 32-bit byte offset the program computes, the root constant word shifted left by
+        // 5, in the title memory of the list's view heap: a literal byte offset, as a table's is.
+        const u64 entry = slot.a < 0 || slot.b < 0 ? 0
+            : slot.heap ? pass.title_view_heap.record(std::uint32_t{pass.compute_constants.word(slot.a, slot.b)} << 5, 16)
+            : pass.compute_tables.table(slot.a).record(static_cast<u64>(slot.b), slot.texture ? 32 : 16);
         std::memset(words, 0, sizeof(words));
         const std::size_t entry_bytes = slot.texture ? 32 : 16;
         if (!entry || !x2w_local::readable(reinterpret_cast<const void*>(entry), entry_bytes)) {
-            reason = "a table descriptor is not bound";
+            reason = slot.heap ? "a heap record is outside the list's view heap" : "a table descriptor is not bound";
             break;
         }
         std::memcpy(words, reinterpret_cast<const void*>(entry), entry_bytes);

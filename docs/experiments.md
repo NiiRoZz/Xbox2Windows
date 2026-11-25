@@ -14814,6 +14814,22 @@ cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
 ```
 
+### An input named by a resource heap record
+
+A compute root signature that indexes the resource heap directly (root flag 0x400) passes the heap pointer in one SGPR after the root parameters. `gfx2hlsl.py` lowers one form of a load through that pointer: `s_lshl_b32 R, <root constant word>, 5`, then, with no write of `R` and no branch target in between, `s_load_dwordx4 D, s[H:H+1], R` with a constant zero in `s[H+1]` and no `offset:` modifier. `D` is then a buffer descriptor, and the manifest names it `srv <i> buf heap rootconst <parameter> <word>`. Slot 32 now records the title memory of the list's view heap on every call; at Dispatch the stand-in reads the 16-byte descriptor at byte `word << 5` (32-bit arithmetic, as the program computes it) of that memory and binds the buffer through the path a `table` record takes. A record outside the heap refuses the dispatch (`a heap record is outside the list's view heap`) and binds nothing.
+
+Every other form keeps a refusal that names it: another shift or index, an index register written again, a branch target between the shift and the load, a high word that is not a constant zero, an `offset:` modifier, eight dwords (an image record), and an index read from a buffer (`s_load of a resource heap record whose index is read from a buffer`). A formatted load or a store through such a record, and the graphics stages, are refused as before.
+
+`tests/startup_gfx2hlsl_heap_record_check.py` compares the manifest and the HLSL of a source-built gfx1013 program whole, runs 19 refused controls and one translator mutation (without the write tracking, a refused control translates), and with `--llvm-mc` reassembles every instruction. `tests/startup_compute_dispatch_heap_check.py` dispatches that program through the stand-in's list on WARP and on a physical adapter (exit 77 without one): the input descriptor is only in heap record 2, records 0 and 1 hold the output's descriptor, and all 320 output words must match; before translation and for a record outside the heap every word keeps its sentinel. Changing the runtime's shift to 4, or ignoring the index, makes the dispatch test fail (`an output buffer is also an input`).
+
+Measured on one synthetic program. The offset is a literal byte offset into the title's heap memory, as a table offset is; a heap whose descriptor increment on the desktop adapter is not 32 bytes is not checked against a caller that addresses records by that increment. In a local set of 184 compute programs with a register-offset load through the heap pointer, every such load lowers in 4 programs and none of the 184 translates yet: 151 hold a load whose index is read from a buffer, and the 4 stop at other instructions.
+
+```powershell
+python -B tests/startup_gfx2hlsl_heap_record_check.py --llvm-mc llvm-mc-15
+cmake --build --preset dev --target startup_stream_consumer
+ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_heap_" -V
+```
+
 ## Startup translator: a short operand list is refused, never a translator crash
 
 The batch translator records any non-`Unsupported` exception from a handler as

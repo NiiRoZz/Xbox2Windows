@@ -162,8 +162,8 @@ static void* desktop_pipeline(void* device)
 //   data-pointer     valid, with the first data qword pointing at state block A
 //   code-zero, data-zero, no-root, code-unreadable, code-past-end, data-unreadable, state-unreadable,
 //   stateb-unreadable, desc-unreadable
-//   dispatch, dispatch-swapped, dispatch-none, dispatch-sampled, dispatch-sampled-unbound: one creation, then
-//   dispatch_slot67 below
+//   dispatch, dispatch-swapped, dispatch-none, dispatch-sampled, dispatch-sampled-unbound, dispatch-heap,
+//   dispatch-heap-outside: one creation, then dispatch_slot67 below
 //   texture-store, texture-store-none, texture-store-denied: one creation, then texture_slot67 below
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
 static void* slot67_pipeline;
@@ -190,6 +190,10 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // dispatch-sampled adds what the sampling variant of the case reads: a committed 1x1 RGBA8 texture filled by
 // CopyTextureRegion (list slot 16) and a shader resource view of it (device slot 18) whose token the stand-in
 // writes at table byte 64. dispatch-sampled-unbound creates no view, so that entry holds no token.
+// dispatch-heap runs the program of startup_gfx2hlsl_heap_record_check.py: a third root constant, 2, indexes the
+// 32-byte heap record that holds the input descriptor (heap byte 64). Heap bytes 0 and 32 hold the output's
+// descriptor, so an index that is ignored or scaled by 16 names a buffer the dispatch refuses as an input.
+// dispatch-heap-outside sets the constant to 0x07ffffff, whose record is past any heap.
 static int dispatch_slot67(void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
@@ -227,7 +231,11 @@ static int dispatch_slot67(void* device, const std::string& mode)
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
     std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
-    const UINT constants[2] = {0x01234567, 0x9e3779b9};
+    const bool heap_record = mode.rfind("dispatch-heap", 0) == 0;
+    if (heap_record)
+        for (const UINT at : {0u, 32u, 64u})
+            std::memcpy(reinterpret_cast<void*>(cpu + at), descriptors[at != 64], sizeof(descriptors[0]));
+    const UINT constants[3] = {0x01234567, 0x9e3779b9, mode == "dispatch-heap-outside" ? 0x07ffffffu : 2u};
     if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
     invoke(list, 32, 1, word(&heap));
     if (mode.rfind("dispatch-sampled", 0) == 0) {
@@ -251,7 +259,7 @@ static int dispatch_slot67(void* device, const std::string& mode)
     }
     invoke(list, 25, word(slot67_pipeline));
     invoke(list, 33, word(slot67_root));
-    invoke(list, 39, 0, 2, word(constants), 0);
+    invoke(list, 39, 0, heap_record ? 3 : 2, word(constants), 0);
     invoke(list, 35, 1, gpu);
     if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;

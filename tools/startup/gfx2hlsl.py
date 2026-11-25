@@ -1693,6 +1693,8 @@ class Stage:
             }
             self.descriptor_block_first = 0
             self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
+            self.heap_index = {}      # SGPR -> what its word is for a resource-heap s_load (see heap_record)
+            self.heap_index_was = {}  # the marks the current instruction's destinations held before it
             self.since_join = None    # SGPRs proven uniform since the last branch target (None: none reached)
             self.defined_uniform_s = set(init_entry_uniform)
             self.bad_sgprs = set()
@@ -1721,6 +1723,7 @@ class Stage:
                 # branch-free program is past it too (dead code).
                 self.past_entry = bool(self.blocks) or 0 in targets
                 if off in targets:
+                    self.heap_index.clear()  # another path into the join may hold a different word
                     pre_uniform = {
                         r for r in (self.defined_uniform_s if self.since_join is None else self.since_join)
                         if r not in self.varying_s and r not in self.masks
@@ -1950,6 +1953,11 @@ class Stage:
                 if sources and all(self.uniform_source(tok) for tok in sources):
                     dst = candidate[1]
         self.last_v = None
+        if hasattr(self, 'heap_index'):  # unit probes build a Stage without the tracking state
+            # Any write ends a register's mark; the lowering below sets the new one, if any.
+            wrote = scalar_destinations(name, asm)
+            wrote = set(self.heap_index) if 'any' in wrote else wrote & set(self.heap_index)
+            self.heap_index_was = {r: self.heap_index.pop(r) for r in wrote}
         term = self.lower(base, asm, ops, mods)
         uniform_written = self._uniform_written
         if self.tracks_uniformity() and getattr(self, 'since_join', None) is not None and wrote_s:
@@ -2543,6 +2551,15 @@ class Stage:
             high_uniform = (self.tracks_uniformity() and high != d and
                             self.uniform_source(high_source))
         self.set_s(d, expr, scc=scc)
+        if (base == 's_lshl_b32' and hasattr(self, 'heap_index') and re.fullmatch(r'0x[0-9a-f]+|[0-9]+', srcs[1])
+                and int(srcs[1], 0) == 5):
+            # index << 5 is the byte offset of a 32-byte resource-heap record. The index is named only when it is a
+            # root constant word (the dispatch knows it) or a word an s_buffer_load wrote (refused by name).
+            r = reg_range(srcs[0])
+            if syms[0] and syms[0][0] == 'ud' and self.pipe.uds[syms[0][1]][0] == 'rootconst':
+                self.heap_index[d] = self.pipe.uds[syms[0][1]]
+            elif r and r[0] == 's' and {**self.heap_index, **self.heap_index_was}.get(r[1]) == ('bufword',):
+                self.heap_index[d] = ('buffer',)
         if is_mask:
             self.masks.add(d)
         if pair and base != 's_mov_b64':
@@ -2794,7 +2811,30 @@ class Stage:
                 self.sym[dst[1] + i] = ('const', 0, 'unassigned')
             self.pipe.notes.add('dynamic sampler index replaced by a default sampler')
             return
+        if p[1] == ('resheap',) and self.kind == 'cs':
+            return self.heap_record(dst, base, token, imm, count)
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
+
+    def heap_record(self, dst, base, token, imm, count):
+        """s_load_dwordx4 D, <resource heap pointer>, R in a compute program, where R is a root constant word
+        shifted left by 5 with no later write of R and no branch target in between: D is the buffer descriptor in
+        the 32-byte heap record that the root constant indexes. The manifest names the root constant; the dispatch
+        reads the record. Only this exact form is modelled."""
+        what = 's_load of a resource heap record'
+        r = reg_range(token)
+        index = getattr(self, 'heap_index', {}).get(r[1]) if r and r[0] == 's' and r[1] == r[2] else None
+        if index == ('buffer',):
+            raise Unsupported('%s whose index is read from a buffer' % what)
+        if not index or index[0] != 'rootconst':
+            raise Unsupported('%s whose offset is not a root constant shifted left by 5 since the last branch target' % what)
+        if count != 4:
+            raise Unsupported('%s of %d dwords' % (what, count))
+        if imm is not None:
+            raise Unsupported('%s with offset:%#x' % (what, imm))
+        if self.sym.get(base[2]) != ('const', 0):
+            raise Unsupported('%s through a pointer whose high word is not a constant zero' % what)
+        for i in range(count):
+            self.sym[dst[1] + i] = ('desc', ('resheap',) + index[1:], 0, i)
 
     def op_s_bfm_b32(self, ops, mods):
         """Fold constant bitfield masks: titles build inline sampler words with them."""
@@ -2956,6 +2996,8 @@ class Stage:
             self.set_s(dst[1] + i, '%s.Load(%s + %d)' % (buf, offset, extra + 4 * i), uniform=uniform)
             if is_lit:
                 self.sym[dst[1] + i] = ('fixed_buffer_word',)
+            if hasattr(self, 'heap_index'):
+                self.heap_index[dst[1] + i] = ('bufword',)
 
     def op_s_buffer_load_dwordx2(self, ops, mods):
         self.op_s_buffer_load_dword(ops, mods, 2)
@@ -5473,10 +5515,14 @@ class ComputePipeline(Pipeline):
                 where = 'table %d %d' % (source[1], off or 0)
             elif source[0] == 'root':
                 where = 'root %d' % source[1]
+            elif source[0] == 'resheap' and len(source) == 3 and r['kind'] == 'buf':
+                where = 'heap rootconst %d %d' % source[1:]  # the 32-byte heap record that root constant word indexes
             else:
                 raise Unsupported('resource through %s' % (source,))
             lines.append('srv %d %s %s' % (r['index'], r['kind'], where))
         for (source, off), r in self.uavs.items():
+            if source[0] != 'table':
+                raise Unsupported('store through %s' % (source,))
             where = 'table %d %d' % (source[1], off)
             if r['kind'] == 'raw':
                 lines.append('uav %d %s' % (r['index'], where))

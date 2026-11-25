@@ -2336,10 +2336,12 @@ const char* draw_translated_indirect(Wrapper* self, ID3D12CommandSignature* sign
 }
 
 // List slot 32, SetDescriptorHeaps. Track the title's shader-visible sampler
-// source while translated draws use their own physical descriptor heaps.
+// source while translated draws use their own physical descriptor heaps, and the
+// title memory of the view heap for a program that indexes the heap itself.
 void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const* heaps)
 {
     x2w_startup::SamplerSource source;
+    x2w_startup::ViewTable heap_records;
     u64 view_heap = 0;
     if (count && count <= 4 && x2w_local::readable(heaps, std::size_t{count} * sizeof(*heaps))) {
         AcquireSRWLockShared(&note_lock);
@@ -2349,6 +2351,10 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
                     heap.logical_count > heap.count)
                     view_heap = heap.wrapper;
+                if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
+                    heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
+                    heap_records = x2w_startup::resolve_view_table(heap.desktop_gpu, heap.title_cpu, heap.logical_count,
+                                                                   heap.increment, heap.desktop_gpu);
                 if (heap.wrapper == reinterpret_cast<u64>(heaps[i]) &&
                     heap.type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && heap.desktop_gpu)
                     source = {static_cast<std::uintptr_t>(heap.title_sampler_cpu), heap.count};
@@ -2364,6 +2370,7 @@ void __stdcall list_set_descriptor_heaps(Wrapper* self, UINT count, void* const*
     }
     pass.source_view_heap = view_heap;
     pass.title_samplers = source;
+    pass.title_view_heap = heap_records;
 }
 
 // The table at a title GPU handle, looked up in the title's view heap (the one set by slot 32 when known).
