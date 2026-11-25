@@ -14716,3 +14716,14 @@ that names one value (a pointer only if no add touched it), is read at run time 
 read before its next write when a path brings a symbol with no run-time value or no definition at all. `startup_gfx2hlsl_join_symbols_check.py` pins the cases; the
 `join_symbols_folded_*` tests run the old OUTSIDE statement and must give 3, not 11. Controls are pure Python plus
 a pixel dispatch on WARP and hardware; `binary` reassembles the fixture words with LLVM 15.
+
+## Startup list Dispatch
+
+Command-list slot 14 (`Dispatch`) is recorded on the desktop list only when the list is open and direct or compute, a desktop compute pipeline and a desktop compute root signature are bound, the compute root declares no static samplers and only root SRV parameters (slot 43), the compute pipeline was built against that same root signature, every root SRV the root declares was set since the root was bound (a rejected or unaligned replacement clears its binding), and every group count is at most 65535. Zero groups on an axis is forwarded and runs nothing. A root with other parameters is refused with `compute root arguments are not forwarded`, a pipeline from another root with `compute pipeline was built against another root signature`, an unset or rejected root SRV with `a compute root SRV is not bound`, because the compute root-argument slots (35, 37, 39, 41, 43, 45) have no handler yet and the dispatch would run with them unset. Other refusals are logged as `x2w-render Dispatch(x, y, z) refused: <reason>`.
+
+Only the decision is checked: `tests/startup_list_dispatch_check.cpp` runs without a device and its five mutated runs must fail. Executing a dispatch on a GPU, with real results read back, is not verified yet.
+
+```powershell
+cmake --build --preset dev --target startup_list_dispatch_check
+ctest --preset dev --no-tests=error -R "^startup_list_dispatch" -V
+```
