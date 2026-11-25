@@ -108,8 +108,7 @@ def main(consumer, dxc, adapter):
             got, result = dispatch(directory, consumer, env, mode)
             assert got == untouched, f'{mode}: a refused Dispatch wrote the output'
             refused = lines(result, 'refused: ')
-            assert len(refused) == 1 and refused[0].endswith('refused: ' + reason), f'{mode}: {refused}
-{result.stderr[-3000:]}'
+            assert len(refused) == 1 and refused[0].endswith('refused: ' + reason), f'{mode}: {refused}\n{result.stderr[-3000:]}'
         print(f'startup_compute_dispatch: PASS on {adapter} (all {C.WORDS} words match after translation and with the '
               'same root set again; untouched before translation, without a Dispatch and for 6 refusals)')
 
