@@ -1256,6 +1256,7 @@ endforeach()
 
 add_executable(startup_indirect_draw_indexed tests/startup_indirect_draw_indexed.cpp tests/desktop_gpu.cpp)
 target_compile_features(startup_indirect_draw_indexed PRIVATE cxx_std_17)
+target_include_directories(startup_indirect_draw_indexed PRIVATE src)
 target_link_libraries(startup_indirect_draw_indexed PRIVATE d3d12_xs_shim d3d12 dxgi d3dcompiler)
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_draw_indexed_${backend} COMMAND startup_indirect_draw_indexed ${backend})
@@ -1277,7 +1278,9 @@ foreach(backend IN ITEMS warp hardware)
         COMMAND startup_indirect_draw_indexed ${backend} mesh-xmem-arguments-skip-wait)
     set_tests_properties(startup_indirect_mesh_xmem_arguments_${backend} startup_indirect_mesh_xmem_arguments_skip_wait_${backend}
         PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77 ENVIRONMENT "X2W_MESH86_FIXTURE_XMEM=$<TARGET_FILE:xmem_shim>")
-    set_tests_properties(startup_indirect_draw_indexed_${backend} startup_indirect_draw_${backend} PROPERTIES TIMEOUT 30)
+    add_test(NAME startup_indirect_rectlist_${backend} COMMAND startup_indirect_draw_indexed ${backend} rect)
+    set_tests_properties(startup_indirect_draw_indexed_${backend} startup_indirect_draw_${backend}
+        startup_indirect_rectlist_${backend} PROPERTIES TIMEOUT 30)
     set_tests_properties(startup_indirect_mesh_${backend} startup_indirect_mesh_console_${backend}
         startup_indirect_mesh_amplified_${backend} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_translated_draw_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
@@ -1289,7 +1292,8 @@ foreach(backend IN ITEMS warp hardware)
     set_tests_properties(startup_indirect_translated_indexed_alias_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
     set_tests_properties(startup_indirect_translated_indexed_alias_off_${backend} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77)
 endforeach()
-set_tests_properties(startup_indirect_draw_indexed_hardware startup_indirect_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(startup_indirect_draw_indexed_hardware startup_indirect_draw_hardware
+    startup_indirect_rectlist_hardware PROPERTIES SKIP_RETURN_CODE 77)
 foreach(backend IN ITEMS warp hardware)
     add_test(NAME startup_indirect_mesh_request_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
     add_test(NAME startup_indirect_mesh_create_result_${backend} COMMAND startup_indirect_draw_indexed ${backend} mesh)
@@ -2753,6 +2757,8 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_readfirstlane_check.py")
     add_test(NAME startup_compute_gather_l COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_gather_l_check.py")
+    add_test(NAME startup_compute_buffer_atomics COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_buffer_atomics_check.py")
     add_test(NAME startup_image_sample_c COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_image_sample_c_check.py")
     add_test(NAME startup_image_gather_c_lz COMMAND "${INTAKE_PYTHON}" -B
@@ -2912,6 +2918,12 @@ if(EXISTS "${INTAKE_PYTHON}")
     # Startup shader translator: image_get_lod on a 2D texture (CalculateLevelOfDetail / Unclamped).
     add_test(NAME startup_gfx2hlsl_image_get_lod_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_image_get_lod_check.py")
+    foreach(adapter IN ITEMS warp hardware)
+        add_test(NAME startup_image_get_lod_view_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_image_get_lod_view_check.py" "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_image_get_lod_view_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+    endforeach()
     # Startup shader translator: v_add/sub/subrev_co_u32 against ISA references.
     add_test(NAME startup_gfx2hlsl_add_sub_co_controls COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_add_sub_co_check.py")
@@ -3176,8 +3188,8 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_check.py" control mbcnt "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(startup_gfx2hlsl_compute_mbcnt_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
-        foreach(control IN ITEMS swapped-axes dropped-store b-offset c-unpredicated f-peer f-broadcast g-scalar-dropped
-                h-inner-unpredicated k-block-entered)
+        foreach(control IN ITEMS swapped-axes dropped-store b-offset c-unpredicated f-peer f-broadcast g-swapped-offsets g-overlap
+                j-scalar-dropped h-inner-unpredicated k-block-entered)
             add_test(NAME startup_gfx2hlsl_compute_${control}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
                 "${CMAKE_SOURCE_DIR}/tests/startup_gfx2hlsl_compute_check.py" control ${control} "${DXC_EXECUTABLE}"
                 "$<TARGET_FILE:offscreen_check>" ${adapter})
@@ -4785,6 +4797,26 @@ if(EXISTS "${INTAKE_PYTHON}")
         "$<TARGET_FILE:cpu_sse_fp_pd_original_lifted>"
         "$<TARGET_FILE:cpu_sse_fp_pd_altered_lifted>"
         "$<TARGET_FILE:cpu_sse_fp_harness>")
+    # cpu_sse_fp_pd_logic_checks
+    set(cpu_sse_fp_pd_logic_exports
+        "op_andpd,op_andpd_mem,op_andpd_mem_disp,op_andpd_self,"
+        "op_andnpd,op_andnpd_mem,op_andnpd_mem_disp,op_andnpd_self,"
+        "op_orpd,op_orpd_mem,op_orpd_mem_disp,op_orpd_self,"
+        "op_xorpd,op_xorpd_mem,op_xorpd_mem_disp,op_xorpd_self,"
+        "op_xorpd_zero_logic,op_xorpd_zero_arith,op_pd_logic_pipeline,op_pd_logic_discarded_read")
+    string(CONCAT cpu_sse_fp_pd_logic_exports ${cpu_sse_fp_pd_logic_exports})
+    foreach(variant IN ITEMS original altered)
+        cpu_asm_fixture(cpu_sse_fp_pd_logic_${variant} sse_fp_pd_logic)
+        cpu_translation(cpu_sse_fp_pd_logic_${variant} cpu_sse_fp_aot "${cpu_sse_fp_pd_logic_exports}")
+    endforeach()
+    target_compile_definitions(cpu_sse_fp_pd_logic_altered PRIVATE ALTER_IMM)
+    add_test(NAME cpu_aot_sse_fp_pd_logic COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/cpu/sse_fp_pd_logic_check.py"
+        "$<TARGET_FILE:cpu_sse_fp_pd_logic_original>"
+        "$<TARGET_FILE:cpu_sse_fp_pd_logic_original_lifted>"
+        "$<TARGET_FILE:cpu_sse_fp_pd_logic_altered>"
+        "$<TARGET_FILE:cpu_sse_fp_pd_logic_altered_lifted>"
+        "${CMAKE_CXX_COMPILER}")
     set(cpu_avx_fp_move_exports
         "op_vmovq_xmm_xmm,op_vmovq_xmm_m64,op_vmovq_m64_xmm,op_vmovq_xmm_r64,op_vmovq_r64_xmm,"
         "op_vmaskmovdqu,op_pipeline,op_discarded_read,op_discarded_read64,"
@@ -7781,12 +7813,16 @@ if(EXISTS "${INTAKE_PYTHON}")
         "${CMAKE_SOURCE_DIR}/tests/sgd5_effects_check.py")
     add_test(NAME rdna2_tools_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/rdna2_tools_check.py")
+    add_test(NAME rdna2_cli_checks COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/disasm_rdna2_cli_check.py")
     add_test(NAME pso_readiness_check COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/pso_readiness_check.py")
     add_test(NAME dxcontainer_part_offsets COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/dxcontainer_part_offsets_check.py")
     add_test(NAME depth_mask_aot_cli COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/depth_mask_aot_cli_check.py")
+    add_test(NAME extract_shaders_cli COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_SOURCE_DIR}/tests/extract_shaders_cli_check.py")
     # #369: the built cs_6_0 array-atomics probe keeps nonUniformIndex on its atomic's handle.
     add_test(NAME array_atomics_dxil COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_SOURCE_DIR}/tests/array_atomics_dxil_check.py" "${DXC_EXECUTABLE}"
@@ -8813,6 +8849,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${CMAKE_SOURCE_DIR}/tests/startup_compute_gather_l_check.py" --dispatch "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)
         set_tests_properties(startup_compute_gather_l_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
+        add_test(NAME startup_compute_buffer_atomics_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_SOURCE_DIR}/tests/startup_compute_buffer_atomics_check.py" --dispatch "${DXC_EXECUTABLE}"
+            "$<TARGET_FILE:offscreen_check>" ${adapter})
+        set_tests_properties(startup_compute_buffer_atomics_${adapter} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
         add_test(NAME startup_image_gather_c_lz_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/startup_image_gather_c_lz_check.py" --draw "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter} $<$<BOOL:${STARTUP_FXC}>:${STARTUP_FXC}>)

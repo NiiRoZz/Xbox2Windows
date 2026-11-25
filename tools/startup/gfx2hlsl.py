@@ -901,6 +901,26 @@ def calculated_pc_proof(ins, kind):
     return lowered
 
 
+def lds_byte_offsets(name, mods):
+    if name != 'ds_read2_b32':
+        if not mods:
+            return (0,)
+        if len(mods) == 1 and re.fullmatch(r'offset:\d+', mods[0]):
+            return (int(mods[0][7:]),)
+        raise Unsupported('LDS exchange needs two VGPRs and an optional byte offset')
+    # DS_READ2 encodes each offset independently in dwords. An omitted field is zero.
+    offsets = {}
+    for mod in mods:
+        field = re.fullmatch(r'offset([01]):(\d+)', mod)
+        if not field or field[1] in offsets or int(field[2]) > 255:
+            raise Unsupported('LDS read2 needs ordinary dword offsets')
+        offsets[field[1]] = 4 * int(field[2])
+    first, second = offsets.get('0', 0), offsets.get('1', 0)
+    if first == second:
+        raise Unsupported('LDS read2 needs two distinct offsets')
+    return first, second
+
+
 def check_lds_exchange(ins, group, words):
     """Prove one race-free fill of a contiguous LDS span, one uniform barrier, then reads of initialized words."""
     if not 0 < words <= 8192 or group[1:] != (1, 1):
@@ -920,13 +940,18 @@ def check_lds_exchange(ins, group, words):
                     or mods or ops not in ([], ['0'], ['0x0'])):
                 raise Unsupported('LDS exchange needs one barrier after a completed fill')
             published = True
-        elif base in ('ds_write_b32', 'ds_read_b32'):
-            if (len(ops) != 2 or not all(re.fullmatch(r'v[0-9]+', op) for op in ops)
-                    or mods and (len(mods) != 1 or not re.fullmatch(r'offset:\d+', mods[0]))):
+        elif base in ('ds_write_b32', 'ds_read_b32', 'ds_read2_b32'):
+            if base == 'ds_read2_b32':
+                dest = reg_range(ops[0]) if len(ops) == 2 else None
+                if (not dest or dest[0] != 'v' or dest[2] != dest[1] + 1 or dest[2] > 255
+                        or not re.fullmatch(r'v\d+', ops[1])):
+                    raise Unsupported('LDS read2 needs a VGPR pair and a byte address VGPR')
+            elif len(ops) != 2 or not all(re.fullmatch(r'v[0-9]+', op) for op in ops):
                 raise Unsupported('LDS exchange needs two VGPRs and an optional byte offset')
-            offset = int(mods[0][7:]) if mods else 0
+            offsets = lds_byte_offsets(base, mods)
             producer, args, modifiers = prev
             if base == 'ds_write_b32':
+                offset, = offsets
                 # The prefix below preserves the entry X ID in v0. Each lane writes exactly one distinct dword.
                 if (first is not None or producer != 'v_lshlrev_b32' or args != [ops[0], '2', 'v0']
                         or modifiers or offset % 4 or offset + group[0] * 4 > words * 4):
@@ -942,7 +967,8 @@ def check_lds_exchange(ins, group, words):
                     low, high = 0, int(args[1], 0)
                 else:
                     raise Unsupported('LDS read needs a literal or literal-masked byte address')
-                if offset % 4 or high % 4 or low + offset < first or high + offset >= first + group[0] * 4:
+                if high % 4 or any(offset % 4 or low + offset < first or high + offset >= first + group[0] * 4
+                                   for offset in offsets):
                     raise Unsupported('LDS read outside the aligned, initialized span')
                 if i + 1 >= len(ins) or ins[i + 1][3] != 's_waitcnt lgkmcnt(0)':
                     raise Unsupported('LDS read needs a completed LGKM wait')
@@ -971,6 +997,7 @@ class Stage:
     pinned_low16_v = ()       # low16_only_v live across basic-block boundaries
     whole_read_v = ()         # VGPRs read outside a proven low-16-bit consumer
     byte_float_v = ()         # VGPRs proven to hold +0.0 or an integer in 1..255 (v_cvt_f32_ubyte0..3 result)
+    used_atomic = ()          # atomic result types ('uint', 'int') needing declarations in main()
     # pixel: VGPR -> (attr, channel, high) of the v_interp_p1ll_f16 that wrote it. Created on first use, because
     # unit probes build a Stage without __init__.
     interp_p1 = None
@@ -997,6 +1024,7 @@ class Stage:
             self.lines = []           # body statements (per block)
             self.sym = {}             # scalar register -> symbolic value
             self.used_s, self.used_v = set(), set()
+            self.used_atomic = set()
             self.exec_known = True    # exec still equals the entry mask (the lane is active)
             self.wqm_exec = False     # exec is proven whole-quad: an s_wqm of exec into itself ran while exec_known
             self.exports = {}         # 'pos0' / 'paramN' / 'mrtN' -> [4 expressions]
@@ -1985,7 +2013,7 @@ class Stage:
             return ('branch', cond, int(ops[0].split('_')[1], 16))
         if base == 'exp':
             return self.export(asm)
-        if base in ('ds_write_b32', 'ds_read_b32', 's_barrier'):
+        if base in ('ds_write_b32', 'ds_read_b32', 'ds_read2_b32', 's_barrier'):
             if getattr(self, 'kind', None) != 'cs':
                 raise Unsupported(base)
             # The refusal census continues past failed instructions. Scan this program only once.
@@ -2003,18 +2031,25 @@ class Stage:
             else:
                 write = base == 'ds_write_b32'
                 address = self.u(ops[0 if write else 1])
-                offset = int(mods[0][7:]) if mods else 0
-                cell = 'lds[(%s + %du) >> 2]' % (address, offset)
+                offsets = lds_byte_offsets(base, mods)
                 if write:
-                    self.emit('%s = %s;' % (cell, self.u(ops[1])))
+                    self.emit('lds[(%s + %du) >> 2] = %s;' % (address, offsets[0], self.u(ops[1])))
                 else:
-                    self.set_v(reg_range(ops[0])[1], cell)
+                    if base == 'ds_read2_b32':
+                        # Either destination can overlap the incoming address VGPR.
+                        self.emit('a = %s;' % address)
+                        address = 'a'
+                    start = reg_range(ops[0])[1]
+                    for index, offset in enumerate(offsets):
+                        self.set_v(start + index, 'lds[(%s + %du) >> 2]' % (address, offset))
             return None
         if base.endswith('_dpp'):
             return self.dpp(base[:-len('_dpp')], ops, mods)
         handler = getattr(self, 'op_' + base, None)
         if handler:
             return handler(ops, mods)
+        if base in MUBUF_ATOMIC_OPS:
+            return self.buffer_atomic(base, ops, mods)
         if base.endswith('_dpp'):
             return self.dpp(base[:-len('_dpp')], ops, mods)
         if base.startswith('v_cmp'):
@@ -2919,27 +2954,26 @@ class Stage:
             raise Unsupported('%s through a modified descriptor' % what)
         return key
 
-    def op_buffer_store_dword(self, ops, mods, count=1):
-        # Compute-stage store in the offen form: per-lane byte VGPR plus the scalar offset and the 12-bit immediate,
-        # through a descriptor read from a fixed root-table slot, to a RWByteAddressBuffer (manifest `uav` line).
-        # Like the loads, this assumes a raw descriptor (no swizzle or stride). Out-of-range stores: assumes a future
-        # runtime sizes the view to the descriptor's range so both sides drop them; nothing binds or checks that yet.
-        if self.kind != 'cs':
-            raise Unsupported('buffer_store_dword' + ('x%d' % count if count > 1 else ''))  # the unknown-op refusal
+    def raw_table_uav_store(self, kind_label, ops, mods, data_count, *, allow_glc=False):
+        """Validate a fixed-table raw UAV descriptor, data range, offen address, soffset, and 4-byte alignment."""
         offset = 0
+        glc = False
         for m in mods:
             if m.startswith('offset:') and re.fullmatch(r'0x[0-9a-f]+|\d+', m[7:]):
                 offset += int(m[7:], 0)
+            elif m == 'glc' and allow_glc:
+                glc = True
             elif m != 'offen':
-                raise Unsupported('buffer store modifier %s' % m)
+                raise Unsupported('%s modifier %s' % (kind_label, m))
         if len(ops) != 4 or 'offen' not in mods:
-            raise Unsupported('buffer store without the offen address form')
-        src, vaddr = reg_range(ops[0]), reg_range(ops[1])
-        if not src or src[0] != 'v' or src[2] - src[1] != count - 1 or src[2] > 255:
-            raise Unsupported('buffer store data %s' % ops[0])
+            raise Unsupported('%s without the offen address form' % kind_label)
+        data = reg_range(ops[0])
+        if not data or data[0] != 'v' or data[2] - data[1] != data_count - 1 or data[2] > 255:
+            raise Unsupported('%s data %s' % (kind_label, ops[0]))
+        vaddr = reg_range(ops[1])
         if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
-            raise Unsupported('buffer store vaddr %s for offen' % ops[1])
-        key = self.store_descriptor(ops[2], 4, 'buffer store', stride0_ok=True)
+            raise Unsupported('%s vaddr %s for offen' % (kind_label, ops[1]))
+        key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True)
         terms = [self.u(ops[1])]
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             offset += int(ops[3], 0)
@@ -2949,15 +2983,57 @@ class Stage:
                 raise Unsupported('buffer soffset %s' % ops[3])
             terms.append(self.S(sreg[1]))
         if offset % 4:
-            raise Unsupported('buffer store at unaligned immediate offset %d' % offset)
-        uav = self.pipe.uav(key)
+            raise Unsupported('%s at unaligned immediate offset %d' % (kind_label, offset))
+        return data, self.pipe.uav(key), '(%s + %d) & 0xfffffffcu' % (' + '.join(terms), offset), glc
+
+    def op_buffer_store_dword(self, ops, mods, count=1):
+        # Compute-stage store in the offen form: per-lane byte VGPR plus the scalar offset and the 12-bit immediate,
+        # through a descriptor read from a fixed root-table slot, to a RWByteAddressBuffer (manifest `uav` line).
+        # Like the loads, this assumes a raw descriptor (no swizzle or stride). Out-of-range stores: assumes a future
+        # runtime sizes the view to the descriptor's range so both sides drop them; nothing binds or checks that yet.
+        if self.kind != 'cs':
+            raise Unsupported('buffer_store_dword' + ('x%d' % count if count > 1 else ''))  # the unknown-op refusal
+        src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count)
         words = [self.u('v%d' % n) for n in range(src[1], src[2] + 1)]
         data = words[0] if count == 1 else 'uint%d(%s)' % (count, ', '.join(words))
         # Store* needs a multiple of four. As in #2059, the run-time part (VGPR and register soffset) is rounded down:
         # an assumption that a dword access ignores the low two address bits, not a measurement.
-        self.emit('a = (%s + %d) & 0xfffffffcu;' % (' + '.join(terms), offset))
+        self.emit('a = %s;' % address)
         store = '%s.Store%s(a, %s);' % (uav, '' if count == 1 else count, data)
         self.emit(store if self.exec_known else 'if (exec & 1) %s' % store)
+
+    def buffer_atomic(self, name, ops, mods):
+        """Lower 32-bit compute MUBUF atomics in offen mode with optional glc pre-atomic return."""
+        if self.kind != 'cs':
+            raise Unsupported(name)
+        method, signed, is_sub, data_count = MUBUF_ATOMIC_OPS[name]
+        data, uav, address, glc = self.raw_table_uav_store('buffer atomic', ops, mods, data_count, allow_glc=True)
+        words = [self.u('v%d' % n) for n in range(data[1], data[2] + 1)]
+        self.emit('a = %s;' % address)
+        if not isinstance(getattr(self, 'used_atomic', None), set):
+            self.used_atomic = set()
+        if name == 'buffer_atomic_cmpswap':
+            # RDNA 2 puts replacement in vdata[0] and compare in vdata[1]; HLSL takes compare first.
+            if glc:
+                self.used_atomic.add('uint')
+                call = '%s.InterlockedCompareExchange(a, %s, %s, ao);' % (uav, words[1], words[0])
+            else:
+                call = '%s.InterlockedCompareStore(a, %s, %s);' % (uav, words[1], words[0])
+        elif name == 'buffer_atomic_swap':
+            # HLSL RWByteAddressBuffer.InterlockedExchange always requires an output operand.
+            self.used_atomic.add('uint')
+            call = '%s.InterlockedExchange(a, %s, ao);' % (uav, words[0])
+        else:
+            arg = 'asint(%s)' % words[0] if signed else ('(0u - %s)' % words[0] if is_sub else words[0])
+            if glc:
+                out_var = 'ai' if signed else 'ao'
+                self.used_atomic.add('int' if signed else 'uint')
+                call = '%s.Interlocked%s(a, %s, %s);' % (uav, method, arg, out_var)
+            else:
+                call = '%s.Interlocked%s(a, %s);' % (uav, method, arg)
+        self.emit(call if self.exec_known else 'if (exec & 1) %s' % call)
+        if glc:
+            self.set_v(data[1], 'asuint(ai)' if signed else 'ao')
 
     def op_buffer_store_dwordx2(self, ops, mods):
         self.op_buffer_store_dword(ops, mods, 2)
@@ -4330,9 +4406,29 @@ class Stage:
         if getattr(self, 'spill_slots', None):
             lines.append('    uint %s;' % ', '.join('sp%d_%d = 0' % k for k in sorted(self.spill_slots)))
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
+        if getattr(self, 'used_atomic', None):
+            if 'uint' in self.used_atomic:
+                lines.append('    uint ao = 0;')
+            if 'int' in self.used_atomic:
+                lines.append('    int ai = 0;')
         lines += ['    s%d = %s;' % kv for kv in sorted(getattr(self, 'materialized', {}).items())]
         return lines
 
+
+# 32-bit raw MUBUF atomics: opcode_name -> (RWByteAddressBuffer method suffix, signed, is_sub, data_vgprs)
+MUBUF_ATOMIC_OPS = {
+    'buffer_atomic_swap': ('Exchange', False, False, 1),
+    'buffer_atomic_cmpswap': ('CompareExchange', False, False, 2),
+    'buffer_atomic_add': ('Add', False, False, 1),
+    'buffer_atomic_sub': ('Add', False, True, 1),
+    'buffer_atomic_smin': ('Min', True, False, 1),
+    'buffer_atomic_umin': ('Min', False, False, 1),
+    'buffer_atomic_smax': ('Max', True, False, 1),
+    'buffer_atomic_umax': ('Max', False, False, 1),
+    'buffer_atomic_and': ('And', False, False, 1),
+    'buffer_atomic_or': ('Or', False, False, 1),
+    'buffer_atomic_xor': ('Xor', False, False, 1),
+}
 
 # name -> (source operand count, expression); operands are floats
 VEC_F = {

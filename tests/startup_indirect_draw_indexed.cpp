@@ -6,12 +6,15 @@
 
 #include "desktop_gpu.h"
 #include "xmem_section_lease.h"
+#include "startup_stubs/rect_indirect_args.h"
 #include "startup_indirect_mesh_mesh.h"
 #include "startup_indirect_mesh_amplify.h"
 #include "startup_indirect_mesh_amplified_mesh.h"
 #include "startup_indirect_mesh_pixel.h"
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -19,11 +22,14 @@
 #include <fstream>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 extern "C" __declspec(dllimport) HRESULT WINAPI D3D12XboxCreateDevice(IUnknown*, const void*, REFIID, void**);
+extern "C" __declspec(dllimport) BOOL x2w_d3d12_distinct_rect_scratch(void*, void*);
 
 #if defined(OFFSCREEN_AGILITY_620)
 extern "C" {
@@ -119,6 +125,21 @@ void write_two_mesh_groups() {
     data.Store3(4, uint3(2, 1, 1));
 }
 
+[numthreads(1, 1, 1)]
+void write_one_rect() {
+    data.Store4(4, uint4(3, 1, 0, 0));
+}
+
+[numthreads(1, 1, 1)]
+void write_two_rects() {
+    data.Store4(4, uint4(6, 1, 0, 0));
+}
+
+[numthreads(1, 1, 1)]
+void write_overflowing_rects() {
+    data.Store4(4, uint4(0xffffffff, 1, 0, 0));
+}
+
 struct Varying {
     float4 position : SV_Position;
     nointerpolation uint side : SIDE;
@@ -129,6 +150,25 @@ Varying vertex(uint id : SV_VertexID) {
     uint corner = id % 3;
     result.position = float4(corner == 2 ? 3 : -1, corner == 1 ? 3 : -1, 0, 1);
     result.side = id / 3;
+    return result;
+}
+
+// One rectangle is three console vertices (bottom-left, bottom-right, top-right); the desktop draw spends six
+// vertices on it: the triangles (v0, v1, v2) and (v0, v2, v3) with v3 = v0 + v2 - v1.
+Varying vertex_rect(uint id : SV_VertexID) {
+    Varying result;
+    const uint rect = id / 6;
+    // No local array indexed by SV_VertexID: some Gen9 drivers mis-lower that. The corner sequence
+    // 0,1,2,0,2,3 is computed with plain arithmetic and the corner is picked with scalar selects.
+    const uint k = id % 6;
+    const uint c = (k < 3u) ? k : ((k == 3u) ? 0u : (k - 2u));
+    const float x0 = (rect == 0) ? -1.0 : 0.0;
+    const float x1 = (rect == 0) ? 0.0 : 1.0;
+    // v0 = (x0, -1), v1 = (x1, -1), v2 = (x1, 1), v3 = v0 + v2 - v1 = (x0, 1)
+    const float x = (c == 0u || c == 3u) ? x0 : x1;
+    const float y = (c >= 2u) ? 1.0 : -1.0;
+    result.position = float4(x, y, 0, 1);
+    result.side = rect;
     return result;
 }
 
@@ -424,13 +464,48 @@ void submit_wrapped(IUnknown* queue, IUnknown* list)
     slot<Execute>(queue, 10)(queue, list ? 1u : 0u, list ? &list : nullptr);
 }
 
+// Two runs on two threads share one guest device, whose recording state is not meant to be driven from two threads
+// at once. The gate serializes everything except the GPU phase and releases both submits together, so the two
+// queues run their conversions at the same time.
+struct Gate {
+    std::mutex state;
+    std::mutex wait_lock;
+    std::condition_variable changed;
+    IUnknown* first = nullptr;
+    unsigned generation = 0;
+    bool aborted = false;
+    bool meet(IUnknown* list) {
+        std::unique_lock<std::mutex> guard(wait_lock);
+        if (aborted) return false;
+        if (first) {
+            if (!x2w_d3d12_distinct_rect_scratch(first, list)) {
+                std::fprintf(stderr, "rectangle scratch is missing or shared between recordings\n");
+                aborted = true;
+            }
+            first = nullptr;
+            ++generation;
+            changed.notify_all();
+            return !aborted;
+        }
+        first = list;
+        const unsigned mine = generation;
+        changed.wait(guard, [&] { return aborted || generation != mine; });
+        return !aborted;
+    }
+    void abort() {
+        std::lock_guard<std::mutex> guard(wait_lock);
+        aborted = true;
+        changed.notify_all();
+    }
+};
+
 enum class Refusal { none, index_upload_cross, index_upload_foreign, index_upload_unaligned, index_unregistered,
                      alias_no_heap, alias_overlaps, alias_cross_page, alias_off, invalid_index, short_argument, missing_viewport, wrong_root, missing_texture, start_vertex,
                      insufficient_table_range, copied_table_buffer, upload_range_crossing, unproven_copy,
                      indexed_base_overrun, indexed_vertex_range, invalid_mesh_tag,
                      rect_bad_index, rect_bad_count, rect_bad_w, rect_bad_shape,
-                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending };
-enum class DrawKind { indexed, vertices, mesh, indexed_rect };
+                     incomplete_mesh_constants, mesh_attachment_count, mesh_pending, overflowing_count, rect_live_compute };
+enum class DrawKind { indexed, vertices, mesh, indexed_rect, rect };
 
 ComPtr<ID3D12Resource> make_gpu_table_buffer(ID3D12Device* guest, UINT64 bytes)
 {
@@ -522,7 +597,8 @@ constexpr UINT command_stride(DrawKind kind)
     switch (kind) {
     case DrawKind::indexed_rect:
     case DrawKind::indexed: return sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
-    case DrawKind::vertices: return sizeof(D3D12_DRAW_ARGUMENTS);
+    case DrawKind::vertices:
+    case DrawKind::rect: return sizeof(D3D12_DRAW_ARGUMENTS);
     case DrawKind::mesh: return sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
     }
     return 0;
@@ -535,14 +611,55 @@ bool supports_mesh(ID3D12Device* device)
         options.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1;
 }
 
+// Failure-path diagnostic for the rectangle-list indirect conversion. Runs the same GPU conversion pass on a copy of
+// the four draw words that the title's buffer held and prints the words it wrote, so a log shows the exact
+// DrawInstanced arguments (vertex count, instance count, start vertex, start instance) the adapter produced.
+void report_rect_conversion(ID3D12Device* device, const Words& observed, UINT word)
+{
+    const std::uint32_t source_words[4]{observed[word], observed[word + 1], observed[word + 2], observed[word + 3]};
+    const std::uint32_t cpu_vertices = source_words[0] / 3 > 0x2AAAAAAAu ? 0 : source_words[0] / 3 * 6;
+    std::fprintf(stderr, "rect conversion diagnostic: title words %u %u %u %u, CPU reference vertices %u\n",
+                 source_words[0], source_words[1], source_words[2], source_words[3], cpu_vertices);
+    const auto source = make_buffer(device, 16, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ);
+    const auto readback = make_buffer(device, 16, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    const auto scratch = x2w_startup::RectIndirectArguments::make_scratch(device);
+    void* mapped = nullptr;
+    const D3D12_RANGE none{0, 0};
+    if (!scratch || FAILED(source->Map(0, &none, &mapped))) {
+        std::fprintf(stderr, "rect conversion diagnostic: scratch or source unavailable\n");
+        return;
+    }
+    std::memcpy(mapped, source_words, sizeof(source_words));
+    source->Unmap(0, nullptr);
+    ComputeCommands commands(device, nullptr, D3D12_COMMAND_LIST_TYPE_DIRECT);
+    if (!x2w_startup::rect_indirect_arguments().convert(commands.list.Get(), source.Get(), 0, scratch.Get())) {
+        std::fprintf(stderr, "rect conversion diagnostic: conversion pass unavailable\n");
+        return;
+    }
+    transition(commands.list.Get(), scratch.Get(), D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commands.list->CopyBufferRegion(readback.Get(), 0, scratch.Get(), 0, 16);
+    commands.submit_and_wait(device);
+    const D3D12_RANGE read{0, 16};
+    std::uint32_t converted[4]{};
+    if (FAILED(readback->Map(0, &read, &mapped))) return;
+    std::memcpy(converted, mapped, sizeof(converted));
+    readback->Unmap(0, &none);
+    std::fprintf(stderr, "rect conversion diagnostic: GPU scratch DrawInstanced words %u %u %u %u (%s)\n", converted[0],
+                 converted[1], converted[2], converted[3],
+                 converted[0] == cpu_vertices && converted[1] == source_words[1] && converted[2] == source_words[2] &&
+                 converted[3] == source_words[3] ? "matches the CPU reference" : "differs from the CPU reference");
+}
+
 bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_root, ID3D12PipelineState* writer,
          ID3D12RootSignature* graphics_root, IUnknown* graphics, ID3D12CommandSignature* signature,
          DrawKind kind, bool draw_right, Refusal refusal, const char* label,
          const TranslatedDrawFixture* translated = nullptr, bool upload_table = false, const ReplayCopy* replay = nullptr,
          bool upload_index = false, bool alias_index = false,
          UINT cached_mesh_targets = 0, bool cached_depth_only = false, bool restore_compute = false,
-         const MeshLeaseDraw* leased = nullptr)
+         const MeshLeaseDraw* leased = nullptr, Gate* gate = nullptr)
 {
+    std::unique_lock<std::mutex> recording;
+    if (gate) recording = std::unique_lock<std::mutex>(gate->state);
     const bool indexed = kind == DrawKind::indexed || kind == DrawKind::indexed_rect;
     const bool translated_indexed = translated && indexed;
     const UINT indexed_argument_offset = translated_indexed && draw_right ? 8 : argument_offset;
@@ -742,7 +859,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         slot<Table>(wrapped, 36)(wrapped, 0, translated->gpu);
     }
     if (!mesh) slot<Topology>(wrapped, 20)(wrapped,
-        rect ? static_cast<D3D12_PRIMITIVE_TOPOLOGY>(0x11) : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        rect || kind == DrawKind::rect ? static_cast<D3D12_PRIMITIVE_TOPOLOGY>(0x11)
+                                       : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     if (refusal != Refusal::missing_viewport) slot<Viewport>(wrapped, 21)(wrapped, 1, &viewport);
     slot<Scissor>(wrapped, 22)(wrapped, 1, &scissor);
     if (translated_indexed) {
@@ -841,6 +959,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         *input = retained_value;
         slot<Srv>(wrapped, 43)(wrapped, 0, reinterpret_cast<UINT64>(input));
         if (draw_right) slot<Root>(wrapped, 33)(wrapped, nullptr);
+        else if (kind == DrawKind::rect) slot<Root>(wrapped, 33)(wrapped, retained_compute_root.Get());
     }
     const UINT64 offset = refusal == Refusal::short_argument
         ? sizeof(initial_words) - command_stride(kind) + sizeof(std::uint32_t) : indexed_argument_offset;
@@ -889,7 +1008,12 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         check(completion->SetEventOnCompletion(1, nullptr), "wait for mesh consumer");
         check(device->GetDeviceRemovedReason(), "leased mesh GPU completion");
     } else {
+        if (gate) {
+            recording.unlock();
+            if (!gate->meet(wrapped)) return false;
+        }
         submit(device, list);
+        if (gate) recording.lock();
     }
 
     if (restore_compute) {
@@ -913,16 +1037,18 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         }
     }
 
+    Words observed{};
     if (arguments) {
         const D3D12_RANGE arg_range{0, sizeof(initial)};
         check(arg_readback->Map(0, &arg_range, &memory), "map argument readback");
-        Words observed{};
         std::memcpy(observed.data(), memory, sizeof(observed));
         arg_readback->Unmap(0, &untouched);
         Words expected = initial_words;
         if (writer) {
             const UINT word = indexed_argument_offset / sizeof(std::uint32_t);
-            expected[word] = refusal == Refusal::rect_bad_count ? 4 : !translated && !indexed && draw_right ? 6 : 3;
+            expected[word] = refusal == Refusal::overflowing_count ? 0xffffffffu
+                           : refusal == Refusal::rect_bad_count ? 4
+                           : !translated && !indexed && draw_right ? 6 : 3;
             expected[word + 1] = 1;
             if (indexed) expected[word + 2] = draw_right && !translated_indexed ? 4 : 1;
             if (translated_indexed && draw_right) {
@@ -966,7 +1092,7 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
                             pixel_bytes);
                 const bool right_half = x >= width / 2;
                 const bool covered = cached_depth_only || (indexed ? right_half == draw_right : translated || !right_half || draw_right);
-                const bool drawn = writer && refusal == Refusal::none && covered;
+                const bool drawn = writer && refusal == Refusal::none && covered;  // overflowing_count draws nothing
                 const std::uint32_t background = cached_depth_only ? 0xffff : black;
                 auto wanted = drawn ? (cached_depth_only ? 0u :
                     translated ? (draw_right ? green : red) : (right_half ? green : red)) : background;
@@ -986,7 +1112,10 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
         pixel_readback->Unmap(0, &untouched);
         std::printf("%s: %u/%u non-clear pixels%s\n", label, painted, width * height,
                     external_arguments ? "" : ", argument guards intact");
-        if (!pixels_match) return false;
+        if (!pixels_match) {
+            if (kind == DrawKind::rect) report_rect_conversion(device, observed, indexed_argument_offset / sizeof(std::uint32_t));
+            return false;
+        }
     }
     return true;
 }
@@ -1128,6 +1257,7 @@ int main(int argc, char** argv) try
     // "count-control" is the negative control: it expects one forwarded call too many.
     const bool count_control = argc == 3 && std::strcmp(argv[2], "count-control") == 0;
     if ((translated && !translated_indexed) || (argc == 3 && std::strcmp(argv[2], "draw") == 0)) kind = DrawKind::vertices;
+    else if (argc == 3 && std::strcmp(argv[2], "rect") == 0) kind = DrawKind::rect;
     else if (lease_arguments || console_mesh || desktop_as || (argc == 3 && std::strcmp(argv[2], "mesh") == 0))
         kind = DrawKind::mesh;
     else if (rect) kind = DrawKind::indexed_rect;
@@ -1523,6 +1653,10 @@ int main(int argc, char** argv) try
     const auto graphics = create_root(guest.Get(), graphics_desc);
     const char* left_entry = indexed ? "write_left" : "write_one_triangle";
     const char* right_entry = indexed ? "write_right" : "write_two_triangles";
+    if (kind == DrawKind::rect) {
+        left_entry = "write_one_rect";
+        right_entry = "write_two_rects";
+    }
     D3D12_INDIRECT_ARGUMENT_DESC argument{};
     argument.Type = indexed ? D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED : D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
     ComPtr<IUnknown> pso;
@@ -1543,13 +1677,14 @@ int main(int argc, char** argv) try
             pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS>(guest.Get(), graphics.Get(), ms, ps);
         }
     } else {
-        const auto vs = compile("vertex", "vs_5_0");
+        const auto vs = compile(kind == DrawKind::rect ? "vertex_rect" : "vertex", "vs_5_0");
         const auto ps = compile("pixel", "ps_5_0");
         pso = guest_pipeline<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS>(guest.Get(), graphics.Get(),
             {vs->GetBufferPointer(), vs->GetBufferSize()}, {ps->GetBufferPointer(), ps->GetBufferSize()});
     }
     const auto left = writer_pipeline(device.Get(), writer.Get(), left_entry);
     const auto right = writer_pipeline(device.Get(), writer.Get(), right_entry);
+    const auto overflow = kind == DrawKind::rect ? writer_pipeline(device.Get(), writer.Get(), "write_overflowing_rects") : nullptr;
     const D3D12_COMMAND_SIGNATURE_DESC signature_desc{command_stride(kind), 1, &argument, 0};
     ComPtr<ID3D12CommandSignature> signature;
     check(guest->CreateCommandSignature(&signature_desc, nullptr, IID_PPV_ARGS(&signature)), "create guest draw signature");
@@ -1566,6 +1701,10 @@ int main(int argc, char** argv) try
     };
     const char* left_label = indexed ? "left writer" : "one triangle";
     const char* right_label = indexed ? "right writer" : "two triangles";
+    if (kind == DrawKind::rect) {
+        left_label = "one rectangle";
+        right_label = "two rectangles";
+    }
     if (mesh) {
         left_label = "one mesh group";
         right_label = "two mesh groups";
@@ -1594,6 +1733,37 @@ int main(int argc, char** argv) try
             return 1;
         }
         std::printf("%s\n", line.c_str());
+    }
+    if (kind == DrawKind::rect &&
+        !run(device.Get(), guest.Get(), writer.Get(), overflow.Get(), graphics.Get(), pso.Get(), signature.Get(), kind,
+             false, Refusal::overflowing_count, "overflowing rectangle count")) return 1;
+    if (kind == DrawKind::rect) {
+        if (!run(device.Get(), guest.Get(), writer.Get(), left.Get(), graphics.Get(), pso.Get(), signature.Get(), kind,
+                 false, Refusal::rect_live_compute, "rectangle with rebound compute root", nullptr, false, nullptr,
+                 false, false, 0, false, true) ||
+            !run(device.Get(), guest.Get(), writer.Get(), right.Get(), graphics.Get(), pso.Get(), signature.Get(), kind,
+                 true, Refusal::rect_live_compute, "rectangle with retained desktop compute root", nullptr, false, nullptr,
+                 false, false, 0, false, true)) return 1;
+        // Check that the closed recordings own distinct scratch before releasing both submissions. Then each
+        // queue must draw its own argument count even if the GPU overlaps the two conversions.
+        std::atomic<bool> concurrent_ok{true};
+        Gate gate;
+        const auto worker = [&](ID3D12PipelineState* producer, bool draw_right, const char* label) {
+            try {
+                for (int round = 0; round < 24 && concurrent_ok; ++round)
+                    if (!run(device.Get(), guest.Get(), writer.Get(), producer, graphics.Get(), pso.Get(), signature.Get(),
+                             kind, draw_right, Refusal::none, label, nullptr, false, nullptr,
+                             false, false, 0, false, false, nullptr, &gate)) concurrent_ok = false;
+            } catch (...) {
+                concurrent_ok = false;
+            }
+            if (!concurrent_ok) gate.abort();
+        };
+        std::thread one(worker, left.Get(), false, "concurrent one rectangle");
+        std::thread two(worker, right.Get(), true, "concurrent two rectangles");
+        one.join();
+        two.join();
+        if (!concurrent_ok) return 1;
     }
     if (info) {
         for (UINT64 i = 0; i < info->GetNumStoredMessages(); ++i) {

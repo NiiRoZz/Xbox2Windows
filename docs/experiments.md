@@ -13056,6 +13056,36 @@ with backface culling enabled (`D3D12_CULL_MODE_BACK`):
 - Raw desktop topology rejection: passing raw `0x11` to desktop `CreateGraphicsPipelineState`
   is rejected with `0x80070057` (`E_INVALIDARG`).
 
+### Indirect Draw with a rectangle list
+
+An indirect `Draw` whose recorded topology is `0x11` is forwarded as a triangle-list `ExecuteIndirect`
+([#1999](https://github.com/R0Y00/Xbox2Windows/issues/1999), item E). The producer's GPU-written
+`VertexCountPerInstance` names three vertices per rectangle, so the runtime records a one-thread compute pass
+([`rect_indirect_args.h`](../src/startup_stubs/rect_indirect_args.h)) that writes `count / 3 * 6` (other words
+unchanged) into a scratch record, and the desktop draw reads that record. The title's own argument buffer is not
+modified. A count that would not fit 32 bits becomes 0 vertices. The model is
+`convert_indirect_draw_arguments` in [`rectlist_topology.py`](../tools/rectlist_topology.py).
+
+The scratch record belongs to the recording, not the device: it is created on the recording's first conversion and
+retained by the recording's desktop allocator, which is reused only after every queue that ran the recording has
+passed its fence. Two recordings on two queues therefore never read each other's converted count. The compute pass
+replaces the list's compute root signature and pipeline. The draw is refused while a forwarded desktop compute
+root SRV is still bound. Rebinding the same root or receiving a guest root that is not forwarded does not clear that
+binding. The fixture checks both cases with an untouched rectangle target and a subsequent compute readback.
+An indexed draw with `0x11` is still refused, as in the direct draw. Other console-only topologies are not handled.
+
+```powershell
+cmake --build --preset dev --target startup_indirect_draw_indexed
+ctest --preset dev --no-tests=error -R '^startup_indirect_rectlist_(warp|hardware)$' -V
+```
+
+[The fixture](../tests/startup_indirect_draw_indexed.cpp) (`rect` mode) has a compute producer write one or two
+rectangles into a 4x2 target through a vertex shader that builds `(v0, v1, v2)` and `(v0, v2, v0 + v2 - v1)`. It
+reads the pixels back (left half red, right half green) and the argument words (unchanged). An omitted producer, a
+short argument range, a missing viewport and an overflowing count must leave the target clear. Two threads then
+record and submit one- and two-rectangle draws on separate queues 24 times each; every target must match its own count. Without the
+conversion the runtime refuses the draw and the first case stays clear.
+
 Not covered by this experiment: geometry or tessellation shader stages preceding the
 input assembler, primitive ID generation in pixel shaders, runtime driver hooking, and title CPU code execution.
 
@@ -13294,13 +13324,33 @@ ctest --preset dev --no-tests=error -R '^startup_image_sample_b' -V
 
 The guest sampler's MIN_LOD (word 1 bits 11:0) and MAX_LOD (bits 23:12) clamp the LOD of every sample form. `tools/startup/gfx2hlsl.py` now carries them for `image_sample`, `image_sample_l` and `image_sample_lz` when the sampler is a constant, through the `smpl` manifest line and `decode_sampler` that `image_sample_b` introduced (#2051); the slice is #2177, split from the run-time heap case (#2221). The three forms share one validation with `image_sample_b`: a descriptor LOD bias (word 2 bits 19:0) and MIN_LOD above MAX_LOD are refused, with the form's own name in the message. Behavior change: a constant sampler with either of those fields set used to translate for these forms (limits ignored) and is now refused. A mip filter of 0 (mipmapping disabled) is not refused for these forms, unlike `image_sample_b` where the bias would count: such a sampler keeps its ordinary `smp` line and its previous behavior. Refusing it would drop every pipeline with an all-zero inline sampler (seven existing check scripts build one); `image_sample_lz` and `_l` with level 0 would be harmless anyway. The one-argument switch is `mip_filter_none_ok` in `Stage.lod_sampler_words`. Also changed: a constant sampler with a non-zero MAX_LOD now clamps the level (it was unbounded before), which is the intended fix.
 
-Not changed: a sampler read through the sampler heap (table or default-sampler shortcut) keeps the ordinary static or heap sampler and is not validated; `translate_to` and `translate_compute` write one line per module to stderr (`<key>: image_sample, image_sample_l through a sampler heap: sampler MIN_LOD, MAX_LOD and LOD bias are not validated (#2221)`). A sampler that is neither heap nor constant is refused as before. `image_sample_c` keeps its MAX_LOD rule.
+Not changed: a sampler read through the sampler heap (table or default-sampler shortcut) keeps the ordinary static or heap sampler and is not validated; `translate_to` and `translate_compute` write one line per module to stderr (`<key>: image_sample, image_sample_l through a sampler heap: sampler MIN_LOD, MAX_LOD and LOD bias are not validated (#2221)`). Since then the run-time heap table applies each entry's MIN_LOD and MAX_LOD (`dynamic_sampler()` in `src/startup_stubs/translated_sampler_bindings.h`, checked by `startup_sampler_lod_*`); the entry's LOD bias is not carried, a MIN_LOD above MAX_LOD is passed through unchanged, and the default-sampler shortcut keeps a static sampler with an unbounded LOD range. A sampler that is neither heap nor constant is refused as before. `image_sample_c` keeps its MAX_LOD rule.
 
 `tests/startup_image_sample_lod_check.py` draws each form on its own (`startup_image_sample_lod_warp`, `startup_image_sample_lod_hardware`) against the 4x4, two-slice, three-mip array, point sampler with mip filter point, where all six cells differ. Each form's control is the same program through the ordinary `smp` line, which must read a different mip: `image_sample_l` with explicit level 2 and MAX_LOD 1 reads mip 1 (`smp`: mip 2); `image_sample` with MIN_LOD 2 above the implicit level 1 reads mip 2 (`smp`: mip 1); `image_sample_lz` with MIN_LOD 1 reads mip 1 (`smp`: mip 0). The implicit level 1 comes from the technique of the bias check: only the `u` initialiser of the translated HLSL is replaced by `0.75 + 0.5 * (SV_Position.x - 0.5)`, the `Sample` call is untouched. Refusal controls per form: bias, secondary bias and MIN_LOD 3 above MAX_LOD 2; accepted controls per form: mip filter 0 (`smp` line) and a heap sampler (table and default-sampler shortcut, logged once). The three `image_sample_b` discriminators are unchanged. Not covered: a fractional MIN_LOD or MAX_LOD, a linear mip filter, 1D, 3D and packed `a16` draws, the run-time heap sampler's LOD fields (#2221), and compute stages.
 
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^startup_image_sample_lod' -V
+```
+
+## Startup 2D LOD queries through a mip view
+
+`startup_image_get_lod_view_warp` and `startup_image_get_lod_view_hardware` draw a synthetic
+gfx1013 `image_get_lod` pixel stage with its emitted `smpl` static sampler. Each draw also runs
+an independent HLSL shader against the same SRV and sampler. Both RGBA32F readbacks must agree
+bit for bit. The expected clamped and raw LODs allow one fractional LOD step (1/256).
+
+The texture has three mips starting at 4×4. With a UV step of one per pixel, a view of all
+three mips gives `(2, 2)`. Starting at mip 1 gives `(1, 1)` for a two-mip view and `(0, 1)`
+for a one-mip view. On the full view with MaxLOD 0.75, point mip filtering gives `(1, 2)`
+and linear mip filtering gives `(0.75, 2)`. Switching only the latter manifest tag to
+`smp` gives `(2, 2)`. A UV step of 1/8 and linear MinLOD 0.5 gives `(0.5, -1)`.
+The two adapters and WARP [measured on the desktop](https://github.com/R0Y00/Xbox2Windows/pull/2311#issuecomment-7162845528)
+differed at exact half-mip boundaries with point mip filtering. The regression uses linear
+filtering for the fractional lower clamp. Native console readback remains open.
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_image_get_lod_view_' -V
 ```
 
 ## Startup translator: packed 2D image-load coordinates
@@ -13492,6 +13542,27 @@ predicted failure counts under negative mutations.
 ```powershell
 cmake --build --preset release --target offscreen_check
 ctest --preset release --no-tests=error -R '^startup_compute_gather_l(_warp|_hardware)?$' -V
+```
+
+### Startup compute raw buffer atomics
+
+The startup compute translator lowers 32-bit gfx1013 raw `offen` MUBUF buffer
+atomics (`buffer_atomic_add`, `sub`, `smin`, `umin`, `smax`, `umax`, `and`,
+`or`, `xor`, `swap`, and `cmpswap`) through fixed-table unmodified `RWByteAddressBuffer`
+descriptors (`u0`). Addresses combine the `vaddr` byte offset, optional `soffset`
+register or aligned immediate, and aligned 12-bit `offset` rounded down by
+`& 0xfffffffcu`, guarded under `(exec & 1)` when `EXEC` is narrowed.
+
+`glc` writes the pre-atomic word back to `vdata[0]` (preserving `vdata[1]` on
+`cmpswap`, which reverses the ISA `(replacement, compare)` register pair to HLSL's
+`(compare, replacement)` order). `buffer_atomic_sub` emits `InterlockedAdd(a, (0u - val))`,
+and `smin`/`smax` use signed `asint` overloads. `idxen`, missing `offen`, `slc`/`dlc`,
+unaligned immediate offsets, modified or aliased descriptors, non-compute stages,
+and `inc`/`dec`/float/64-bit forms stay refused.
+
+```powershell
+cmake --build --preset release --target offscreen_check
+ctest --preset release --no-tests=error -R '^startup_compute_buffer_atomics(_warp|_hardware)?$' -V
 ```
 
 ## Startup translator: fixed-mip 2D comparison gathers
@@ -13735,7 +13806,7 @@ The runtime has no slot-67 path yet, so no translated compute program runs in th
   immediate offset.
 - Case C enables Y only, with group size 8x1x1 and 1x5x1 groups. It stores four words from every lane, then
   three words under an exec mask set from a compare.
-- Case G leaves three of eight lanes active, then enters a block that `s_cbranch_execz` skips for the other
+- Case J leaves three of eight lanes active, then enters a block that `s_cbranch_execz` skips for the other
   lanes. Inside the block it loads the store descriptor and computes a scalar from the group ID and the root
   constants, which the active lanes store. The block's scalars are dead at the join. A control that drops one
   of the block's scalar statements must mismatch.
@@ -13749,7 +13820,7 @@ for `cs_6_0`, and a plain D3D12 device dispatches it. The root signature is the 
 a root UAV and the root constants), so the manifest's table lines and the descriptor fetch are not exercised
 on the GPU. All 320 words are compared, including the sentinels. Four controls must each mismatch: swapping
 the X and Y group IDs, dropping the store, dropping case B's immediate offset, and dropping case C's exec
-predicate. Three more cover the execz cases: dropping a scalar statement in case G's block, dropping case H's
+predicate. Three more cover the execz cases: dropping a scalar statement in case J's block, dropping case H's
 inner exec predicate, and running case K's block for the skipped waves.
 
 The pure-Python controls cover:
@@ -13803,6 +13874,16 @@ is consumed. The expected UAV contains 256 result words and 64 sentinels.
 On WARP, RTX 4060 and Intel UHD 770, all 320 matched. Reading the same lane
 or broadcasting lane 36 instead changed exactly 128 words per adapter.
 
+Case G checks `ds_read2_b32` against the same bounded fill. Each encoded offset
+counts dwords independently from the original byte address. The translator
+checks both addresses against the initialized span and snapshots the base before
+writing either destination VGPR. In `ds_read2_b32 v[6:7], v6 offset0:5 offset1:36`,
+the first result overwrites the address register. The data are chosen so that
+using that overwritten value for the second read still addresses initialized LDS
+and produces a predictable wrong word. A second control swaps the two offsets.
+The RDNA 2 ISA describes a single access when the offsets coincide. This slice
+requires distinct offsets. [AMD RDNA 2 ISA, §10.4, LDS Access](https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf)
+
 The startup translator accepts one straight-line, full-EXEC fill in a 1D
 group, one group barrier, and reads from that initialized span. The fill
 address is the entry X ID shifted left by two. Read addresses come from an
@@ -13815,7 +13896,7 @@ the 32 KiB groupshared limit. The barrier becomes an unconditional
 and [HLSL group barrier](https://learn.microsoft.com/en-us/windows/win32/direct3dhlsl/groupmemorybarrierwithgroupsync).
 
 ```powershell
-ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(f-peer_|f-broadcast_)?(warp|hardware))$' -V
+ctest --preset dev --no-tests=error -R '^startup_gfx2hlsl_compute_(controls|(f-peer_|f-broadcast_|g-swapped-offsets_|g-overlap_)?(warp|hardware))$' -V
 python -B tests/startup_gfx2hlsl_compute_check.py binary llvm-mc-15
 ```
 
