@@ -20,6 +20,10 @@ The fixtures are source-built gfx1013 compute programs:
   inactive lanes 6..15 must preserve sentinel.
 - Case C: 256 concurrent threads (4 groups x 64 lanes) repeatedly write competing values ({0x1111, 0x2222} to byte 0,
   {0x4444, 0x8888} to byte 2) to the same 16-bit halfwords, verifying atomic CAS prevents bitwise-OR or torn corruption.
+- Case B / B-short: 4 lanes write 3 in-bounds 16-bit halves at addr = 0, 2, 4 under guest OOB_SELECT=3, stride=0,
+  num_records=6. Case B binds a padded host raw UAV (uav_words=2, 8 bytes) so DWORD 0 updates and DWORD 1 updates only
+  its low half while preserving the high-half sentinel; Case B-short binds the same shader/inputs to a short host raw
+  UAV (uav_words=1, 4 bytes) proving the host backing guard exits before Load/InterlockedCompareExchange on DWORD 1.
 """
 
 import math
@@ -165,10 +169,25 @@ WORDS_C = bytes.fromhex(
     + '000081bf'
 )
 
+SOURCE_B = PREAMBLE_X8 + """\
+v_lshlrev_b32 v4, 2, v0
+buffer_load_dword v5, v4, s[12:15], 0 offen
+v_lshlrev_b32 v1, 1, v0
+s_waitcnt vmcnt(0)
+buffer_store_format_d16_x v5, v1, s[16:19], 0 offen
+s_endpgm
+"""
+WORDS_B = bytes.fromhex(
+    '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf'
+    '82000834' '001030e004050380' '81000234' '703f8cbf'
+    '001010e201050480' '000081bf'
+)
+
 VERIFIED_SNIPPETS = {
     'buffer_store_format_d16_x v5, off, s[16:19], 0 offset:4': '040010e200050480',
     'buffer_store_format_d16_x v5, v0, s[16:19], 0 idxen offset:4': '042010e200050480',
     'buffer_store_format_d16_x v5, v0, s[16:19], s4 idxen offset:4': '042010e200050404',
+    'buffer_store_format_d16_x v5, v1, s[16:19], 0 offen': '001010e201050480',
     'buffer_store_format_d16_x v5, v1, s[16:19], s4 offen offset:2': '021010e201050404',
     'buffer_store_format_d16_x v5, v[2:3], s[16:19], 0 idxen offen': '003010e202050480',
     'buffer_store_format_d16_x v5, v0, s[16:19], 0 idxen glc': '006010e200050480',
@@ -226,9 +245,10 @@ PROGRAMS = {
     'S': (SOURCE_S, WORDS_S, USER7, (16, 1, 1), (1, 1, 1)),
     'E': (SOURCE_E, WORDS_E, USER7, (16, 1, 1), (1, 1, 1)),
     'C': (SOURCE_C, WORDS_C, USER7, (64, 1, 1), (4, 1, 1)),
+    'B': (SOURCE_B, WORDS_B, USER7, (4, 1, 1), (1, 1, 1)),
 }
 
-DISPATCH_CASES = (*F_VARIANTS.keys(), 'P', 'S', 'E')
+DISPATCH_CASES = (*F_VARIANTS.keys(), 'P', 'S', 'E', 'B', 'B-short')
 CONTENTION_VALID_LO = (0x1111, 0x2222)
 CONTENTION_VALID_HI = (0x4444, 0x8888)
 
@@ -275,7 +295,7 @@ def put_half(buf, byte_addr, half):
 
 
 def case_inputs(name):
-    """Return (program_key, source_bytes, constants_16, expected_words_320)."""
+    """Return (program_key, source_bytes, constants_16, expected_words_320, uav_words)."""
     buf = bytearray(struct.pack('<%dI' % WORDS, *([SENTINEL] * WORDS)))
     if name in F_VARIANTS:
         word3, stride, num_records, kind, active = F_VARIANTS[name]
@@ -297,7 +317,7 @@ def case_inputs(name):
                     put_half(buf, addr, f16_to_snorm16(h))
                 else:
                     put_half(buf, addr, h)
-        return 'F', source, constants, list(struct.unpack('<%dI' % WORDS, buf))
+        return 'F', source, constants, list(struct.unpack('<%dI' % WORDS, buf)), None
 
     if name == 'P':
         # 32 lanes, s4 = 2 (soffset), offset:2 -> base byte offset 4; lane i writes at 4 + 2*i.
@@ -311,7 +331,7 @@ def case_inputs(name):
             addr = 4 + 2 * lane
             if addr + 2 <= 50:
                 put_half(buf, addr, halves[lane])
-        return 'P', source, constants, list(struct.unpack('<%dI' % WORDS, buf))
+        return 'P', source, constants, list(struct.unpack('<%dI' % WORDS, buf)), None
 
     if name == 'S':
         # Structured OOB_SELECT=0 with soffset (s4=16) > stride (8) and imm_off=4.
@@ -322,7 +342,7 @@ def case_inputs(name):
         constants = [16, 0, word3, 8, 12] + [0] * 11
         for lane in range(12):
             struct.pack_into('<I', buf, 16 + lane * 8 + 4, f16_to_f32_bits(halves[lane]))
-        return 'S', source, constants, list(struct.unpack('<%dI' % WORDS, buf))
+        return 'S', source, constants, list(struct.unpack('<%dI' % WORDS, buf)), None
 
     if name == 'E':
         halves = FP16_VALUES
@@ -331,7 +351,24 @@ def case_inputs(name):
         constants = [0, 0, word3, 8, 16] + [0] * 11
         for lane in range(6):  # Outer EXEC tid.x < 10, inner s_and_saveexec tid.x < 6
             put_half(buf, lane * 8 + 2, halves[lane])
-        return 'E', source, constants, list(struct.unpack('<%dI' % WORDS, buf))
+        return 'E', source, constants, list(struct.unpack('<%dI' % WORDS, buf)), None
+
+    if name in ('B', 'B-short'):
+        # Host-backing boundary check separate from guest num_records/stride:
+        # guest OOB_SELECT=3, stride=0, num_records=6 lets lanes 0..2 pass (addr = 0, 2, 4; addr + 2 <= 6).
+        # Case B binds a padded 2-word (8-byte) raw UAV -> word 0 updated, word 1 low half updated (high half sentinel).
+        # Case B-short binds a short 1-word (4-byte) raw UAV -> word 0 updated, word 1 untouched sentinel.
+        halves = (0x1234, 0x5678, 0x9abc, 0xdef0)
+        source = poisoned_source(halves)
+        word3 = desc_word3(11, oob_select=3, dst_sel=0xFAC)  # BUF_FMT_16_UINT, OOB_SELECT=3 (RAW)
+        constants = [0, 0, word3, 0, 6] + [0] * 11
+        uav_words = 2 if name == 'B' else 1
+        uav_bytes = uav_words * 4
+        for lane in range(4):
+            addr = 2 * lane
+            if addr + 2 <= 6 and (addr & ~3) + 4 <= uav_bytes:
+                put_half(buf, addr, halves[lane])
+        return 'B', source, constants, list(struct.unpack('<%dI' % WORDS, buf)), uav_words
 
     if name == 'C':
         # Even lanes read t0[0]=0x1111, t0[2]=0x4444; odd lanes read t0[1]=0x2222, t0[3]=0x8888.
@@ -341,7 +378,7 @@ def case_inputs(name):
         # Sentinel 0xdeadbeef at word 0 forces offscreen_check to report actual word 0 while asserting words 1..319 == SENTINEL.
         exp = [SENTINEL] * WORDS
         exp[0] = 0xdeadbeef
-        return 'C', source, constants, exp
+        return 'C', source, constants, exp, None
 
     raise KeyError(name)
 
@@ -406,6 +443,14 @@ def check_controls():
     assert 'buf.InterlockedCompareExchange(' in hlsl_f
     assert 'InterlockedAnd' not in hlsl_f and 'InterlockedOr' not in hlsl_f
     assert '    store_format_d16_x(u0, ud2, ud3, ud4, v0, 0u, 0u, 4u, v5);' in hlsl_f, hlsl_f
+    dim_pos = hlsl_f.index('buf.GetDimensions(uav_bytes);')
+    store_guard_pos = hlsl_f.index('if ((addr & 3u) != 0u || uav_bytes < 4u || addr > uav_bytes - 4u) return;')
+    store_pos = hlsl_f.index('buf.Store(addr, asuint(f16tof32(h)));')
+    cas_guard_pos = hlsl_f.index('if (uav_bytes < 4u || base > uav_bytes - 4u) return;')
+    load_pos = hlsl_f.index('buf.Load(base)')
+    cas_pos = hlsl_f.index('buf.InterlockedCompareExchange(')
+    assert dim_pos < store_guard_pos < store_pos < cas_guard_pos < load_pos < cas_pos, (
+        dim_pos, store_guard_pos, store_pos, cas_guard_pos, load_pos, cas_pos)
 
     hlsl_p = translate('P').hlsl_cs()
     assert '    store_format_d16_x(u0, ud2, ud3, ud4, 0u, v1, ud0, 2u, v5);' in hlsl_p, hlsl_p
@@ -415,6 +460,9 @@ def check_controls():
 
     hlsl_e = translate('E').hlsl_cs()
     assert 'if (exec & 1) store_format_d16_x(u0, ud2, ud3, ud4, v2, v3, 0u, 0u, v5);' in hlsl_e, hlsl_e
+
+    hlsl_b = translate('B').hlsl_cs()
+    assert '    store_format_d16_x(u0, ud2, ud3, ud4, 0u, v1, 0u, 0u, v5);' in hlsl_b, hlsl_b
 
     # 'off' addressing mode with inline soffset=8 and offset:4 must keep soff=8u and imm_off=4u SEPARATE!
     store_f = '042010e200050480'
@@ -528,53 +576,75 @@ CONTROLS = {
         'F-f32',
         '    store_format_d16_x(u0, ud2, ud3, ud4, v0, 0u, 0u, 4u, v5);\n',
         '',
+        None,
     ),
     'f32-wrong-half': (
         'F-f32',
         '    uint h = val & 0xffffu;\n',
         '    uint h = (val >> 16u) & 0xffffu;\n',
+        None,
     ),
     'f32-drop-oob': (
         'F-f32',
         '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;\n',
         '        if (elem_bytes > stride || rec_off > stride - elem_bytes) return;\n',
+        None,
     ),
     'unorm16-trunc': (
         'F-unorm16',
         '    return (uint)floor(scaled + 0.5f);\n',
         '    return (uint)floor(scaled);\n',
+        None,
     ),
     'p-drop-soffset': (
         'P',
         '    store_format_d16_x(u0, ud2, ud3, ud4, 0u, v1, ud0, 2u, v5);\n',
         '    store_format_d16_x(u0, ud2, ud3, ud4, 0u, v1, 0u, 2u, v5);\n',
+        None,
     ),
     'p-drop-keep': (
         'P',
         '        uint next = (cur & keep) | ins;\n',
         '        uint next = ins;\n',
+        None,
     ),
     's-fold-soff-stride': (
         'S',
         '        if (idx >= num_records || elem_bytes > stride || rec_off > stride - elem_bytes) return;\n',
         '        if (idx >= num_records || elem_bytes > stride || (rec_off + soff) > stride - elem_bytes) return;\n',
+        None,
     ),
     'e-drop-exec': (
         'E',
         'if (exec & 1) store_format_d16_x(',
         'store_format_d16_x(',
+        None,
+    ),
+    'b-short-binding': (
+        'B',
+        None,
+        None,
+        1,
+    ),
+    'b-tight-host-guard': (
+        'B',
+        '    if (uav_bytes < 4u || base > uav_bytes - 4u) return;\n',
+        '    if (uav_bytes < 4u || base > uav_bytes - 8u) return;\n',
+        None,
     ),
 }
 
 
 def mutate(hlsl, control):
-    _, old, new = CONTROLS[control]
+    _, old, new, _ = CONTROLS[control]
+    if old is None:
+        return hlsl
     assert hlsl.count(old) == 1, (control, hlsl)
     return hlsl.replace(old, new)
 
 
-def run_case(name, dxc, runner, adapter, directory, control=None):
-    prog_key, source, constants, exp = case_inputs(name)
+def run_case(name, dxc, runner, adapter, directory, control=None, uav_words=None):
+    prog_key, source, constants, exp, case_uav_words = case_inputs(name)
     hlsl = translate(prog_key).hlsl_cs()
     if control:
         hlsl = mutate(hlsl, control)
@@ -588,7 +658,11 @@ def run_case(name, dxc, runner, adapter, directory, control=None):
         + struct.pack('<16I', *constants)
         + source
     )
-    return subprocess.run([runner, adapter, '--compute-store-case', str(cso), str(case)], capture_output=True, text=True)
+    bound_uav_words = case_uav_words if uav_words is None else uav_words
+    cmd = [runner, adapter, '--compute-store-sized-case', str(cso), str(case)]
+    if bound_uav_words is not None:
+        cmd.append(str(bound_uav_words))
+    return subprocess.run(cmd, capture_output=True, text=True)
 
 
 def check_dispatch(dxc, runner, adapter, control=None):
@@ -596,9 +670,11 @@ def check_dispatch(dxc, runner, adapter, control=None):
     out = ROOT / 'out'
     out.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
-        runs = [(CONTROLS[control][0], control)] if control else [(name, None) for name in DISPATCH_CASES]
-        for name, mutation in runs:
-            run = run_case(name, dxc, runner, adapter, Path(tmp), mutation)
+        runs = [(CONTROLS[control][0], control, CONTROLS[control][3])] if control else [
+            (name, None, None) for name in DISPATCH_CASES
+        ]
+        for name, mutation, uav_words in runs:
+            run = run_case(name, dxc, runner, adapter, Path(tmp), mutation, uav_words=uav_words)
             print(run.stdout, end='')
             if run.returncode == 77:
                 return 77
@@ -607,10 +683,14 @@ def check_dispatch(dxc, runner, adapter, control=None):
             if mutation:
                 if run.returncode != 1 or not any('expected=' in line for line in diagnostics):
                     raise AssertionError('control %s: not rejected (exit %d) %s' % (mutation, run.returncode, run.stderr))
+                if mutation in ('b-short-binding', 'b-tight-host-guard'):
+                    assert diagnostics[0].startswith('word=1 '), (mutation, diagnostics)
+                    assert 'debug_errors=0 debug_warnings=0' in run.stdout, (mutation, run.stdout)
                 print('control %s: rejected at %s' % (mutation, diagnostics[0]))
             elif run.returncode or diagnostics:
                 raise AssertionError('case %s: %s' % (name, run.stderr or 'exit %d' % run.returncode))
             else:
+                assert 'debug_errors=0 debug_warnings=0' in run.stdout, (name, run.stdout)
                 print('case %s: all %d words match' % (name, WORDS))
 
         if not control:

@@ -192,7 +192,7 @@ STORE_D16_X_LEGACY_FORMATS = {
     (2 << 3) | 7: 13,  # DFMT_16 + NFMT_FLOAT
     (4 << 3) | 7: 22,  # DFMT_32 + NFMT_FLOAT
 }
-STORE_D16_X_WORD3_ZERO_MASK = 0xcef80000
+STORE_D16_X_WORD3_ZERO_MASK = 0xcef80000  # bits 31:30 TYPE | 27:25 reserved | 23 ADD_TID_ENABLE | 22:21 INDEX_STRIDE | 20:19 reserved
 
 
 def validate_store_d16_x_word3(word3):
@@ -5389,9 +5389,11 @@ class Pipeline:
                 '        if (soff > 0xffffffffu - elem_addr) return;',
                 '        addr = elem_addr + soff;',
                 '    }',
+                '    uint uav_bytes = 0u;',
+                '    buf.GetDimensions(uav_bytes);',
                 '    uint h = val & 0xffffu;',
                 '    if (fmt == 22u) {',
-                '        if ((addr & 3u) != 0u) return;',
+                '        if ((addr & 3u) != 0u || uav_bytes < 4u || addr > uav_bytes - 4u) return;',
                 '        buf.Store(addr, asuint(f16tof32(h)));',
                 '        return;',
                 '    }',
@@ -5400,6 +5402,7 @@ class Pipeline:
                 '    if (fmt == 7u) out16 = d16_to_unorm16(h);',
                 '    else if (fmt == 8u) out16 = d16_to_snorm16(h);',
                 '    uint base = addr & 0xfffffffcu;',
+                '    if (uav_bytes < 4u || base > uav_bytes - 4u) return;',
                 '    uint shift = (addr & 2u) << 3u;',
                 '    uint keep = ~(0xffffu << shift);',
                 '    uint ins = (out16 & 0xffffu) << shift;',
