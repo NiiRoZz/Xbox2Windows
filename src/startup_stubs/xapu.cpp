@@ -10,9 +10,9 @@
 
 // Experimental (docs/startup-runtime.md). With X2W_AUDIO_PERMISSIVE=1 the exports
 // stand in for the audio command queue; otherwise they trap. Call shapes observed:
-//   XApuConnect(input*, output*, handle*) -> HRESULT (the handle is later passed to the others). The caller
-//     reads one pointer from output +0, a shared buffer it copies packets and samples into; its size is the
-//     u32 at input +0x0C.
+//   XApuConnect(input*, output*, handle*) -> HRESULT (the handle is later passed to the others). In one
+//     title's calls, the caller reads one pointer from output +0 and its later decode commands point into that
+//     buffer; the size is taken from the u32 at input +0x0C (0x104000 there). Not traced to every consumer.
 //   XApuGetResultCount(handle, 0) -> count
 //   XApuDequeueResult(handle, result*) -> HRESULT; zeroes 0x58 bytes. With the experimental
 //     X2W_XAPU_TYPED_COMPLETIONS=1, also echoes the command type at +0 and slot at +4.
@@ -29,7 +29,7 @@ constexpr long hr_pending_results = static_cast<long>(0x8AC81001); // XAPU_E_PEN
 constexpr std::size_t command_header_size = 8;
 constexpr std::size_t result_size = 0x58;
 constexpr std::size_t max_queue_entries = 16384;  // 128 KiB cap per connection for undrained commands
-constexpr std::uint32_t max_buffer_bytes = 64u << 20;  // the observed caller asks for 0x104000
+constexpr std::uint32_t max_buffer_bytes = 64u << 20;  // sanity cap against a bad size, not a measured limit
 
 bool permissive() noexcept { return x2w_local::env_on("X2W_AUDIO_PERMISSIVE"); }
 

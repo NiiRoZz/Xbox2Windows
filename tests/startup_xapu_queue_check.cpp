@@ -196,6 +196,7 @@ int main(int argc, char** argv)
     sentinel.fill(0xA5);
     void* h1 = nullptr;
     output.fill(0x5A);
+    std::memset(output.data(), 0, sizeof(void*));  // an unwritten pointer reads as null, not as the 0x5A fill
     check(connect(input.data(), output.data(), &h1) == hr_ok && h1 != nullptr, "XApuConnect h1 succeeds");
     // The caller reads only output +0 and copies packets and samples into that buffer.
     unsigned char* shared = nullptr;
@@ -204,7 +205,9 @@ int main(int argc, char** argv)
     for (std::size_t i = 8; i < output.size(); ++i) second_untouched &= output[i] == 0x5A;
     check(shared != nullptr && second_untouched, "XApuConnect writes the shared buffer to output +0 and leaves +8 alone");
     if (shared) {
-        check(shared[0] == 0 && shared[buffer_bytes - 1] == 0, "shared buffer starts zeroed");
+        bool zeroed = true;
+        for (std::uint32_t i = 0; i < buffer_bytes; ++i) zeroed &= shared[i] == 0;
+        check(zeroed, "shared buffer starts zeroed");
         shared[0] = 1;
         shared[buffer_bytes - 1] = 1;
     }

@@ -2002,8 +2002,8 @@ routing and sample format.
 
 With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConnect`
 and `XApuDisconnect`. `XApuConnect` allocates a zeroed shared buffer of the size given by the
-32-bit value at input `+0x0C` and writes its address to output `+0x00`; the observed caller reads only
-that pointer and copies packets and samples into the buffer. A size of 0 or over 64 MiB is refused
+32-bit value at input `+0x0C` and writes its address to output `+0x00`. In one title's calls the caller read only that
+pointer, and its later decode commands pointed into the buffer. A size of 0, or over a 64 MiB sanity cap, is refused
 (`E_INVALIDARG`) without a handle, and the buffer is released on `XApuDisconnect`. It refuses null
 or unreadable command headers (`E_POINTER`), null or unreadable inputs and null or unwritable outputs
 (`E_POINTER`), and unknown or disconnected handles (`E_HANDLE`), and records one `(type, slot)`
