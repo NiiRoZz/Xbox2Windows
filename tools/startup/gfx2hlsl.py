@@ -441,11 +441,20 @@ QUAD_SWAPS = {(1, 0, 3, 2): 'QuadReadAcrossX', (2, 3, 0, 1): 'QuadReadAcrossY', 
 VOP3B_SDST = re.compile(r'v_(add|sub|subrev)_co(_ci)?_u32|v_div_scale_f(32|64)|v_mad_[iu]64_[iu]32')
 
 
+def destinations(name, ops):
+    """The operands an instruction writes: the first, and the SGPR destination of the VOP3b forms. Compares write none."""
+    if not ops or name.startswith(('s_cmp', 's_bitcmp')):
+        return []
+    return [ops[0]] + ([ops[1]] if len(ops) > 1 and VOP3B_SDST.match(name) else [])
+
+
 def writes_exec(name, ops):
     """Conservatively: whether the instruction can write EXEC, explicitly or implicitly."""
-    r = reg_range(ops[0]) if ops else None
-    return bool(ops and ops[0] in ('exec', 'exec_lo', 'exec_hi') or r and r[0] == 's' and r[1] <= 127 and r[2] >= 126
-                or 'saveexec' in name or 'wrexec' in name or name.startswith(('v_cmpx', 's_movreld')))
+    for tok in destinations(name, ops):
+        r = reg_range(tok)
+        if tok in ('exec', 'exec_lo', 'exec_hi') or r and r[0] == 's' and r[1] <= 127 and r[2] >= 126:
+            return True
+    return 'saveexec' in name or 'wrexec' in name or name.startswith(('v_cmpx', 's_movreld'))
 
 
 class Stage:
@@ -865,11 +874,8 @@ class Stage:
         The VGPR proofs stay: the entry-block read copies the VGPR, which neither write changes."""
         if writes_exec(name, ops):
             self.uniform_expr.clear()
-        if not ops or name.startswith(('s_cmp', 's_bitcmp')):
-            return
-        written = [ops[0]] + ([ops[1]] if len(ops) > 1 and VOP3B_SDST.match(name) else [])
         regs = set(range(128)) if name.startswith('s_movreld') else set()  # M0 picks the destination
-        for tok in written:
+        for tok in destinations(name, ops):
             r = reg_range(tok)
             if r and r[0] == 's':
                 regs.update(range(r[1], r[2] + 1))

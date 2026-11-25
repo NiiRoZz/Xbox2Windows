@@ -87,6 +87,10 @@ REFUSED = [
                                  'v_mov_b32_e32 v7, 0', READ, 's_endpgm')),
     # A scalar written before the last join can hold another path's value.
     ('scalar written before the join', (LOAD,) + JOIN + (DEFINE, READ)),
+    # A second join (here a loop head at the definition) resets the since-join marks again: on the next iteration
+    # s3 holds a lane mask.
+    ('scalar written before the second join', JOIN + (LOAD, DEFINE, READ, 's_mov_b32 s3, vcc_lo',
+                                                       's_cbranch_scc0 label_000C', 's_endpgm')),
     ('lane-varying source', JOIN + ('v_mul_f32_e64 v7, v0, 2.0', READ)),
     ('lane mask source', JOIN + ('v_cmp_lt_f32_e64 s3, v0, v1', DEFINE, READ)),
     ('VGPR overwritten in between', JOIN + (LOAD, DEFINE, 'v_add_f32_e64 v7, v0, 1.0', READ)),
@@ -115,7 +119,9 @@ for name, ops, expected in (('s_mov_b64', ['exec', 's[2:3]'], True), ('s_mov_b32
                             ('s_mov_b64', ['s[124:125]', 's[2:3]'], False),
                             ('s_or_saveexec_b64', ['s[2:3]', 's[4:5]'], True),
                             ('s_andn2_wrexec_b32', ['s2', 's4'], True), ('v_cmpx_lt_f32_e32', ['v0', 'v1'], True),
-                            ('s_movreld_b32', ['s0', 's2'], True), ('s_mov_b32', ['s2', 'exec_lo'], False)):
+                            ('s_movreld_b32', ['s0', 's2'], True), ('s_mov_b32', ['s2', 'exec_lo'], False),
+                            ('v_add_co_u32_e64', ['v1', 'exec_lo', 'v2', 'v3'], True),
+                            ('v_mul_f32_e64', ['v1', 'exec_lo', 'v2'], False), ('s_cmp_eq_u32', ['exec_lo', '0'], False)):
     check(f'{name} {ops[0]} writes EXEC: {expected}', G.writes_exec(name, ops) == expected)
 
 print('Readfirstlane recompute checks: %d failed' % len(failures))
