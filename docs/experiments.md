@@ -13944,15 +13944,24 @@ join. When no lane is active, the wave skips the block too. The block is therefo
 when every SGPR, `vcc`, `m0` and SCC it may define is dead where it joins. A backward liveness pass over
 the program's instructions checks this. `m0` is always treated as live.
 
-Exec writes inside the block are accepted when the block is straight-line (no branch in it and none into
-it) and the write cannot set the exec bit of a lane whose bit is clear, because that lane's bit is clear on
-entry. Accepted forms:
-- `s_and_saveexec` and `v_cmpx`;
-- `s_and` or `s_andn2` that keeps exec;
-- `s_or`, `s_xor` or a move whose other source only ever holds a copy of exec made earlier in the same block.
+Exec writes inside the block are accepted when they cannot set the exec bit of a lane whose bit was clear at
+the branch. A forward pass over the block proves it. For each instruction the wave can reach from the branch,
+the pass keeps the set of scalar words in which such a lane's bit is known clear, on every path through the
+block, branches and loops inside it included (the largest sets that every path keeps, found by iteration). Each
+fact names the half of the wave it holds for, so a copy of `exec_hi` proves nothing about `exec_lo`. The set
+starts as exec alone. Only bitwise forms carry a fact:
+- a copy of exec (`s_mov` from exec, or the mask a saveexec form saves) and a zero literal are clear;
+- `s_and` is clear where either source is, `s_or` and `s_xor` where both are, `s_andn2` and `s_mov` where the
+  first source is;
+- `s_and_saveexec`, `s_or_saveexec`, `s_xor_saveexec`, `s_andn2_saveexec` and `s_andn2_wrexec` are their
+  operation on exec and the source, and `v_cmpx` ANDs into exec;
+- any other write, a compare result included, drops the facts of what it writes.
 
-That covers a nested `if` without its own branch. The copies are tracked in program order, which is every path
-only in a straight-line block.
+An exec write must leave exec in the set. The lane's bit is then clear at every instruction the wave runs in
+the block, so the wave changes nothing of that lane there, and its exec at the join is the model's. That
+covers a nested `if`, an `if`/`else` whose arms have their own `s_cbranch_execz`, and a loop, when every
+restore reads a mask saved inside the block. The proof starts at the branch, so it is not run for a block that
+a branch from outside enters.
 
 Each instruction's reads and writes come from its printed operands, checked against the repository
 decoder's spelling:
@@ -13963,9 +13972,10 @@ decoder's spelling:
 
 The block is still refused in these cases:
 - a definition that is live at the join;
-- any other exec write: exec set from a compare alone, restored from a mask saved before the block, or written
-  in a block with a branch or entered by one (a proven calculated `s_setpc_b64` jump counts), or restored through a 64-bit move, `s_or` or `s_xor` (the tracked copies name
-  registers, not which exec half they hold);
+- any other exec write: exec set from a compare alone, restored from a mask saved before the block or on only
+  some of the paths, written by a form the pass does not follow (`s_orn2`, `s_nand`, `s_nor`, `s_xnor`, `s_not`,
+  the other saveexec and wrexec forms), written in a block that a branch from outside enters (a proven
+  calculated `s_setpc_b64` jump counts), or restored from a copy of the other exec half;
 - an effect outside scalar registers, such as a scalar store or atomic, a barrier, `s_endpgm` or `v_writelane`;
 - a branch out of the block;
 - a backward `s_cbranch_execz`.
@@ -14012,6 +14022,9 @@ The runtime has no slot-67 path yet, so no translated compute program runs in th
   of the block's scalar statements must mismatch.
 - Case H nests an `s_and_saveexec`/`s_or` if inside such a block. Three lanes store two words, three more lanes
   store one word, and the rest store nothing. A control that drops the inner exec predicate must mismatch.
+- Case M is case H with an `if`/`else` in the block. Each arm has its own `s_cbranch_execz`, `s_andn2_b32` of
+  the saved mask switches to the else arm and `s_mov_b32` restores it. Three lanes store the first word, three
+  more the second, and the rest store nothing. A control that drops the switch to the else arm must mismatch.
 - Case K enters such a block only in group 1; in the other three groups the whole wave skips it. A control that
   runs the block for the skipped waves must mismatch.
 
@@ -14020,12 +14033,15 @@ for `cs_6_0`, and a plain D3D12 device dispatches it. The root signature is the 
 a root UAV and the root constants), so the manifest's table lines and the descriptor fetch are not exercised
 on the GPU. All 320 words are compared, including the sentinels. Four controls must each mismatch: swapping
 the X and Y group IDs, dropping the store, dropping case B's immediate offset, and dropping case C's exec
-predicate. Three more cover the execz cases: dropping a scalar statement in case J's block, dropping case H's
-inner exec predicate, and running case K's block for the skipped waves.
+predicate. Four more cover the execz cases: dropping a scalar statement in case J's block, dropping case H's
+inner exec predicate, running case K's block for the skipped waves, and dropping case M's switch to the else arm.
 
 The pure-Python controls cover:
 - accepted and refused execz blocks: a dead definition is accepted; a live scalar definition, SCC consumed
-  after the join, a nested block and a backward branch are refused;
+  after the join and a backward branch are refused;
+- exec writes in such a block: an `if`/`else` in both switch forms, a loop and a mask built from a zero literal
+  are accepted; a mask the loop body overwrites, a nonzero literal, an `s_or_saveexec` or `s_andn2_wrexec` source
+  from before the block, `s_orn2` and a copy of `exec_hi` are refused;
 - a modified descriptor word, an implicit-LOD sample and a misaligned immediate offset, all refused;
 - a store past the descriptor's range, which today translates with no range check.
 

@@ -497,44 +497,54 @@ def scalar_tokens(text):
     return out
 
 
-def is_exec(regs):
-    return regs in ({'exec'}, EXEC_KEYS)
+def mask_words(tok, count):
+    """The scalar state keys holding a mask operand's words, low word first ('0' for a zero literal), or None when
+    the operand is not `count` whole words of scalar state."""
+    if tok == '0':
+        return ['0'] * count
+    m = re.fullmatch(r's\[(\d+):(\d+)\]|s(\d+)|(vcc|exec)(_lo|_hi)?', tok)
+    if not m:
+        return None
+    if m.group(4):
+        words = {'_lo': [m.group(4)], '_hi': [m.group(4) + '_hi']}.get(m.group(5), [m.group(4), m.group(4) + '_hi'])
+    else:
+        words = ['s%d' % n for n in range(int(m.group(1) or m.group(3)), int(m.group(2) or m.group(3)) + 1)]
+    return words if len(words) == count else None
 
 
-def exec_stays_clear(name, asm, saved):
-    """True when an exec write cannot set the bit of a lane whose bit is clear: exec & x (s_and_saveexec, v_cmpx,
-    s_and or s_andn2 with exec as the kept operand), or exec | x, exec ^ x or a move of x where x is only ever a copy
-    of exec made inside the same skipped block (so x's bit is clear for that lane too)."""
+def clear_after(name, asm, may, clear):
+    """Forward step of the proof Stage.execz_refusals runs over a block that s_cbranch_execz skips. A fact (key, h)
+    says: for every lane of wave half h (0: lanes 0 to 31, 1: lanes 32 to 63) whose exec bit was clear at the branch,
+    that lane's bit of the scalar state word `key` is clear. Returns the facts after the instruction, given the
+    facts before it.
+
+    Only bitwise forms carry a fact, per word: a zero literal holds it for both halves; D = A & B holds what either
+    source holds; A | B and A ^ B what both hold; A & ~B and a move what A holds. A saveexec or wrexec form is its
+    operation on exec plus the copy it saves, and v_cmpx ANDs its result into exec. Any other write, a compare
+    result included, drops the facts of what it may write."""
     base = re.sub(r'_e(32|64)$', '', name)
     _, ops, _ = parse(asm)
-    if base.startswith(('s_and_saveexec', 'v_cmpx')):
-        return True
-    if not ops or not is_exec(scalar_tokens(ops[0])):
-        return False
-    srcs = [scalar_tokens(op) for op in ops[1:]]
-    # saved tracks register names, not which exec half was copied, so only a 32-bit restore is trusted
-    copies = lambda regs: bool(regs) and regs <= saved and base.endswith('32')
-    if base in ('s_and_b32', 's_and_b64'):
-        return any(is_exec(regs) for regs in srcs)
-    if base in ('s_andn2_b32', 's_andn2_b64'):
-        return bool(srcs) and is_exec(srcs[0])
-    if base in ('s_or_b32', 's_or_b64', 's_xor_b32', 's_xor_b64') and len(srcs) == 2:
-        return all(is_exec(regs) or copies(regs) for regs in srcs)
-    if base in ('s_mov_b32', 's_mov_b64') and len(srcs) == 1:
-        return copies(srcs[0])
-    return False
-
-
-def exec_copies_after(name, asm, saved, may):
-    """The registers that hold only copies of exec made in the block, after this instruction."""
-    base = re.sub(r'_e(32|64)$', '', name)
-    _, ops, _ = parse(asm)
-    dests = scalar_tokens(ops[0]) - EXEC_KEYS - {'scc'} if ops else set()
-    saved = saved - (may - EXEC_KEYS - {'scc'})
-    if base.startswith('s_and_saveexec') or (base in ('s_mov_b32', 's_mov_b64') and len(ops) == 2
-                                             and is_exec(scalar_tokens(ops[1]))):
-        saved |= dests
-    return saved
+    out = {fact for fact in clear if fact[0] not in may - EXEC_KEYS}
+    if base.startswith('v_cmpx'):
+        return out
+    halves = lambda word: {0, 1} if word == '0' else {h for key, h in clear if key == word}
+    m = re.fullmatch(r's_(mov|and|or|xor|andn2)(_saveexec|_wrexec)?_b(32|64)', base)
+    saving = m and m.group(2)
+    count = 2 if m and m.group(3) == '64' else 1
+    words = [mask_words(op, count) for op in ops] if m and not (saving and m.group(1) == 'mov') else [None]
+    if None in words or len(words) != (2 if saving or m.group(1) == 'mov' else 3):
+        return {fact for fact in out if fact[0] not in may}
+    dest, srcs = words[0], words[1:]
+    if saving:  # RDNA 2 ISA SOP1: the operation is S0 op EXEC, so andn2 is S0 & ~EXEC
+        srcs.append(['exec', 'exec_hi'][:count])
+    combine = {'and': set.union, 'or': set.intersection, 'xor': set.intersection}.get(m.group(1), lambda a, *b: a)
+    value = [combine(*(halves(src[j]) for src in srcs)) for j in range(count)]
+    writes = list(zip(dest, value))
+    if saving:  # saveexec keeps the old exec in D; wrexec writes the result to both
+        writes = list(zip(('exec', 'exec_hi'), value)) + (writes if saving == '_wrexec' else
+                                                          [(word, halves(old)) for word, old in zip(dest, srcs[-1])])
+    out = {fact for fact in out if fact[0] not in dict(writes)}
+    return out | {(word, h) for word, held in writes for h in held}
 
 
 def scalar_effects(name, asm):
@@ -1422,23 +1432,26 @@ class Stage:
         model skips the block for an inactive lane. That lane can differ from the wave only by reading, after the
         join, scalar state the block defines (no lane active means the wave skipped the block too). The block is
         therefore accepted unchanged when every scalar register, mask and SCC it may define is dead where it joins,
-        and it has no effect outside scalar registers and no branch out of it. An exec write is accepted in a
-        straight-line block (no branch in it, none into it) when it cannot set the bit of a lane whose bit is clear
-        (exec_stays_clear): such a lane's bit is clear on entry, so the wave leaves it clear and its exec at the
-        join is the model's. A live definition, another exec write, a refused effect, a branch leaving the block
-        or a backward s_cbranch_execz is refused."""
+        and it has no effect outside scalar registers and no branch out of it. An exec write is accepted when it
+        cannot set the bit of a lane whose bit was clear at the branch: clear_after carries, over every path through
+        the block (its branches and loops included), which masks have that lane's bit clear, and the write must
+        leave exec among them. Such a lane's bit then stays clear at every instruction the wave runs in the block,
+        so the wave changes nothing of that lane there and its exec at the join is the model's. The proof starts at
+        the branch, so a block that a branch from outside enters keeps its exec writes refused. A live definition,
+        an unproven exec write, a refused effect, a branch leaving the block or a backward s_cbranch_execz is
+        refused."""
         offsets = [ins[0] for ins in self.ins]
         index = {off: i for i, off in enumerate(offsets)}
         effects = [scalar_effects(name, asm) for _, _, name, asm in self.ins]
         succ = []
-        targets = []  # every branch target, the proven calculated s_setpc_b64 ones included
+        jumps = []  # (instruction, target) of every branch, the proven calculated s_setpc_b64 ones included
         for i, (off, n, name, asm) in enumerate(self.ins):
             to = int(parse(asm)[1][0].split('_')[1], 16) if name.startswith(('s_cbranch', 's_branch')) else None
             if name == 's_setpc_b64':  # a proven calculated jump reaches its target
                 to = getattr(self, 'calculated_pc', {}).get(off)
             nxt = [i + 1] if i + 1 < len(self.ins) and name not in ('s_branch', 's_endpgm') else []
             if to is not None:
-                targets.append(to)
+                jumps.append((i, to))
             succ.append(nxt + ([index[to]] if to in index else []))
         live_in = [set() for _ in self.ins]
         changed = True
@@ -1459,11 +1472,19 @@ class Stage:
                 refused.setdefault(off, 's_cbranch_execz to a block before it')
                 continue
             live = live_in[t] | {'m0'}  # m0 is also read implicitly; treat it as live
-            saved = set()  # registers whose every write in the block so far is a copy of exec
-            # The copies are tracked in program order, which is every path only in a straight-line block: no branch
-            # in it and no branch into it. Elsewhere an exec write is refused.
-            straight = not any(self.ins[k][2].startswith(('s_cbranch', 's_branch')) for k in range(b + 1, t)) and \
-                not any(index.get(target) in range(b + 1, t) for target in targets)
+            # Facts before each instruction the wave can reach from the branch: the largest sets every path keeps.
+            entry = frozenset({('exec', 0), ('exec_hi', 1)})
+            before = {b + 1: entry} if b + 1 < t else {}
+            entered = any(index.get(target) in range(b + 1, t) for k, target in jumps if not b < k < t)
+            changed = not entered
+            while changed:
+                changed = False
+                for i in range(b + 1, t):
+                    if i in before:
+                        after = frozenset(clear_after(*self.ins[i][2:], effects[i][2], before[i])) | entry
+                        for s in succ[i]:
+                            if b < s < t and before.get(s, after) & after != before.get(s):
+                                before[s], changed = before.get(s, after) & after, True
             for i in range(b + 1, t):
                 at, _, inner, inner_asm = self.ins[i]
                 may = effects[i][2]
@@ -1473,11 +1494,11 @@ class Stage:
                 elif inner.startswith(('s_cbranch', 's_branch')) and not (
                         b < index.get(int(parse(inner_asm)[1][0].split('_')[1], 16), -1) <= t):
                     reason = 'branch out of the block'
-                elif may & EXEC_KEYS and not (straight and exec_stays_clear(inner, inner_asm, saved)):
+                elif may & EXEC_KEYS and (entered or i in before and
+                                          not entry <= clear_after(inner, inner_asm, may, before[i])):
                     reason = 'exec write'
                 elif (may - EXEC_KEYS) & live:
                     reason = 'definition of %s, live where the block joins' % ', '.join(sorted((may - EXEC_KEYS) & live))
-                saved = exec_copies_after(inner, inner_asm, saved, may)
                 if reason:
                     refused.setdefault(at, '%s inside a block s_cbranch_execz skips per lane: %s' % (inner, reason))
         return refused
