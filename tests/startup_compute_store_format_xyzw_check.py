@@ -108,6 +108,9 @@ uint soff, uint imm_off, uint4 v) {
     uint elem_bytes = (fmt == 75u || fmt == 77u) ? 16u : fmt == 71u ? 8u : (fmt == 50u || fmt == 56u) ? 4u : 0u;
     if (elem_bytes == 0u) return;
 BOUNDS    if ((addr & 3u) != 0u) return;
+    uint uav_bytes = 0u;
+    buf.GetDimensions(uav_bytes);
+    if (uav_bytes < elem_bytes || addr > uav_bytes - elem_bytes) return;
     if (elem_bytes == 16u) {
         buf.Store4(addr, v);
     } else if (fmt == 71u) {
