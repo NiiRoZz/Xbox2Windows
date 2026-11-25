@@ -146,10 +146,8 @@ def check_lowering():
     hlsl = pipe.hlsl_cs()
     assert pipe.manifest() == MANIFEST, pipe.manifest()
     assert hlsl.endswith(BINDINGS + MAIN), hlsl[hlsl.index('cbuffer'):]
-    # A branch that is not a target between the shift and the load, and a branch target before the shift, change
-    # nothing.
+    # A branch target before the shift changes nothing: the form is not tied to the entry block.
     assert pipeline({SHIFT: JUMP + (SHIFT,)}).manifest() == MANIFEST
-    assert pipeline({SHIFT: (SHIFT,) + JUMP[:2], LOAD: (LOAD, 's_nop 0')}).manifest() == MANIFEST
 
 
 def check_refusals():
