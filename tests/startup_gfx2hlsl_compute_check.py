@@ -1291,18 +1291,20 @@ def check_controls():
     }
 }
 ''')
-    # Refused: X not clear (the mask saved before the block), another write of s0 in the block, a copy and a data
-    # read after the join, and a block that a branch from outside enters (the fact is not proven there).
+    # Refused: X not clear (the mask saved before the block), another write of s0 in the block, alone or after the
+    # narrowing, a copy and a data read after the join, and a block that a branch from outside enters (the fact is
+    # not proven there).
     kept = ' inside a block s_cbranch_execz skips per lane: definition of s0, live where the block joins: read by %s ' \
            'after the join'
     for prefix, body, join, inner, name in (
             ([], ['s_andn2_b32 s0, s0, s21'], [], 's_andn2_b32', 's_mov_b32'),
             ([], ['s_mov_b32 s0, 4'], [], 's_mov_b32', 's_mov_b32'),
+            ([], ['s_andn2_b32 s0, s0, exec_lo', 's_mov_b32 s0, 4'], [], 's_andn2_b32', 's_mov_b32'),
             ([], ['s_andn2_b32 s0, s0, exec_lo'], ['s_mov_b32 s1, s0'], 's_andn2_b32', 's_mov_b32'),
             ([], ['s_andn2_b32 s0, s0, exec_lo'], ['s_add_u32 s23, s0, 1'], 's_andn2_b32', 's_add_u32'),
             (['s_cbranch_scc1 1'], ['s_andn2_b32 s0, s0, exec_lo'], [], 's_andn2_b32', 's_mov_b32')):
         refused(inner + kept % name, lambda prefix=prefix, body=body, join=join: translate('A', code=splice(
-            *save, *prefix, 's_cbranch_execz 1', *body, *join, 's_mov_b32 exec_lo, s0', *leave)).hlsl_cs())
+            *save, *prefix, 's_cbranch_execz %d' % len(body), *body, *join, 's_mov_b32 exec_lo, s0', *leave)).hlsl_cs())
     # The rule's steps on their own: the halves a write keeps, and the reads that keep the lane's bit.
     for line, word, clear, halves in (('s_andn2_b32 s0, s0, exec_lo', 's0', start, {0}),
                                       ('s_andn2_b64 s[0:1], s[0:1], exec', 's1', start, {1}),
@@ -1456,8 +1458,6 @@ CONTROL_MISMATCH = {
     'l-byte-offset': 'word=0 expected=0000603e actual=00003e1f',
     'l-swizzle': 'word=5 expected=3f800000 actual=00000000',
     'l-integer-one': 'word=2 expected=00000001 actual=3f800000',
-    'n-unmasked': 'word=6 expected=c5c5c5c5 actual=01234561',
-    'o-mask-kept': 'word=0 expected=c5c5c5c5 actual=01234567',
 }
 
 
