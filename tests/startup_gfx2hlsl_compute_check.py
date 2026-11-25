@@ -4,7 +4,7 @@
   binary <llvm-mc>                                reassemble the fixture sources and compare them with the words below
   dispatch <dxc> <offscreen_check> <warp|hardware>
                                                   translate, compile with DXC cs_6_0, dispatch and compare every word
-  control <swapped-axes|dropped-store> <dxc> <offscreen_check> <warp|hardware>
+  control <swapped-axes|dropped-store|b-offset|c-unpredicated> <dxc> <offscreen_check> <warp|hardware>
                                                   the same dispatch with a mutated translation, which must mismatch
 
 The fixtures are source-built gfx1013 compute programs. The root signature puts two root constants (key, stride)
@@ -15,12 +15,16 @@ reads the read buffer at that index and stores to its own destination:
 
 - case A enables all three group-ID axes and v0-v2, with group size 2x3x4 and 3x2x2 groups, and stores one word;
 - case B enables X and Z only (Y omitted, so Z is s8), v0-v1, group size 5x2x1 and 4x1x3 groups, and stores two
-  words at an immediate offset of 8 bytes.
+  words at an immediate offset of 8 bytes;
+- case C enables Y only (s7), v0 only, group size 8x1x1 and 1x5x1 groups, stores four words with every lane, then
+  three words at offset 16 under an exec mask set from a compare (lanes with tid.x < 6), and restores exec.
 
-The dispatch runs on a plain D3D12 device (the stand-in has no slot-67 path yet): root SRV t0 (read buffer), root
-UAV u0 (writable buffer) and 16 root constants at b0, which match the translation's r0, u0 and entry cbuffer.
-All 320 words are compared, so a word outside the written records must keep the sentinel. The controls swap the
-X and Y group IDs at entry or drop the store; either must change the readback.
+The dispatch runs on a plain D3D12 device (the stand-in has no slot-67 path yet). The root signature is the runner's:
+root SRV t0 (read buffer), root UAV u0 (writable buffer) and 16 root constants at b0, which match the translation's
+r0, u0 and entry cbuffer. The manifest's table lines and the descriptor fetch are therefore not exercised on the GPU.
+All 320 words are compared, so a word outside the written records must keep the sentinel. The controls swap the X
+and Y group IDs at entry, drop the store, drop case B's immediate offset, or drop case C's exec predicate; each must
+change the readback.
 """
 import struct
 import subprocess
@@ -98,11 +102,69 @@ WORDS_B = bytes.fromhex(
     '1406064a' '83060834' '82060e34' '001030e007050380' '060069d5030b0000' '040c0c4a' '703f8cbf' '050d0a3a'
     'ff060c3a0000005a' '081074e004050480' '000081bf')
 
+SOURCE_C = """\
+s_mov_b32 s10, s6
+s_mov_b32 s11, 0
+s_load_dwordx8 s[12:19], s[10:11], 0x0
+s_waitcnt lgkmcnt(0)
+s_lshl_b32 s20, s7, 3
+v_add_nc_u32 v3, s20, v0
+v_lshlrev_b32 v7, 2, v3
+buffer_load_dword v8, v7, s[12:15], 0 offen
+v_mul_u32_u24 v4, 28, v3
+v_mov_b32 v9, v3
+v_mul_lo_u32 v10, v3, s5
+v_add_nc_u32 v10, s4, v10
+s_waitcnt vmcnt(0)
+v_xor_b32 v11, v8, v10
+buffer_store_dwordx4 v[8:11], v4, s[16:19], 0 offen
+s_mov_b32 s21, exec_lo
+v_cmp_gt_u32 vcc_lo, 6, v0
+s_mov_b32 exec_lo, vcc_lo
+buffer_store_dwordx3 v[8:10], v4, s[16:19], 0 offen offset:16
+s_mov_b32 exec_lo, s21
+s_endpgm
+"""
+WORDS_C = bytes.fromhex(
+    '06038abe' '80038bbe' '05030cf4000000fa' '7fc08cbf' '0783148f' '1400064a' '82060e34' '001030e007080380'
+    '9c060816' '0303127e' '0a0069d5030b0000' '0414144a' '703f8cbf' '0815163a' '001078e004080480' '7e0395be'
+    '8600887d' '6a03febe' '10107ce004080480' '1503febe' '000081bf')
+
 CASES = {
     # name: (source, words, rsrc2, group size, group counts)
     'A': (SOURCE_A, WORDS_A, USER7 | TGID_X | TGID_Y | TGID_Z | tidig(3), (2, 3, 4), (3, 2, 2)),
     'B': (SOURCE_B, WORDS_B, USER7 | TGID_X | TGID_Z | tidig(2), (5, 2, 1), (4, 1, 3)),
+    'C': (SOURCE_C, WORDS_C, USER7 | TGID_Y | tidig(1), (8, 1, 1), (1, 5, 1)),
 }
+
+# Single instructions the controls splice into case A before its store, recorded from llvm-mc 15.
+STORE_A = WORDS_A.index(bytes.fromhex('001070e004050480'))
+SPLICE = {
+    's_mov_b32 s18, 0': '800392be',
+    's_or_b32 s17, s17, 0x40000': '11ff118800000400',
+    's_and_b32 s18, s18, 0xffff': '12ff1287ffff0000',
+    's_mov_b32 s18, 4': '840392be',
+    'v_cmp_gt_u32 vcc_lo, 1, v0': '8100887d',
+    's_and_saveexec_b32 s0, vcc_lo': '6a3c80be',
+    's_cbranch_execz 1': '010088bf',
+    's_add_u32 s20, s7, 1': '07811480',
+    's_or_b32 exec_lo, exec_lo, s0': '7e007e88',
+    'v_mov_b32 v5, s20': '14020a7e',
+    's_mov_b32 s21, exec_lo': '7e0395be',
+    's_mov_b32 exec_lo, vcc_lo': '6a03febe',
+    's_mov_b32 exec_lo, s21': '1503febe',
+    's_mov_b64 s[20:21], 0': '800494be',
+    's_mov_b64 s[22:23], 0': '800496be',
+    's_load_dwordx8 s[24:31], s[10:11], 0x40': '05060cf4400000fa',
+    'image_sample v[12:15], v[0:1], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D': '080f80f0000ca600',
+    'image_sample_lz v[12:15], v[0:1], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D': '080f9cf0000ca600',
+    'buffer_store_dword v5, v4, s[16:19], 0 offen': '001070e004050480',
+    'buffer_store_dword v5, v4, s[16:19], 0 offen offset:6': '061070e004050480',
+}
+
+
+def splice(*lines, at=STORE_A):
+    return WORDS_A[:at] + b''.join(bytes.fromhex(SPLICE[line]) for line in lines) + WORDS_A[at:]
 
 
 def root_blob():
@@ -132,6 +194,12 @@ def expected(name):
                             if name == 'A':
                                 i = (gx + 3 * gy + 6 * gz) * 24 + tx + 2 * ty + 6 * tz
                                 out[i] = ((input_word(i) * 33) & MASK) ^ ((KEY + i * STRIDE) & MASK)
+                            elif name == 'C':
+                                i = gy * 8 + tx
+                                record = [input_word(i), i, (KEY + i * STRIDE) & MASK]
+                                out[7 * i:7 * i + 4] = record + [record[0] ^ record[2]]
+                                if tx < 6:
+                                    out[7 * i + 4:7 * i + 7] = record
                             else:
                                 i = (gx + 4 * gz) * 10 + tx + 5 * ty
                                 out[2 + 2 * i] = input_word(i) ^ ((KEY + i * STRIDE) & MASK)
@@ -197,12 +265,50 @@ def check_controls():
                            ('005070e004050480', 'modifier glc'),           # glc offen
                            ('001070e004050380', 'used for a load and a store')):  # store through the read descriptor
         refused(fragment, lambda w=word: translate('A', code=patch(WORDS_A, store, w)).hlsl_cs())
-    refused('buffer store in the ps stage', lambda: G.Stage.op_buffer_store_dword(
-        type('P', (), {'kind': 'ps'})(), ['v5', 'v4', 's[16:19]', '0'], ['offen']))
+    # Graphics stages keep the unknown-op refusal text, so refusal census buckets do not move.
+    for count, text in ((1, 'buffer_store_dword'), (4, 'buffer_store_dwordx4')):
+        try:
+            G.Stage.op_buffer_store_dword(type('P', (), {'kind': 'ps'})(), ['v5', 'v4', 's[16:19]', '0'], ['offen'], count)
+        except G.Unsupported as reason:
+            assert str(reason) == text, str(reason)
+        else:
+            raise AssertionError('graphics store accepted')
     # A register soffset is added to the address.
     hlsl = translate('A', code=patch(WORDS_A, store, '001070e004050414')).hlsl_cs()
     assert '    a = (v4 + s20 + 0) & 0xfffffffcu;' in hlsl.splitlines(), hlsl
-    print('compute entry, numthreads, manifest, offen store forms and 9 refusals pass')
+    # An immediate offset that is not a multiple of 4 is refused, not rounded down.
+    refused('unaligned immediate offset 6', lambda: translate(
+        'A', code=patch(WORDS_A, store, SPLICE['buffer_store_dword v5, v4, s[16:19], 0 offen offset:6'])).hlsl_cs())
+    # Descriptor words: a word that is overwritten, moved or modified before the store refuses it, including a word
+    # that is not the first of its s_load and a constant move. Each input below was accepted before.
+    for lines in (['s_mov_b32 s18, 0'], ['s_or_b32 s17, s17, 0x40000'], ['s_and_b32 s18, s18, 0xffff'],
+                  ['buffer_store_dword v5, v4, s[16:19], 0 offen', 's_mov_b32 s18, 4']):
+        refused('modified descriptor', lambda lines=lines: translate('A', code=splice(*lines)).hlsl_cs())
+    # The modification is recorded for the descriptor the word belongs to (byte 16 of the x8 load), not for the
+    # load's first descriptor: loads through the read descriptor at byte 0 are unaffected.
+    refusals = []
+    pipe = G.ComputePipeline(splice('s_and_b32 s18, s18, 0xffff'), root_blob(), CASES['A'][2], (2, 3, 4), refusals=refusals)
+    assert pipe.modified == {(('table', 1), 16)}, pipe.modified
+    assert [G.normalize_refusal(r) for r, _ in refusals] == ['buffer store through a modified descriptor'], refusals
+    # A scalar write in a block s_cbranch_execz skips: the wave runs it when any lane is active, so a per-lane skip
+    # would store 0 for inactive lanes. Refused with exec from a plain move and in the saveexec form.
+    for lines in (['s_mov_b32 s21, exec_lo', 'v_cmp_gt_u32 vcc_lo, 1, v0', 's_mov_b32 exec_lo, vcc_lo',
+                   's_cbranch_execz 1', 's_add_u32 s20, s7, 1', 's_mov_b32 exec_lo, s21', 'v_mov_b32 v5, s20'],
+                  ['v_cmp_gt_u32 vcc_lo, 1, v0', 's_and_saveexec_b32 s0, vcc_lo', 's_cbranch_execz 1',
+                   's_add_u32 s20, s7, 1', 's_or_b32 exec_lo, exec_lo, s0', 'v_mov_b32 v5, s20']):
+        refused('s_add_u32 inside a block s_cbranch_execz skips', lambda lines=lines: translate(
+            'A', code=splice(*lines)).hlsl_cs())
+    # The same block without the branch translates: the scalar write then runs for every lane.
+    translate('A', code=splice('s_mov_b32 s21, exec_lo', 'v_cmp_gt_u32 vcc_lo, 1, v0', 's_mov_b32 exec_lo, vcc_lo',
+                               's_add_u32 s20, s7, 1', 's_mov_b32 exec_lo, s21', 'v_mov_b32 v5, s20')).hlsl_cs()
+    # An implicit-LOD sample has no derivatives in a compute lane; the level-zero form translates.
+    load = ('s_mov_b64 s[20:21], 0', 's_mov_b64 s[22:23], 0', 's_load_dwordx8 s[24:31], s[10:11], 0x40')
+    sample = 'image_sample v[12:15], v[0:1], s[24:31], s[20:23] dmask:0xf dim:SQ_RSRC_IMG_2D'
+    refused('image_sample with implicit LOD', lambda: translate('A', code=splice(*load, sample)).hlsl_cs())
+    lz = translate('A', code=splice(*load, sample.replace('image_sample', 'image_sample_lz'))).hlsl_cs()
+    assert '.SampleLevel(' in lz, lz
+    print('compute entry, numthreads, manifest, offen store forms and the store, descriptor, execz and sample '
+          'refusals pass')
 
 
 def assemble(llvm_mc, source):
@@ -214,15 +320,25 @@ def check_binary(llvm_mc):
     for name, (source, words, *_rest) in CASES.items():
         built = assemble(llvm_mc, source)
         assert built == words, '%s: assembled %s, recorded %s' % (name, built.hex(), words.hex())
+    for line, words in SPLICE.items():
+        built = assemble(llvm_mc, line + '\n').hex()
+        assert built == words, '%s: assembled %s, recorded %s' % (line, built, words)
     print('fixture words match llvm-mc')
 
 
+# control -> (case, text the translation must contain once, replacement)
+CONTROLS = {
+    'swapped-axes': ('A', '    s7 = gid.x;\n    s8 = gid.y;\n', '    s7 = gid.y;\n    s8 = gid.x;\n'),
+    'dropped-store': ('A', '    u0.Store(a, v5);\n', ''),
+    'b-offset': ('B', '    a = (v4 + 8) & 0xfffffffcu;\n', '    a = (v4 + 0) & 0xfffffffcu;\n'),
+    'c-unpredicated': ('C', 'if (exec & 1) u0.Store3(', 'u0.Store3('),
+}
+
+
 def mutate(hlsl, control):
-    if control == 'swapped-axes':
-        assert '    s7 = gid.x;\n    s8 = gid.y;\n' in hlsl
-        return hlsl.replace('    s7 = gid.x;\n    s8 = gid.y;\n', '    s7 = gid.y;\n    s8 = gid.x;\n')
-    assert control == 'dropped-store' and hlsl.count('u0.Store(') == 1
-    return hlsl.replace('    u0.Store(a, v5);\n', '')
+    _, old, new = CONTROLS[control]
+    assert hlsl.count(old) == 1, (control, hlsl)
+    return hlsl.replace(old, new)
 
 
 def run_case(name, dxc, runner, adapter, directory, control=None):
@@ -244,7 +360,7 @@ def check_dispatch(dxc, runner, adapter, control=None):
     out = HERE.parent / 'out'
     out.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
-        for name in (('A',) if control else CASES):
+        for name in ((CONTROLS[control][0],) if control else CASES):
             run = run_case(name, dxc, runner, adapter, Path(tmp), control)
             print(run.stdout, end='')
             if run.returncode == 77:

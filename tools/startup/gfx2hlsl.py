@@ -396,6 +396,16 @@ def reg_range(tok):
     return None
 
 
+# Scalar instructions with no scalar or exec effect, allowed inside a compute block s_cbranch_execz skips.
+SKIPPABLE_SCALAR = ('s_waitcnt', 's_nop', 's_inst_prefetch', 's_clause', 's_cbranch_', 's_branch')
+
+
+def desc_key(sym):
+    """Resource key of the descriptor a ('desc', source, load offset, dword) word belongs to: the key descriptor()
+    gives its first word, so a write into a later descriptor of a wide load marks that descriptor."""
+    return sym[1], None if sym[2] is None else sym[2] + 4 * (sym[3] & ~3)
+
+
 def smem_offset(tok):
     """The SMEM offset operand as a token: 'off' (no offset operand) is the literal 0, anything else unchanged."""
     return '0' if tok == 'off' else tok
@@ -461,7 +471,9 @@ class Stage:
     # ---- entry state ---------------------------------------------------------------------
     def setup_entry(self):
         root = self.pipe.root
-        # Compute root parameters start at s4 (s0-s3 are not modelled); graphics stages start at s8.
+        # Graphics root parameters start at s8. For compute, s4 is an inference, not a documented layout: the only
+        # in-repo evidence is a local compute-record scan whose table bindings used s4 or s5 (docs/experiments.md).
+        # s0-s3 are not modelled.
         reg = 4 if self.kind == 'cs' else 8
         for index, p in enumerate(root['params']):
             if p['type'] == 0:
@@ -492,9 +504,10 @@ class Stage:
             self.sym[reg] = ('const', 0)  # primitive mask: only ever moved to m0
 
     def setup_compute_entry(self, root_end):
-        """Entry registers of a compute wave (compute_store_aot.entry_registers): the user SGPRs, then one SGPR per
-        enabled group-ID axis (SV_GroupID), and v0..v2 holding SV_GroupThreadID. User SGPRs the root signature does
-        not place (s0-s3 and any past the root's span) have no known value, so any numeric read of them is refused."""
+        """Entry registers of a compute wave as compute_store_aot.entry_registers (#1608) gives them: the user SGPRs,
+        then one SGPR per enabled group-ID axis (SV_GroupID), and v0..v2 holding SV_GroupThreadID. Where the root
+        parameters sit inside the user SGPRs (from s4) is this translator's inference. User SGPRs the root does not
+        place (s0-s3 and any past the root's span) have no known value, so any numeric read of them is refused."""
         user, groups, threads = self.pipe.entry
         if root_end > user:
             raise Unsupported('root signature needs s4-s%d, COMPUTE_PGM_RSRC2 gives %d user SGPRs' % (root_end - 1, user))
@@ -707,9 +720,13 @@ class Stage:
     # ---- instruction translation -------------------------------------------------------------
     def translate(self):
         targets = set()
+        skipped = []  # compute: (branch, target) of each s_cbranch_execz
         for off, n, name, asm in self.ins:
             if name.startswith('s_cbranch') or name == 's_branch':
-                targets.add(int(parse(asm)[1][0].split('_')[1], 16))
+                target = int(parse(asm)[1][0].split('_')[1], 16)
+                targets.add(target)
+                if name == 's_cbranch_execz' and self.kind == 'cs':
+                    skipped.append((off, target))
         self.blocks = []          # (offset, [lines], terminator)
         self.uniform_v = set()
         self.varying_s = set()
@@ -723,6 +740,12 @@ class Stage:
                 self.lines, start = [], off
             self.pc = off
             try:
+                if any(branch < off < target or target <= off < branch for branch, target in skipped) and (
+                        name.startswith(('s_', 'v_readlane', 'v_readfirstlane', 'v_writelane'))
+                        and not name.startswith(SKIPPABLE_SCALAR)):
+                    # The wave runs this block when any lane is active, so its scalar state changes for every
+                    # lane; the one-lane model would skip it for an inactive lane.
+                    raise Unsupported('%s inside a block s_cbranch_execz skips per lane' % name)
                 term = self.one(name, asm)
             except Unsupported as reason:
                 if refusals is None:
@@ -1089,7 +1112,10 @@ class Stage:
                             self.varying_s.add(d + 1)
             elif own and own[0] in ('desc', 'ptr', 'ptrhi') and any(s == own for s in syms):
                 if own[0] == 'desc':
-                    self.pipe.modified.add((own[1], own[2]))
+                    self.pipe.modified.add(desc_key(own))
+                    # The word keeps its descriptor identity for loads; an exact-word check (unmodified_descriptor)
+                    # sees the mark.
+                    self.sym[d] = own[:4] + ('modified',)
             else:
                 self.sym[d] = ('descnum',)
             return None
@@ -1551,10 +1577,10 @@ class Stage:
     def op_buffer_store_dword(self, ops, mods, count=1):
         # Compute-stage store in the offen form: per-lane byte VGPR plus the scalar offset and the 12-bit immediate,
         # through a descriptor read from a fixed root-table slot, to a RWByteAddressBuffer (manifest `uav` line).
-        # Like the loads, this assumes a raw descriptor (no swizzle or stride) and that the runtime sizes the view
-        # to the descriptor's range, so an out-of-range store is dropped on both sides.
+        # Like the loads, this assumes a raw descriptor (no swizzle or stride). Out-of-range stores: assumes a future
+        # runtime sizes the view to the descriptor's range so both sides drop them; nothing binds or checks that yet.
         if self.kind != 'cs':
-            raise Unsupported('buffer store in the %s stage' % self.kind)
+            raise Unsupported('buffer_store_dword' + ('x%d' % count if count > 1 else ''))  # the unknown-op refusal
         offset = 0
         for m in mods:
             if m.startswith('offset:') and re.fullmatch(r'0x[0-9a-f]+|\d+', m[7:]):
@@ -1568,11 +1594,16 @@ class Stage:
             raise Unsupported('buffer store data %s' % ops[0])
         if not vaddr or vaddr[0] != 'v' or vaddr[1] != vaddr[2] or vaddr[1] > 255:
             raise Unsupported('buffer store vaddr %s for offen' % ops[1])
-        key = self.descriptor(ops[2])
-        if key[0][0] != 'table' or key[1] is None:
-            raise Unsupported('buffer store through %s' % (key,))
-        if key in self.pipe.modified:
+        # All four words must still be the loaded words of one descriptor at a fixed table offset: a moved,
+        # overwritten or modified word (stride, num_records) would change what the store does.
+        rsrc = reg_range(ops[2])
+        first = self.sym.get(rsrc[1]) if rsrc and rsrc[0] == 's' and rsrc[2] - rsrc[1] == 3 else None
+        if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 4:
+            raise Unsupported('buffer store through %s holding %s' % (ops[2], first))
+        if (any(self.sym.get(rsrc[1] + k) != first[:3] + (first[3] + k,) for k in range(4))
+                or desc_key(first) in self.pipe.modified):
             raise Unsupported('buffer store through a modified descriptor')
+        key = desc_key(first)
         terms = [self.u(ops[1])]
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
             offset += int(ops[3], 0)
@@ -1581,11 +1612,13 @@ class Stage:
             if not sreg or sreg[0] != 's' or sreg[1] != sreg[2] or sreg[1] > 105:
                 raise Unsupported('buffer soffset %s' % ops[3])
             terms.append(self.S(sreg[1]))
+        if offset % 4:
+            raise Unsupported('buffer store at unaligned immediate offset %d' % offset)
         uav = self.pipe.uav(key)
         words = [self.u('v%d' % n) for n in range(src[1], src[2] + 1)]
         data = words[0] if count == 1 else 'uint%d(%s)' % (count, ', '.join(words))
-        # shortcut: Store* needs a multiple of four, so a misaligned address is rounded down (dword buffer access is
-        # assumed to ignore the low two bits); refuse misaligned addresses instead if a program depends on them.
+        # Store* needs a multiple of four. As in #2059, the run-time part (VGPR and register soffset) is rounded down:
+        # an assumption that a dword access ignores the low two address bits, not a measurement.
         self.emit('a = (%s + %d) & 0xfffffffcu;' % (' + '.join(terms), offset))
         store = '%s.Store%s(a, %s);' % (uav, '' if count == 1 else count, data)
         self.emit(store if self.exec_known else 'if (exec & 1) %s' % store)
@@ -1723,6 +1756,9 @@ class Stage:
                 uv = 'float3(%s, %s, %s)' % (self.f(cs[0]), self.f(cs[1]), self.f(cs[2]))
             else:
                 uv = 'float2(%s, %s)' % (self.f(cs[0]), self.f(cs[1]))
+            if how == 'sample' and self.kind == 'cs':
+                # A compute lane has no pixel quad to supply derivatives; level 0 would be a guess.
+                raise Unsupported('image_sample with implicit LOD in a compute program')
             if how == 'l':
                 call = '%s.SampleLevel(%s, %s, %s)' % (tex, smp, uv, self.f(lod))
             elif how == 'lz' or not self.exec_known or self.kind != 'ps' or len(self.blocks) > 0:
@@ -2700,7 +2736,8 @@ class Pipeline:
 
 class ComputePipeline(Pipeline):
     """One compute program with the root and resource model of Pipeline. COMPUTE_PGM_RSRC2 and the thread group
-    size are pipeline register state the caller supplies; their meaning follows compute_store_aot (#1608)."""
+    size are pipeline register state the caller supplies; COMPUTE_PGM_RSRC2 is decoded as compute_store_aot does
+    (#1608). Root parameters from s4 are an inference (see Stage.setup_entry)."""
 
     def __init__(self, cs_code, root_blob, rsrc2, group, sampler_heap=None, refusals=None, decoded=None):
         from compute_store_aot import checked_group, entry_registers
