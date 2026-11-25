@@ -61,6 +61,7 @@
 #include "descriptor_heap_type.h"
 #include "small_texture_4k.h"
 #include "null_binding_cause.h"
+#include "root_constant_store.h"
 #include "null_texture_view.h"
 #include "packed_target_format.h"
 #include "present_view_format.h"
@@ -2249,8 +2250,10 @@ struct Pass {
     x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     u64 root_address[16] = {};       // title address of each root descriptor
-    std::uint32_t constants[16][8] = {};
+    x2w_root_constants::Store constants;          // graphics root constants (slot 40)
     unsigned char constant_words_bound[16] = {};
+    x2w_root_constants::Store compute_constants;  // compute root constants (slots 37 and 39)
+    Wrapper* compute_root_wrapper = nullptr;      // compute root signature last set by slot 33
     D3D12_VERTEX_BUFFER_VIEW vb[8] = {};
     PlacedVertexView placed_vb[8] = {};
     D3D12_INDEX_BUFFER_VIEW ib = {};
@@ -2439,6 +2442,9 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     if (!list) return;
     Wrapper* w = as_wrapper(root);
     Pass& pass = pass_of(self);
+    // A different root signature invalidates the title's cached compute root arguments.
+    if (pass.compute_root_wrapper != w) pass.compute_constants.clear();
+    pass.compute_root_wrapper = w;
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
     pass.compute_tables.set_signature(w ? root_info(w) : nullptr);  // a different signature leaves no table bound
@@ -2815,7 +2821,7 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
                 list->SetGraphicsRootShaderResourceView(srv, inputs[0].resource->GetGPUVirtualAddress() + inputs[0].offset);
             for (UINT i = 0; i < pass.root->size(); ++i) {
                 if (i == srv) continue;
-                list->SetGraphicsRoot32BitConstants(i, (*pass.root)[i].constants_count, pass.constants[i], 0);
+                list->SetGraphicsRoot32BitConstants(i, (*pass.root)[i].constants_count, pass.constants.words[i], 0);
             }
         }
     }
@@ -2859,7 +2865,7 @@ void __stdcall list_graphics_root(Wrapper* self, void* root)
     if (pass.root != params) {
         for (auto& table : pass.view_tables) table = {};
         std::fill_n(pass.root_address, 16, 0);
-        std::memset(pass.constants, 0, sizeof(pass.constants));
+        pass.constants.clear();
         std::memset(pass.constant_words_bound, 0, sizeof(pass.constant_words_bound));
     }
     pass.root = params;
@@ -5004,6 +5010,8 @@ void build_tables()
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
         list_typed[35] = reinterpret_cast<ListTyped>(&list_compute_table);
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);
+        list_typed[37] = reinterpret_cast<ListTyped>(&list_compute_constant);
+        list_typed[39] = reinterpret_cast<ListTyped>(&list_compute_constants);
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);
         list_typed[48] = reinterpret_cast<ListTyped>(&list_vertex_buffers);
