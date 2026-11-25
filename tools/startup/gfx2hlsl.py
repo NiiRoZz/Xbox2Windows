@@ -582,6 +582,12 @@ def scalar_registers(text):
     return out
 
 
+def reads_scc(name, asm):
+    # LLVM AMDGPU SOPInstructions.td lists implicit SCC uses. Cover each supported family here
+    # (s_cmov includes s_cmovk_i32) so both the calculated-PC and descriptor checks see new readers.
+    return 'src_scc' in asm or name.startswith(('s_cbranch_scc', 's_cmov', 's_cselect', 's_addc', 's_subb'))
+
+
 def calculated_pc_proof(ins, kind):
     """Return offset -> target for proven SETPCs, and offset -> None for their address arithmetic.
 
@@ -728,7 +734,7 @@ def calculated_pc_proof(ins, kind):
             for reg in maybe_written:
                 definitions.pop(reg, None)
             if scc is not None:
-                if ('src_scc' in asm or name.startswith(('s_cbranch_scc', 's_cmov', 's_cselect', 's_addc', 's_subb'))):
+                if reads_scc(name, asm):
                     refuse(off, 'calculated PC SCC escapes into %s' % name)
                 # These comparisons always emit a replacement SCC (or refuse).
                 # Other scalar writers may not model SCC, so they cannot make
@@ -1074,6 +1080,7 @@ class Stage:
     def set_scc(self, expr, proof=None):
         """Emit an SCC assignment and track its uniformity from `proof` (an expression over the
         sources) when the emitted text names a register, such as m0, that the proof cannot judge."""
+        self.scc_effect = 'emitted'
         if self.tracks_uniformity():
             self.scc_uniform = self.scalar_expr_uniform(expr if proof is None else proof)
         self.emit('scc = %s;' % expr)
@@ -1232,6 +1239,7 @@ class Stage:
                 if name == 's_cbranch_execz' and self.kind == 'cs':
                     skipped.append((off, target))
         join_writes = self.join_writes(branches)
+        scc_effects = {}
         self.blocks = []          # (offset, [lines], terminator)
         self.uniform_v = set()
         self.varying_s = set()
@@ -1312,6 +1320,7 @@ class Stage:
             dests = scalar_destinations(name, asm)
             written |= every_sgpr if 'any' in dests else dests
             self.pc = off
+            self.scc_effect = None
             # Before the first branch target or terminator every path has run exactly the instructions above, so
             # the program-order tracking is exact there even in a program with branches. Code after s_endpgm in a
             # branch-free program is past it too (dead code).
@@ -1345,6 +1354,8 @@ class Stage:
                     raise
                 refusals.append((handler_error(name, error, refusals), self.kind))
                 continue
+            if self.scc_effect:
+                scc_effects[off] = self.scc_effect
             if term:
                 self.pinned_low16_v.update(self.low16_only_v)
                 self.blocks.append((start, self.lines, term))
@@ -1352,6 +1363,12 @@ class Stage:
         if self.lines:
             self.blocks.append((start, self.lines, None))
         self.materialized = materialize  # declarations() assigns these before the body (and before any loop)
+        if 'descriptor' in scc_effects.values():
+            for name in self.descriptor_scc_reads(dict(branches), scc_effects):
+                reason = 'scc from descriptor data in %s' % name
+                if refusals is None:
+                    raise Unsupported(reason)
+                refusals.append((reason, self.kind))
         self.pinned_low16_v.update(self.low16_only_v)
         leak = self.pinned_low16_v & self.whole_read_v
         if leak:
@@ -1359,6 +1376,26 @@ class Stage:
             if refusals is None:
                 raise Unsupported(reason)
             refusals.append((reason, self.kind))
+
+    def descriptor_scc_reads(self, branches, effects):
+        """Find reads reachable with an elided SCC write, including through joins and back edges."""
+        instructions = {off: (size, name, asm) for off, size, name, asm in self.ins}
+        pending = [(0, False)]
+        seen = set()
+        while pending:
+            off, stale = pending.pop()
+            if (off, stale) in seen or off not in instructions:
+                continue
+            seen.add((off, stale))
+            size, name, asm = instructions[off]
+            if stale and off not in self.calculated_pc and reads_scc(name, asm):
+                yield name
+            if off in effects:
+                stale = effects[off] == 'descriptor'
+            if off in branches:
+                pending.append((branches[off], stale))
+            if name not in ('s_branch', 's_setpc_b64', 's_endpgm'):
+                pending.append((off + size, stale))
 
     def join_writes(self, branches):
         """Branch target -> the scalar registers another path can write before it reaches the target: the loop body
@@ -1832,8 +1869,10 @@ class Stage:
             return self.sym.get(r[1]) if r and r[0] == 's' else None
         syms = [src_sym(t) for t in srcs]
         if any(s and s[0] in ('desc', 'descnum', 'ptr', 'ptrhi') for s in syms):
-            if scc and self.tracks_uniformity():
-                self.scc_uniform = False  # nothing is emitted here, so the run-time scc is stale
+            if scc or base in SCC_UNMODELLED:
+                self.scc_effect = 'descriptor'
+                if self.tracks_uniformity():
+                    self.scc_uniform = False
             if shift_add or word_complement:
                 raise Unsupported('scc from descriptor data')
             if word_pack:
@@ -1939,6 +1978,13 @@ class Stage:
             self.set_s(d + 1, self.S(high) if high is not None else '0u', uniform=high_uniform)
         return None
 
+    def set_exec_scc(self, expr):
+        self.exec_known = False
+        self.scc_effect = 'emitted'
+        self.emit('exec = (%s) & 1; scc = exec != 0;' % expr)
+        if hasattr(self, 'scc_uniform'):
+            self.scc_uniform = False
+
     def op_s_and_saveexec_b64(self, ops, mods, text='exec & {0}'):
         if len(ops) != 2:
             raise Unsupported('saveexec with %d operands, expected 2' % len(ops))
@@ -1949,10 +1995,7 @@ class Stage:
         src = ops[1] if not reg_range(ops[1]) else 's%d' % reg_range(ops[1])[1]
         self.set_s(d, 'exec')
         self.masks.add(d)
-        self.exec_known = False
-        self.emit('exec = (%s) & 1; scc = exec != 0;' % text.format(self.u(src)))
-        if hasattr(self, 'scc_uniform'):
-            self.scc_uniform = False
+        self.set_exec_scc(text.format(self.u(src)))
 
     op_s_and_saveexec_b32 = op_s_and_saveexec_b64
 
@@ -1972,10 +2015,7 @@ class Stage:
             raise Unsupported('wrexec destination %s' % ops[0])
         d = dst[1]
         src = ops[1] if not reg_range(ops[1]) else 's%d' % reg_range(ops[1])[1]
-        self.exec_known = False
-        self.emit('exec = (%s & ~exec) & 1; scc = exec != 0;' % self.u(src))
-        if hasattr(self, 'scc_uniform'):
-            self.scc_uniform = False
+        self.set_exec_scc('%s & ~exec' % self.u(src))
         self.set_s(d, 'exec')
         self.masks.add(d)
 
@@ -4297,7 +4337,7 @@ def fnv(data, h=1469598103934665603):
 
 def pipeline_key(vs_code, ps_code, root_blob, layout=b''):
     """Hash the startup translation revision and the three blobs in runtime order, then a stream's input layout."""
-    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-10'))))
+    key = fnv(root_blob, fnv(ps_code, fnv(vs_code, fnv(b'x2w-startup-shader-11'))))
     return fnv(layout, key) if layout else key
 
 
@@ -4306,7 +4346,7 @@ def compute_key(cs_code, data, root_blob, desc, state_a=b'', state_b=b''):
     graphics revision followed by "cs", then each part preceded by its length as a little-endian u64: the code,
     the words 7-8 blob, the root signature, the 12 description words with their pointers zeroed and the two
     state blocks."""
-    key = fnv(b'x2w-startup-shader-10cs')
+    key = fnv(b'x2w-startup-shader-11cs')
     for part in (cs_code, data, root_blob, desc, state_a, state_b):
         key = fnv(part, fnv(struct.pack('<Q', len(part)), key))
     return key
