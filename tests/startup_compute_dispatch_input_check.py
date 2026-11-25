@@ -7,7 +7,7 @@ gfx2hlsl.py --pending with DXC, the unchanged recording still matches all 320 wo
 time is replaced, and each dispatch is refused with its own reason, logs which input and descriptor once, writes
 no output word and leaves the input as written:
 
-- dispatch-input-empty: zero records, the four words a title run logged;
+- dispatch-input-empty: zero records with a nonzero base and word 3 zero (synthetic values);
 - dispatch-input-past: 16 bytes past the end of the placed input buffer;
 - dispatch-input-unplaced: memory between the two placed buffers;
 - dispatch-input-copied: a buffer placed at an offset the desktop cannot alias, so it is a separate copy;

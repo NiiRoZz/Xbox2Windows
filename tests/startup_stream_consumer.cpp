@@ -204,8 +204,8 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // another compute root and the first one again after the constants, dispatch-same-root sets the same root again;
 // dispatch-reset closes and resets the list after the constants; dispatch-wrong-root records under the other
 // root; dispatch-same-buffer names the output buffer as the input too.
-// Input descriptors the dispatch refuses, one reason each: dispatch-input-empty has zero records (the words a title
-// run logged), dispatch-input-past ends 16 bytes past the input buffer, dispatch-input-unplaced names memory between
+// Input descriptors the dispatch refuses, one reason each: dispatch-input-empty has zero records (a nonzero base,
+// word 3 zero), dispatch-input-past ends 16 bytes past the input buffer, dispatch-input-unplaced names memory between
 // the two buffers, dispatch-input-copied a third buffer placed there at an offset the desktop cannot alias, and
 // dispatch-input-token writes the token of a texture view where the input descriptor was.
 static int dispatch_slot67(void* device, const std::string& mode)
