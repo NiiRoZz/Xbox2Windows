@@ -3972,7 +3972,7 @@ class Stage:
         """
         name = 'buffer_store_format_xyzw'
         if self.kind != 'cs':
-            raise Unsupported('%s outside a compute stage' % name)
+            raise Unsupported(name)  # the unknown-op refusal
         raw = getattr(self, 'raw_code', b'')
         pc = getattr(self, 'pc', None)
         if raw and pc is not None and pc + 8 <= len(raw):
@@ -4011,15 +4011,16 @@ class Stage:
         first = self.sym.get(rsrc[1])
         if getattr(self, 'past_entry', False) and not self.formatted_descriptor_from_block(rsrc, first):
             raise Unsupported('%s requires descriptor words proven in the entry block or a local table load' % name)
+        idx = self.u(ops[1])
+        data = 'uint4(%s)' % ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
         uav = self.pipe.uav(key, 'raw')
         uav_index = self.pipe.uavs[key]['index']
         word3 = 'ud%d' % self.pipe.ud(('uav_descword3', uav_index))
         stride = 'ud%d' % self.pipe.ud(('uav_stride', uav_index))
         num_records = 'ud%d' % self.pipe.ud(('uav_numrecords', uav_index))
-        data = 'uint4(%s)' % ', '.join(self.u('v%d' % n) for n in range(src[1], src[2] + 1))
         self.pipe.uses_store_format_xyzw = self.pipe.uses_pack16_rne = True
         call = 'store_format_xyzw(%s, %s, %s, %s, %s, 0u, %du, %du, %s);' % (
-            uav, word3, stride, num_records, self.u(ops[1]), int(ops[3], 0), imm_offset or 0, data)
+            uav, word3, stride, num_records, idx, int(ops[3], 0), imm_offset or 0, data)
         self.emit(call if self.exec_known else 'if (exec & 1) ' + call)
 
     def op_tbuffer_load_format_x(self, ops, mods):
