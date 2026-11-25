@@ -768,6 +768,7 @@ ID3D12PipelineState* pipeline_for(BoundPipeline& bound, Translation& tr, const P
     desc.DSVFormat = dsv_format;
     desc.SampleDesc.Count = 1;
     ID3D12PipelineState* pipeline = nullptr;
+    X2W_ZONE("desktop pipeline creation");
     const HRESULT hr = device_of(the_device)->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pipeline));
     log("x2w-draw desktop pipeline for %016llx, %u targets (format %d) -> 0x%08lx (dsv %d, depth %d)", tr.key,
         pass.target_count, pass.target_count ? pass.target_formats[0] : 0, static_cast<unsigned long>(hr),

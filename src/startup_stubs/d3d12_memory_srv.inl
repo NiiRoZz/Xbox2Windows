@@ -137,6 +137,7 @@ bool memory_srv_destination(u64 handle)
 
 Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
 {
+    X2W_ZONE("srv existing_memory_texture scan");
     Wrapper* match = nullptr;
     AcquireSRWLockShared(&note_lock);
     for (const auto& [wrapper, info] : resource_infos()) {
@@ -157,6 +158,7 @@ Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
 // An unmatched or interior view must not reinterpret bytes owned by a live resource.
 bool address_resource_overlap(u64 address, u64 span)
 {
+    X2W_ZONE("srv address_resource_overlap scan");
     bool found = false;
     AcquireSRWLockShared(&note_lock);
     for (const auto& [wrapper, info] : resource_infos()) {
@@ -178,6 +180,7 @@ bool address_resource_overlap(u64 address, u64 span)
 // title memory does not hold the texel. For a resource of unknown size, its base is the only known byte.
 bool gpu_written_overlap(u64 address, UINT texel_bytes)
 {
+    X2W_ZONE("srv gpu_written_overlap scan");
     constexpr UINT gpu_written = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     bool found = false;
@@ -198,6 +201,7 @@ bool gpu_written_overlap(u64 address, UINT texel_bytes)
 
 Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
 {
+    X2W_ZONE("srv existing_memory_buffer scan");
     if (!address || !bytes) return nullptr;
     const auto placed = placed_buffer_range(device, address, bytes);
     if (placed.reject) return nullptr;
@@ -412,6 +416,7 @@ void note_memory_srv_write(const D3D12_RESOURCE_DESC* resource, const MemoryShad
 void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resource,
                                  const MemoryShaderResourceView* input, u64 destination)
 {
+    X2W_ZONE("device_memory_srv");
     static LONG refused;
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
         refuse_memory_srv(refused, "unsupported memory SRV arguments", reason, resource, input, destination);
