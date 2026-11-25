@@ -6165,6 +6165,8 @@ class Stage:
                               % next(f for f in flags if f.startswith('en:'))[3:])
         if 'vm' in flags and not self.exec_known:
             self.emit('if (!(exec & 1)) discard;')
+        if target == 'null':
+            return None  # the null target writes no render target; its only effect is the vm discard above
         if target == 'mrtz':
             if (self.kind != 'ps' or self.has_branches or self.blocks or not self.exec_known or 'depth' in self.exports
                     or 'compr' in flags or len(vals) != 4 or not re.fullmatch(r'v\d+', vals[0])
