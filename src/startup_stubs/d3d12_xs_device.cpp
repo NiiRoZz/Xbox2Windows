@@ -17,6 +17,7 @@
 #include "xmem_page_batch.h"
 #include "startup_stubs/local_log.h"
 #include "startup_stubs/logical_view_table.h"
+#include "startup_stubs/list_compute_root.h"
 #include "startup_stubs/overlay_window.h"
 #include "startup_stubs/draw_bmp.h"
 #include "startup_stubs/draw_dump_tracking.h"
@@ -2235,6 +2236,7 @@ struct Pass {
     const std::vector<RootParameter>* requested_mesh_root = nullptr;
     UINT topology = 0;
     x2w_startup::ViewTable view_tables[16]{};
+    x2w_startup::ComputeTables compute_tables;  // slot 35, read by a Dispatch handler
     u64 source_view_heap = 0;
     u64 root_address[16] = {};       // title address of each root descriptor
     std::uint32_t constants[16][8] = {};
@@ -2428,6 +2430,7 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     Pass& pass = pass_of(self);
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
+    pass.compute_tables.set_signature(w ? root_info(w) : nullptr);  // a different signature leaves no table bound
     pass.compute_params = real ? root_info(w) : nullptr;
     if (compute_binding_trace_enabled() && (!pass.compute_trace || pass.compute_trace->root != w)) {
         pass.compute_trace = std::make_unique<ComputeBindingTrace>();
@@ -4955,6 +4958,7 @@ void build_tables()
         list_typed[42] = reinterpret_cast<ListTyped>(&list_root_cbv);
         list_typed[50] = reinterpret_cast<ListTyped>(&list_targets);
         list_typed[13] = reinterpret_cast<ListTyped>(&list_draw_indexed);
+        list_typed[35] = reinterpret_cast<ListTyped>(&list_compute_table);
         list_typed[36] = reinterpret_cast<ListTyped>(&list_table);
         list_typed[40] = reinterpret_cast<ListTyped>(&list_root_constants);
         list_typed[47] = reinterpret_cast<ListTyped>(&list_index_buffer);

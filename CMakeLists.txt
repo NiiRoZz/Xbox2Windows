@@ -1954,6 +1954,12 @@ add_executable(startup_logical_view_table_check tests/startup_logical_view_table
 target_include_directories(startup_logical_view_table_check PRIVATE src)
 target_compile_features(startup_logical_view_table_check PRIVATE cxx_std_17)
 add_test(NAME startup_logical_view_table COMMAND startup_logical_view_table_check)
+# Compute descriptor tables (command-list slot 35, src/startup_stubs/list_compute_root.h): a table at a nonzero
+# descriptor offset, a wrong handle, clear on a different signature or a view heap change, range limit.
+add_executable(startup_compute_root tests/startup_compute_root.cpp)
+target_include_directories(startup_compute_root PRIVATE src)
+target_compile_features(startup_compute_root PRIVATE cxx_std_17)
+add_test(NAME startup_compute_root COMMAND startup_compute_root)
 # Local switch, logging, and page-probe helpers (src/startup_stubs/local_log.h, #1149).
 add_executable(startup_local_log_check tests/startup_local_log_check.cpp)
 target_include_directories(startup_local_log_check PRIVATE src)
