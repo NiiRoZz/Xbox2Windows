@@ -1992,7 +1992,9 @@ volatile LONG64 indirect_calls[indirect_outcomes][5];
 void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count, void* argument, u64 offset,
                                      void* count_buffer, u64 count_offset)
 {
-    IndirectCommand kind = IndirectCommand::none;
+    // Every refusal is counted under the signature's kind, including those before the signature is checked.
+    Wrapper* sig = as_wrapper(signature);
+    IndirectCommand kind = sig && sig->own().kind == command_signature_kind ? sig->own().indirect_command : IndirectCommand::none;
     const auto refuse = [&kind](const char* reason, int outcome = indirect_other) {
         InterlockedIncrement64(&indirect_calls[outcome][static_cast<int>(kind)]);
         static LONG refusals;
@@ -2004,14 +2006,12 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
     if (type != D3D12_COMMAND_LIST_TYPE_DIRECT && type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
         return refuse("requires a direct or compute command list");
     if (count != 1 || count_buffer || count_offset) return refuse("requires one command and no count buffer");
-    Wrapper* sig = as_wrapper(signature);
     if (!sig || sig->own().kind != command_signature_kind || !sig->own().real)
         return refuse("missing or placeholder signature", indirect_placeholder);
     const Wrapper* device = self->own().list_device;
     if (!device || sig->own().signature_device != device)
         return refuse("requires a supported signature from this device");
     const auto command = sig->own().indirect_command;
-    kind = command;
     const bool indexed = command == IndirectCommand::draw_indexed;
     const bool mesh = command == IndirectCommand::dispatch_mesh;
     const bool graphics = indexed || mesh || command == IndirectCommand::draw;

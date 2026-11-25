@@ -928,8 +928,9 @@ endforeach()
 set_tests_properties(startup_indirect_draw_indexed_hardware startup_indirect_draw_hardware PROPERTIES SKIP_RETURN_CODE 77)
 # Negative control for the x2w-render indirect line: one forwarded call too many must be reported as a mismatch.
 add_test(NAME startup_indirect_counts_control_warp COMMAND startup_indirect_draw_indexed warp count-control)
+# "got" is printed only for a mismatch, and the pattern holds the real counts. No semicolons: CMake would split it.
 set_tests_properties(startup_indirect_counts_control_warp PROPERTIES TIMEOUT 30
-    PASS_REGULAR_EXPRESSION "got +'x2w-render indirect: forwarded: drawindexed 3;[^']*'[^e]*expected +'x2w-render indirect: forwarded: drawindexed 4;")
+    PASS_REGULAR_EXPRESSION "got +'x2w-render indirect: forwarded: drawindexed 3. refused graphics-pipeline: drawindexed 1. compute-pipeline: dispatch 1. placeholder-signature: other 1. other: drawindexed 3'")
 
 # OMSetRenderTargets with a single descriptor range, handles that hold no view, and a cleared copied descriptor.
 add_executable(startup_rtv_bind tests/startup_rtv_bind.cpp)

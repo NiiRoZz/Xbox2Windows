@@ -547,10 +547,10 @@ Compare the last line of each run. More translated draws and fewer "not drawn" m
 Beside the totals line, one line counts every `ExecuteIndirect` call (command-list slot 61) since the start, forwarded or by refusal reason, then by signature kind (`draw`, `drawindexed`, `dispatch`, `dispatchmesh`, or `other` for a placeholder or unknown signature); a reason with no calls reads `0`:
 
 ```
-x2w-render indirect: forwarded: drawindexed 3; refused graphics-pipeline: drawindexed 1; compute-pipeline: dispatch 1; placeholder-signature: other 1; other: drawindexed 2
+x2w-render indirect: forwarded: drawindexed 3; refused graphics-pipeline: drawindexed 1; compute-pipeline: dispatch 1; placeholder-signature: other 1; other: drawindexed 3
 ```
 
-`graphics-pipeline` is a draw without a matching desktop pipeline and root, `compute-pipeline` a dispatch without a desktop compute pipeline and root, and `other` every remaining refusal. The `x2w-render ExecuteIndirect refused` lines still stop after 16. `startup_indirect_draw_indexed_warp` checks this line; `startup_indirect_counts_control_warp` expects one forwarded call too many and must report the mismatch.
+`graphics-pipeline` is a draw without a matching desktop pipeline and root, `compute-pipeline` a dispatch without a desktop compute pipeline and root, and `other` every remaining refusal, counted under the signature's kind whenever the signature is known. The `x2w-render ExecuteIndirect refused` lines still stop after 16. `startup_indirect_draw_indexed_warp` checks this line; `startup_indirect_counts_control_warp` expects one forwarded call too many and must report the mismatch.
 
 ### 4. Census, then rank
 

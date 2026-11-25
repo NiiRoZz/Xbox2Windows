@@ -407,7 +407,8 @@ bool run(ID3D12Device* device, ID3D12Device* guest, ID3D12RootSignature* writer_
     std::printf("%s: %u/%u non-clear pixels, argument guards intact\n", label, painted, width * height);
     return pixels_match;
 }
-// Three calls refused before any argument is read, one per counted reason; the list is closed and dropped.
+// Calls refused before any argument is read: one per counted reason, and one with two commands, which is
+// counted as other under its signature's kind. The list is closed and dropped.
 void refuse_each_reason(ID3D12Device* guest, ID3D12CommandSignature* draw_indexed)
 {
     D3D12_INDIRECT_ARGUMENT_DESC dispatch{};
@@ -423,6 +424,7 @@ void refuse_each_reason(ID3D12Device* guest, ID3D12CommandSignature* draw_indexe
     execute(list.Get(), nullptr, 1, nullptr, 0, nullptr, 0);                    // placeholder signature
     execute(list.Get(), draw_indexed, 1, nullptr, 0, nullptr, 0);               // no desktop graphics pipeline bound
     execute(list.Get(), dispatch_signature.Get(), 1, nullptr, 0, nullptr, 0);   // no desktop compute pipeline bound
+    execute(list.Get(), draw_indexed, 2, nullptr, 0, nullptr, 0);               // two commands
     check(slot<HRESULT (WINAPI*)(IUnknown*)>(list.Get(), 9)(list.Get()), "close refusal list");
 }
 
@@ -560,13 +562,13 @@ int main(int argc, char** argv) try
     if (indexed ? !verify(left.Get(), false, Refusal::invalid_index, "invalid index range")
                 : !verify(left.Get(), false, Refusal::missing_viewport, "missing viewport")) return 1;
     if (indexed) {
-        // Forwarded: the three unrefused runs. Other reasons: the short argument range and the invalid index range.
+        // Forwarded: the three unrefused runs. Other reasons: the short argument range, the invalid index range and two commands.
         refuse_each_reason(guest.Get(), signature.Get());
         const std::string line = indirect_line(guest.Get(), log_path);
         DeleteFileW(log_path.c_str());
         const std::string expected = std::string("x2w-render indirect: forwarded: drawindexed ") + (count_control ? "4" : "3") +
             "; refused graphics-pipeline: drawindexed 1; compute-pipeline: dispatch 1; placeholder-signature: other 1; "
-            "other: drawindexed 2";
+            "other: drawindexed 3";
         if (line != expected) {
             std::fprintf(stderr, "indirect line mismatch:\n  got      '%s'\n  expected '%s'\n", line.c_str(), expected.c_str());
             return 1;
