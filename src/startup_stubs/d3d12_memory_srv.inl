@@ -135,21 +135,45 @@ bool memory_srv_destination(u64 handle)
     return valid;
 }
 
+// With X2W_RESOURCE_INDEX_CHECK=1 (or 2, see resource_index_check_mode), every memory SRV call (a full pass, for tests) checks that each live resource with title
+// memory is in the address index (entries are never removed, so it stays there after a release). A miss is logged and ends the process with code 3; this is a test mode only.
+void check_resource_address_index()
+{
+    if (resource_index_check_mode() == 0) return;
+    AcquireSRWLockShared(&note_lock);
+    std::optional<u64> missing;
+    for (const auto& [wrapper, info] : resource_infos()) {
+        const u64 base = reinterpret_cast<u64>(wrapper->own().title_memory);
+        if (!base || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0 || resource_address_index().contains(base, wrapper))
+            continue;
+        missing = base;
+        break;
+    }
+    const std::size_t entries = resource_address_index().size();
+    ReleaseSRWLockShared(&note_lock);
+    if (!missing) return;
+    log("x2w-d3d12 resource address index misses a live resource at 0x%llx (index %zu entries)", *missing, entries);
+    ExitProcess(3);
+}
+
 Wrapper* existing_memory_texture(u64 address, const D3D12_RESOURCE_DESC& desc)
 {
     Wrapper* match = nullptr;
     AcquireSRWLockShared(&note_lock);
-    for (const auto& [wrapper, info] : resource_infos()) {
+    // A null address never gets here (memory_srv_refusal), and the index holds no null base.
+    resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
+        const auto& info = resource_infos().at(wrapper);
         if (reinterpret_cast<u64>(wrapper->own().title_memory) != address ||
             wrapper->own().tiled_address_srv ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0 ||
-            !same_texture_description(desc, info.console)) continue;
+            !same_texture_description(desc, info.console)) return false;
         if (match) {
             match = nullptr;
-            break;
+            return true;
         }
         match = const_cast<Wrapper*>(wrapper);
-    }
+        return false;
+    });
     ReleaseSRWLockShared(&note_lock);
     return match;
 }
@@ -159,17 +183,14 @@ bool address_resource_overlap(u64 address, u64 span)
 {
     bool found = false;
     AcquireSRWLockShared(&note_lock);
-    for (const auto& [wrapper, info] : resource_infos()) {
+    resource_address_index().for_each_reaching(address, span, [&](const Wrapper* wrapper) {
         if (wrapper->own().tiled_address_srv || InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
-            continue;
-        const u64 base = reinterpret_cast<u64>(wrapper->own().title_memory);
+            return false;
+        const auto& info = resource_infos().at(wrapper);
         const u64 bytes = info.bytes ? info.bytes
             : info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0;
-        if (base && (address <= base ? base - address < span : address - base < bytes)) {
-            found = true;
-            break;
-        }
-    }
+        return found = x2w_startup::address_span_touches(address, span, reinterpret_cast<u64>(wrapper->own().title_memory), bytes);
+    });
     ReleaseSRWLockShared(&note_lock);
     return found;
 }
@@ -182,16 +203,12 @@ bool gpu_written_overlap(u64 address, UINT texel_bytes)
                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
     bool found = false;
     AcquireSRWLockShared(&note_lock);
-    for (const auto& [wrapper, info] : resource_infos()) {
-        const u64 base = reinterpret_cast<u64>(wrapper->own().title_memory);
+    resource_address_index().for_each_reaching(address, texel_bytes, [&](const Wrapper* wrapper) {
+        const auto& info = resource_infos().at(wrapper);
         const u64 bytes = info.bytes ? info.bytes : info.console.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? info.console.Width : 0;
-        const bool overlap = address <= base ? base - address < texel_bytes : address - base < bytes;
-        if (base && overlap &&
-            (static_cast<UINT>(info.console.Flags) & gpu_written) && InterlockedCompareExchange(&wrapper->own().refs, 0, 0) > 0) {
-            found = true;
-            break;
-        }
-    }
+        return found = x2w_startup::address_span_touches(address, texel_bytes, reinterpret_cast<u64>(wrapper->own().title_memory), bytes) &&
+            (static_cast<UINT>(info.console.Flags) & gpu_written) && InterlockedCompareExchange(&wrapper->own().refs, 0, 0) > 0;
+    });
     ReleaseSRWLockShared(&note_lock);
     return found;
 }
@@ -211,22 +228,24 @@ Wrapper* existing_memory_buffer(Wrapper* device, u64 address, u64 bytes)
     }
     Wrapper* match = nullptr;
     AcquireSRWLockShared(&note_lock);
-    for (const auto& [wrapper, info] : resource_infos()) {
+    resource_address_index().for_each_reaching(address, 1, [&](const Wrapper* wrapper) {
+        const auto& info = resource_infos().at(wrapper);
         if (info.placement != Placement::none ||
             info.console.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ||
             (info.console.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) ||
             InterlockedCompareExchange(&wrapper->own().refs, 0, 0) <= 0)
-            continue;
+            return false;
         const u64 base = reinterpret_cast<u64>(wrapper->own().title_memory);
         const u64 width = info.console.Width;
         if (!base || address < base || address - base >= width || bytes > width - (address - base))
-            continue;
+            return false;
         if (match) {
             match = nullptr;
-            break;
+            return true;
         }
         match = const_cast<Wrapper*>(wrapper);
-    }
+        return false;
+    });
     ReleaseSRWLockShared(&note_lock);
     return match;
 }
@@ -413,6 +432,7 @@ void __stdcall device_memory_srv(Wrapper* self, const D3D12_RESOURCE_DESC* resou
                                  const MemoryShaderResourceView* input, u64 destination)
 {
     static LONG refused;
+    check_resource_address_index();
     if (const char* reason = memory_srv_refusal(resource, input, destination)) {
         refuse_memory_srv(refused, "unsupported memory SRV arguments", reason, resource, input, destination);
         return;

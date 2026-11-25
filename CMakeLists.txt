@@ -644,6 +644,17 @@ target_include_directories(startup_placement_publish_check PRIVATE src)
 add_test(NAME startup_placement_publish COMMAND startup_placement_publish_check)
 add_test(NAME startup_placement_publish_shrink_control COMMAND startup_placement_publish_check --mutate shrink)
 set_tests_properties(startup_placement_publish_shrink_control PROPERTIES WILL_FAIL TRUE)
+# The memory SRV address lookups through src/startup_stubs/resource_address_index.h answer what a scan of
+# every resource answers, across release, re-reference, address reuse and allocation failures at the index
+# insert. The skip run (one insert dropped) and the unsync run (index insert first, kept when the record
+# update fails) are the negative controls.
+add_executable(startup_resource_address_index_check tests/startup_resource_address_index_check.cpp)
+target_compile_features(startup_resource_address_index_check PRIVATE cxx_std_17)
+target_include_directories(startup_resource_address_index_check PRIVATE src)
+add_test(NAME startup_resource_address_index COMMAND startup_resource_address_index_check)
+add_test(NAME startup_resource_address_index_skip_control COMMAND startup_resource_address_index_check --mutate skip)
+add_test(NAME startup_resource_address_index_unsync_control COMMAND startup_resource_address_index_check --mutate unsync)
+set_tests_properties(startup_resource_address_index_skip_control startup_resource_address_index_unsync_control PROPERTIES WILL_FAIL TRUE)
 # Device slot 133 proves that the allocation is committed from its base to the end of the buffer with
 # one region-information call when the whole private allocation is committed, else with a walk that
 # stops at the end of the buffer; every alias or refusal must equal the full walk's on the same memory,
@@ -3371,6 +3382,15 @@ if(EXISTS "${INTAKE_PYTHON}")
             "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_srv_check.py"
             "$<TARGET_FILE:startup_stream_consumer>" "${backend}")
         set_tests_properties(startup_address_srv_${backend} PROPERTIES TIMEOUT 90 SKIP_RETURN_CODE 77)
+        if(backend STREQUAL "warp")
+            # Negative control for X2W_RESOURCE_INDEX_CHECK: mode 2 skips the index inserts, so the check must
+            # report the first live resource it does not find (the run passes only on that report).
+            add_test(NAME startup_resource_address_index_missing_control_warp COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
+                "X2W_RESOURCE_INDEX_CHECK=2" "${INTAKE_PYTHON}" -B "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_address_srv_check.py"
+                "$<TARGET_FILE:startup_stream_consumer>" warp)
+            set_tests_properties(startup_resource_address_index_missing_control_warp PROPERTIES TIMEOUT 90
+                PASS_REGULAR_EXPRESSION "resource address index misses a live resource")
+        endif()
         # Refused slot 70 calls and "token" texture nulls in the five-second report census. The WARP control
         # publishes a supported R8 texture in place of the refused one and passes only on the exact mismatch
         # that causes (column 0 samples the R8 texel instead of a null view).
