@@ -1,10 +1,10 @@
 // Checks src/startup_stubs/list_dispatch.h without a device: when command-list slot 14 (Dispatch) is forwarded to the
 // desktop list and which refusal applies otherwise. Expectations are written out below, not computed with the header.
 //
-//   startup_list_dispatch_check [--mutate no-limit|no-state]
+//   startup_list_dispatch_check [--mutate no-limit|no-state|no-root-args]
 //
-// The mutations change the expectations to those of a wrong decision (no group-count limit, or a forward without a
-// compute pipeline and root); each must make the check fail.
+// The mutations change the expectations to those of a wrong decision (no group-count limit, a forward without a
+// compute pipeline and root, or a forward with unforwarded compute root arguments); each must make the check fail.
 #include "startup_stubs/list_dispatch.h"
 
 #include <cstdio>
@@ -14,7 +14,7 @@ namespace {
 using namespace x2w_startup;
 using D = DispatchDecision;
 int failures, cases;
-bool no_limit, no_state;
+bool no_limit, no_state, no_root_args;
 
 void expect(const char* label, const ListDispatch& in, D expected)
 {
@@ -40,7 +40,8 @@ int main(int argc, char** argv)
     if (argc == 3 && !std::strcmp(argv[1], "--mutate")) {
         no_limit = !std::strcmp(argv[2], "no-limit");
         no_state = !std::strcmp(argv[2], "no-state");
-        if (!no_limit && !no_state) return 2;
+        no_root_args = !std::strcmp(argv[2], "no-root-args");
+        if (!no_limit && !no_state && !no_root_args) return 2;
     }
     expect("one group", ready(1, 1, 1), D::forward);
     expect("limit on every axis", ready(65535, 65535, 65535), D::forward);
@@ -54,6 +55,11 @@ int main(int argc, char** argv)
     d = ready(8, 1, 1);
     d.compute_root = false;
     expect("no compute root", d, no_state ? D::forward : D::no_compute_state);
+    d = ready(8, 1, 1);
+    d.compute_root_has_arguments = true;  // e.g. a root UAV set through slot 45, which is not forwarded
+    expect("root with arguments", d, no_root_args ? D::forward : D::unforwarded_root_arguments);
+    d.x = 0;
+    expect("root with arguments, zero groups", d, no_root_args ? D::forward : D::unforwarded_root_arguments);
     d = ready(8, 1, 1);
     d.list_open = false;
     expect("closed list", d, D::list_closed);

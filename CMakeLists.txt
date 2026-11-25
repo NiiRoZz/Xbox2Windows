@@ -1382,7 +1382,7 @@ add_executable(startup_list_dispatch_check tests/startup_list_dispatch_check.cpp
 target_include_directories(startup_list_dispatch_check PRIVATE src)
 target_compile_features(startup_list_dispatch_check PRIVATE cxx_std_17)
 add_test(NAME startup_list_dispatch COMMAND startup_list_dispatch_check)
-foreach(mutation IN ITEMS no-limit no-state)
+foreach(mutation IN ITEMS no-limit no-state no-root-args)
     add_test(NAME startup_list_dispatch_${mutation}_control COMMAND startup_list_dispatch_check --mutate ${mutation})
     set_tests_properties(startup_list_dispatch_${mutation}_control PROPERTIES WILL_FAIL TRUE)
 endforeach()

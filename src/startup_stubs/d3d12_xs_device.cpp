@@ -126,6 +126,7 @@ struct alignas(16) WrapperOwn {
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     bool compute_pipeline;   // PipelineState: a desktop compute pipeline
     bool root_without_bindings; // RootSignature: decoded and has no parameters or static samplers
+    bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
     Wrapper* list_device;    // CommandList: wrapper that created this list.
@@ -1687,8 +1688,10 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
         if (SUCCEEDED(deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &desc)) && desc) {
             heap_flags = static_cast<UINT>(desc->Desc_1_1.Flags) & x2w_startup::root_flags_heap_indexed;
             w->own().root_without_bindings = !heap_flags && !desc->Desc_1_1.NumParameters && !desc->Desc_1_1.NumStaticSamplers;
+            w->own().root_srv_only = !heap_flags && !desc->Desc_1_1.NumStaticSamplers && desc->Desc_1_1.NumParameters;
             for (UINT i = 0; i < desc->Desc_1_1.NumParameters; ++i) {
                 const auto& parameter = desc->Desc_1_1.pParameters[i];
+                if (parameter.ParameterType != D3D12_ROOT_PARAMETER_TYPE_SRV) w->own().root_srv_only = false;
                 RootParameter info{parameter.ParameterType, 0, 0};
                 if (parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV || parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV ||
                     parameter.ParameterType == D3D12_ROOT_PARAMETER_TYPE_UAV) {
@@ -1956,6 +1959,7 @@ struct Pass {
     bool compute_pipeline = false;
     ID3D12RootSignature* compute_root = nullptr; // desktop compute root set by slot 33
     const std::vector<RootParameter>* compute_params = nullptr;
+    bool compute_root_has_arguments = false;     // that root declares parameters other than root SRVs, or static samplers
     IndirectGraphicsPipeline indirect_graphics;
     ID3D12RootSignature* graphics_root = nullptr;
     bool targets_bound = false;
@@ -2089,6 +2093,8 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
     pass.compute_params = real ? root_info(w) : nullptr;
+    // Root SRV parameters are forwarded by their own slot; anything else the root declares is not.
+    pass.compute_root_has_arguments = real && !w->own().root_without_bindings && !w->own().root_srv_only;
     if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
 }
 
@@ -2668,7 +2674,8 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
     if (list) request.type = list->GetType();
     const Pass& pass = pass_of(self);
     request.compute_pipeline = pass.compute_pipeline;
-    request.compute_root = pass.compute_root;
+    request.compute_root = pass.compute_root != nullptr;
+    request.compute_root_has_arguments = pass.compute_root_has_arguments;
     request.x = x, request.y = y, request.z = z;
     const x2w_startup::DispatchDecision decision = x2w_startup::decide_dispatch(request);
     if (decision != x2w_startup::DispatchDecision::forward) {
