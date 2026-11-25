@@ -126,6 +126,7 @@ struct alignas(16) WrapperOwn {
     bool list_ready;  // CommandList (render mode): closed with recorded work, not yet submitted
     bool compute_pipeline;   // PipelineState: a desktop compute pipeline
     bool root_without_bindings; // RootSignature: decoded and has no parameters or static samplers
+    ID3D12RootSignature* pipeline_root; // PipelineState: desktop root signature its compute stream declared
     bool root_srv_only;         // RootSignature: decoded, no static samplers, every parameter a root SRV (those are forwarded)
     volatile LONG queue_wait_seen; // CommandQueue: publish later signals only after GPU completion.
     void* pass;       // CommandList (render mode): recording state (Pass)
@@ -1774,7 +1775,7 @@ std::size_t desktop_stream_size(UINT type)
 // Converts a console pipeline stream to desktop form and creates the pipeline. The subobject type
 // numbers and sizes are the desktop ones; only the pointers and formats inside need converting.
 ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DESC* desc, char* why, std::size_t why_size,
-                                          bool& compute, IndirectGraphicsPipeline& graphics)
+                                          bool& compute, IndirectGraphicsPipeline& graphics, ID3D12RootSignature*& pipeline_root)
 {
     const std::size_t bytes = desc->SizeInBytes;
     if (bytes < 16 || bytes > 0x2000 || (bytes & 7) || !x2w_local::readable(desc->pPipelineStateSubobjectStream, bytes)) {
@@ -1888,6 +1889,8 @@ ID3D12PipelineState* build_stream_pipeline(const D3D12_PIPELINE_STATE_STREAM_DES
         }
         check_device("Device CreatePipelineState", 86);
     }
+    if (pipeline && compute && root && root->own().kind == root_signature_kind)
+        pipeline_root = static_cast<ID3D12RootSignature*>(root->own().real);
     if (pipeline && (vertex || mesh) && pixel)
         graphics = {static_cast<ID3D12RootSignature*>(root->own().real), targets.RTFormats[0], mesh};
     return pipeline;
@@ -1957,6 +1960,8 @@ std::size_t readable_window(u64 address, std::size_t wanted)
 struct Pass {
     bool pipeline_real = false;      // the bound pipeline has a desktop pipeline
     bool compute_pipeline = false;
+    ID3D12RootSignature* compute_pipeline_root = nullptr; // root the bound compute pipeline was built against
+    UINT compute_srv_bound = 0;                           // root SRV parameters that reached the desktop list since slot 33
     ID3D12RootSignature* compute_root = nullptr; // desktop compute root set by slot 33
     const std::vector<RootParameter>* compute_params = nullptr;
     bool compute_root_has_arguments = false;     // that root declares parameters other than root SRVs, or static samplers
@@ -2079,6 +2084,7 @@ void __stdcall list_pipeline(Wrapper* self, void* pipeline)
     // a recognized desktop graphics pipeline just before it records the draw.
     pass.pipeline_real = available && !pass.indirect_graphics.root;
     pass.compute_pipeline = pass.pipeline_real && w->own().compute_pipeline;
+    pass.compute_pipeline_root = pass.compute_pipeline ? w->own().pipeline_root : nullptr;
     pass.pipeline = w && w->own().kind == pipeline_kind ? w : nullptr;
     InterlockedIncrement(pass.pipeline_real ? &render_pipelines_real : &render_pipelines_missing);
     if (auto* list = recording(self); list && pass.pipeline_real) list->SetPipelineState(static_cast<ID3D12PipelineState*>(w->own().real));
@@ -2093,6 +2099,7 @@ void __stdcall list_compute_root(Wrapper* self, void* root)
     const bool real = w && w->own().kind == root_signature_kind && w->own().real && !root_heap_flags(w);
     pass.compute_root = real ? static_cast<ID3D12RootSignature*>(w->own().real) : nullptr;
     pass.compute_params = real ? root_info(w) : nullptr;
+    pass.compute_srv_bound = 0;
     // Root SRV parameters are forwarded by their own slot; anything else the root declares is not.
     pass.compute_root_has_arguments = real && !w->own().root_without_bindings && !w->own().root_srv_only;
     if (pass.compute_root) list->SetComputeRootSignature(pass.compute_root);
@@ -2615,7 +2622,12 @@ void __stdcall list_compute_upload_srv(Wrapper* self, UINT parameter, UINT64 add
     if (!list || !params || parameter >= params->size() ||
         (*params)[parameter].type != D3D12_ROOT_PARAMETER_TYPE_SRV) return;
     const auto gpu = list_upload_gpu(self, address, 1);
-    if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) list->SetComputeRootShaderResourceView(parameter, gpu);
+    // A rejected replacement leaves no valid binding: the desktop list may still hold the previous address.
+    if (parameter < 32) pass_of(self).compute_srv_bound &= ~(1u << parameter);
+    if (gpu && !(gpu % D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
+        list->SetComputeRootShaderResourceView(parameter, gpu);
+        if (parameter < 32) pass_of(self).compute_srv_bound |= 1u << parameter;
+    }
 }
 
 // List slot 44 (desktop 40 + 4), SetGraphicsRootShaderResourceView(parameter, title GPU address).
@@ -2676,6 +2688,9 @@ void __stdcall list_dispatch(Wrapper* self, UINT x, UINT y, UINT z)
     request.compute_pipeline = pass.compute_pipeline;
     request.compute_root = pass.compute_root != nullptr;
     request.compute_root_has_arguments = pass.compute_root_has_arguments;
+    request.root_matches_pipeline = pass.compute_pipeline_root && pass.compute_pipeline_root == pass.compute_root;
+    const UINT count = pass.compute_params ? static_cast<UINT>(pass.compute_params->size()) : 0;
+    request.root_arguments_bound = count <= 32 && (pass.compute_srv_bound & (count >= 32 ? ~0u : (1u << count) - 1)) == (count >= 32 ? ~0u : (1u << count) - 1);
     request.x = x, request.y = y, request.z = z;
     const x2w_startup::DispatchDecision decision = x2w_startup::decide_dispatch(request);
     if (decision != x2w_startup::DispatchDecision::forward) {
@@ -3625,12 +3640,13 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     bool has_depth_stencil = false;
     DXGI_FORMAT dsv_format = DXGI_FORMAT_UNKNOWN;
     bool compute = false;
+    ID3D12RootSignature* pipeline_root = nullptr;
     IndirectGraphicsPipeline graphics;
     if (render_mode()) {
         char why[256] = "";
         // Recognized desktop stages must reach the native path before the
         // guest cache creates a pending translation for any DXBC container.
-        real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, graphics);
+        real_pipeline = build_stream_pipeline(desc, why, sizeof(why), compute, graphics, pipeline_root);
         if (!real_pipeline || graphics.root)
             translation = stream_translation(*desc, blend, has_blend, depth_stencil, has_depth_stencil, dsv_format);
         static LONG built;
@@ -3639,6 +3655,7 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
     }
     *out = wrap(real_pipeline, pipeline_kind);
     static_cast<Wrapper*>(*out)->own().compute_pipeline = real_pipeline && compute;
+    static_cast<Wrapper*>(*out)->own().pipeline_root = pipeline_root;
     static_cast<Wrapper*>(*out)->own().indirect_graphics = graphics;
     note_pipeline(static_cast<Wrapper*>(*out), 86, nullptr, desc->pPipelineStateSubobjectStream, desc->SizeInBytes < 0x2000 ? desc->SizeInBytes : 0x2000,
                   translation, translation && has_blend ? &blend : nullptr,

@@ -1,7 +1,7 @@
 // Checks src/startup_stubs/list_dispatch.h without a device: when command-list slot 14 (Dispatch) is forwarded to the
 // desktop list and which refusal applies otherwise. Expectations are written out below, not computed with the header.
 //
-//   startup_list_dispatch_check [--mutate no-limit|no-state|no-root-args]
+//   startup_list_dispatch_check [--mutate no-limit|no-state|no-root-args|no-pairing|no-bound]
 //
 // The mutations change the expectations to those of a wrong decision (no group-count limit, a forward without a
 // compute pipeline and root, or a forward with unforwarded compute root arguments); each must make the check fail.
@@ -14,7 +14,7 @@ namespace {
 using namespace x2w_startup;
 using D = DispatchDecision;
 int failures, cases;
-bool no_limit, no_state, no_root_args;
+bool no_limit, no_state, no_root_args, no_pairing, no_bound;
 
 void expect(const char* label, const ListDispatch& in, D expected)
 {
@@ -41,7 +41,9 @@ int main(int argc, char** argv)
         no_limit = !std::strcmp(argv[2], "no-limit");
         no_state = !std::strcmp(argv[2], "no-state");
         no_root_args = !std::strcmp(argv[2], "no-root-args");
-        if (!no_limit && !no_state && !no_root_args) return 2;
+        no_pairing = !std::strcmp(argv[2], "no-pairing");
+        no_bound = !std::strcmp(argv[2], "no-bound");
+        if (!no_limit && !no_state && !no_root_args && !no_pairing && !no_bound) return 2;
     }
     expect("one group", ready(1, 1, 1), D::forward);
     expect("limit on every axis", ready(65535, 65535, 65535), D::forward);
@@ -60,6 +62,17 @@ int main(int argc, char** argv)
     expect("root with arguments", d, no_root_args ? D::forward : D::unforwarded_root_arguments);
     d.x = 0;
     expect("root with arguments, zero groups", d, no_root_args ? D::forward : D::unforwarded_root_arguments);
+    d = ready(8, 1, 1);
+    d.root_matches_pipeline = false;  // pipeline built against a different root signature
+    expect("root and pipeline differ", d, no_pairing ? D::forward : D::root_pipeline_mismatch);
+    d = ready(8, 1, 1);
+    d.root_arguments_bound = false;  // a root SRV was never set, or a replacement was rejected
+    expect("unbound root SRV", d, no_bound ? D::forward : D::unbound_root_argument);
+    d.x = 0;
+    expect("unbound root SRV, zero groups", d, no_bound ? D::forward : D::unbound_root_argument);
+    d = ready(8, 1, 1);
+    d.root_matches_pipeline = d.root_arguments_bound = true;
+    expect("paired root with every SRV bound", d, D::forward);
     d = ready(8, 1, 1);
     d.list_open = false;
     expect("closed list", d, D::list_closed);
