@@ -2302,6 +2302,7 @@ class Stage:
                     regs.add('m0')
             offs.append(off)
             written.append(regs)
+        assert offs == sorted(offs)  # the ranges below are taken by bisection
         writes = {}
         for branch, target in branches:
             lo, hi = ((bisect.bisect_left(offs, target), bisect.bisect_right(offs, branch)) if target <= branch else
