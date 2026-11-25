@@ -108,14 +108,16 @@ inline std::vector<D3D12_STATIC_SAMPLER_DESC> decode_statics(const TranslatedSam
 inline UINT sampler_root_parameter(UINT srvs) { return srvs ? 2u : 1u; }
 
 inline HRESULT create_translated_root(ID3D12Device* device, UINT constants, UINT srvs,
-                                      const TranslatedSamplers& samplers, ID3D12RootSignature** out)
+                                      const TranslatedSamplers& samplers, ID3D12RootSignature** out, UINT uavs = 0)
 {
     D3D12_ROOT_PARAMETER parameters[3]{};
     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     parameters[0].Constants.Num32BitValues = constants;
-    const D3D12_DESCRIPTOR_RANGE srv_range{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srvs, 0, 0, 0};
+    // A compute program's outputs (u0..) follow its resources in the same table.
+    const D3D12_DESCRIPTOR_RANGE view_ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, srvs, 0, 0, 0},
+                                                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, uavs, 0, 0, srvs}};
     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-    parameters[1].DescriptorTable = {1, &srv_range};
+    parameters[1].DescriptorTable = {uavs ? 2u : 1u, view_ranges};
     const D3D12_DESCRIPTOR_RANGE sampler_range{
         D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, translated_sampler_count, 0, translated_sampler_space, 0};
     UINT count = sampler_root_parameter(srvs);

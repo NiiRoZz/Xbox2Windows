@@ -161,7 +161,78 @@ static void* desktop_pipeline(void* device)
 //   data-pointer     valid, with the first data qword pointing at state block A
 //   code-zero, data-zero, no-root, code-unreadable, code-past-end, data-unreadable, state-unreadable,
 //   stateb-unreadable, desc-unreadable
+//   dispatch, dispatch-swapped, dispatch-none: one creation, then dispatch_slot67 below
 // The unreadable cases point at a PAGE_NOACCESS page; code-past-end ends the code on the last byte before one.
+static void* slot67_pipeline;
+static void* slot67_root;
+
+// Case A of startup_gfx2hlsl_compute_check.py through the stand-in's own list: two root constants (slot 39), a
+// table (slot 35) of two 16-byte hardware buffer descriptors written into the title heap's memory, and Dispatch
+// (slot 14) of 3x2x2 groups with the slot 67 placeholder bound. Input and output are placed buffers 64 KiB apart
+// in one allocation, so both alias this process's memory and the result is read from that memory after the queue's
+// fence. dispatch-swapped exchanges the two descriptors (the output then names the buffer without unordered
+// access); dispatch-none records everything but the Dispatch. The 320 output words go to X2W_TEST_DISPATCH_OUT.
+static int dispatch_slot67(void* device, const std::string& mode)
+{
+    constexpr UINT words = 320;
+    auto* memory = static_cast<UINT*>(VirtualAlloc(nullptr, 0x20000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!memory) return 70;
+    UINT* const buffers[2] = {memory, memory + 0x10000 / sizeof(UINT)};
+    for (UINT i = 0; i < words; ++i) {
+        buffers[0][i] = 0x8b02a7f1u + i * 0x413b1u;
+        buffers[1][i] = 0xc5c5c5c5u;
+    }
+    const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
+    void* placed[2]{};
+    UINT descriptors[2][4]{};
+    for (int i = 0; i < 2; ++i) {
+        const D3D12_RESOURCE_DESC desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, words * sizeof(UINT), 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
+            D3D12_TEXTURE_LAYOUT_ROW_MAJOR, i ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE};
+        if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(buffers[i]), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
+                word(&__uuidof(ID3D12Resource)), word(&placed[i]))))) return 71;
+        const UINT64 address = reinterpret_cast<UINT64>(buffers[i]);
+        const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | 4u << 16, words, 0};
+        std::memcpy(descriptors[mode == "dispatch-swapped" ? 1 - i : i], view, sizeof(view));
+    }
+    const struct {
+        D3D12_DESCRIPTOR_HEAP_DESC desc;
+        UINT64 backing, bytes;
+    } heap_desc{{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE}, 0, 0};
+    void *heap = nullptr, *queue = nullptr, *allocator = nullptr, *list = nullptr, *fence = nullptr;
+    const D3D12_COMMAND_QUEUE_DESC queue_desc{};
+    const UINT list_desc[]{D3D12_COMMAND_LIST_TYPE_DIRECT, 2, 1, 0};
+    if (FAILED(static_cast<HRESULT>(invoke(device, 14, word(&heap_desc), word(&__uuidof(ID3D12DescriptorHeap)), word(&heap)))) ||
+        FAILED(static_cast<HRESULT>(invoke(device, 8, word(&queue_desc), word(&__uuidof(ID3D12CommandQueue)), word(&queue)))) ||
+        FAILED(static_cast<HRESULT>(invoke(device, 9, D3D12_COMMAND_LIST_TYPE_DIRECT, word(&__uuidof(ID3D12CommandAllocator)), word(&allocator)))) ||
+        FAILED(static_cast<HRESULT>(invoke(device, 73, word(list_desc), word(allocator), 0, word(&__uuidof(ID3D12GraphicsCommandList)), word(&list)))) ||
+        FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence))))) return 72;
+    const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
+    if (!cpu || !gpu) return 73;
+    std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
+    const UINT constants[2] = {0x01234567, 0x9e3779b9};
+    if (FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
+    invoke(list, 32, 1, word(&heap));
+    invoke(list, 25, word(slot67_pipeline));
+    invoke(list, 33, word(slot67_root));
+    invoke(list, 39, 0, 2, word(constants), 0);
+    invoke(list, 35, 1, gpu);
+    if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
+    if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
+    invoke(queue, 10, 1, word(&list));
+    if (FAILED(static_cast<HRESULT>(invoke(queue, 14, word(fence), 1)))) return 76;
+    for (const ULONGLONG deadline = GetTickCount64() + 10000; invoke(fence, 8) < 1;) {
+        if (GetTickCount64() >= deadline) return 78;
+        Sleep(1);
+    }
+    for (UINT i = 0; i < words; ++i)
+        if (buffers[0][i] != 0x8b02a7f1u + i * 0x413b1u) return 79;  // the input must stay as written
+    char path[MAX_PATH];
+    const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);
+    if (!n || n >= MAX_PATH) return 2;
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(buffers[1]), words * sizeof(UINT));
+    return 0;
+}
+
 static bool create_slot67(void* device, const char* code_path, const char* data_path, const char* state_path, const char* mode)
 {
     std::ifstream code_file(code_path, std::ios::binary), data_file(data_path, std::ios::binary), state_file(state_path, std::ios::binary);
@@ -218,8 +289,11 @@ static bool create_slot67(void* device, const char* code_path, const char* data_
     using Create = HRESULT (WINAPI*)(void*, const void*, REFIID, void**);
     auto create = [&](const void* d) {
         void* pipeline = nullptr;
-        return SUCCEEDED(reinterpret_cast<Create>((*static_cast<void***>(device))[67])(device, d, __uuidof(ID3D12PipelineState), &pipeline)) &&
+        const bool created = SUCCEEDED(reinterpret_cast<Create>((*static_cast<void***>(device))[67])(device, d, __uuidof(ID3D12PipelineState), &pipeline)) &&
                pipeline;
+        slot67_pipeline = pipeline;
+        slot67_root = root;
+        return created;
     };
     if (m == "order") {
         if (!create(desc)) return false;
@@ -258,12 +332,15 @@ int main(int argc, char** argv)
     ComPtr<IDXGIAdapter> adapter;
     void* device = nullptr;
     void* pso = nullptr;
-    const bool hardware = draw && std::strcmp(argv[4], "hardware") == 0;
+    const bool hardware = (draw && std::strcmp(argv[4], "hardware") == 0) ||
+                          GetEnvironmentVariableW(L"X2W_TEST_DISPATCH_HARDWARE", nullptr, 0) != 0;
     const bool textured = bc7.blocks != nullptr || GetEnvironmentVariableW(L"X2W_TEST_D16_SRV", nullptr, 0) != 0 ||
                           GetEnvironmentVariableW(L"X2W_TEST_FORMATTED_BUFFER", nullptr, 0) != 0;
     if (const int rc = prepare_stream_pipeline(argv[1], argv[2], argv[3], hardware, textured,
                                                 adapter, device, pso)) return rc;
     // <vs> <ps> <root> slot67 <code> <data> <state> [case]: WARP device and root only, then slot-67 creations.
+    if (argc == 9 && std::strcmp(argv[4], "slot67") == 0 && std::strncmp(argv[8], "dispatch", 8) == 0)
+        return create_slot67(device, argv[5], argv[6], argv[7], argv[8]) ? dispatch_slot67(device, argv[8]) : 10;
     if ((argc == 8 || argc == 9) && std::strcmp(argv[4], "slot67") == 0)
         return create_slot67(device, argv[5], argv[6], argv[7], argc == 9 ? argv[8] : "valid") ? 0 : 10;
     if (GetEnvironmentVariableW(L"X2W_TEST_TRUNCATED_ONLY", nullptr, 0)) return 0;

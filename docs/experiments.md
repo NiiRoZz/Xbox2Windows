@@ -14727,3 +14727,16 @@ Only the decision is checked: `tests/startup_list_dispatch_check.cpp` runs witho
 cmake --build --preset dev --target startup_list_dispatch_check
 ctest --preset dev --no-tests=error -R "^startup_list_dispatch" -V
 ```
+
+## Translated compute Dispatch
+
+With a device slot 67 placeholder bound, command-list slot 14 looks up the translation of the pipeline's published request (`<key>.txt` with `stage cs`, and `<key>.cs.cso`) and records it on the desktop list. This first slice binds raw buffers only: inputs and outputs named by 16-byte hardware buffer descriptors in the compute descriptor tables of slot 35, and entry values from the compute root constants of slots 37 and 39. An input must resolve to a complete GPU-backed range; an output must be a placed buffer that aliases the caller's memory and allows unordered access. Any other manifest line (textures, samplers, root views, other entry-value sources) leaves the pipeline untranslated, and a Dispatch that cannot be bound completely is refused with one logged reason and records nothing.
+
+`tests/startup_compute_dispatch_check.py` drives a source-built gfx1013 program through the stand-in's list on WARP and on a physical adapter (exit 77 without one) and reads the 320 output words back from the aliased memory. Controls in the same run: before the offline translation, without a Dispatch, and with the two descriptors exchanged, every output word must keep its sentinel. The log line `x2w-render compute dispatches: translated <n>, refused <n>, no translation <n>` follows the render totals.
+
+Measured on one fixture program. Programs with textures, samplers or outputs in memory that is not aliased are not dispatched.
+
+```powershell
+cmake --build --preset dev --target startup_stream_consumer
+ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
+```

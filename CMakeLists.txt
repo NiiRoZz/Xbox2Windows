@@ -3498,6 +3498,10 @@ if(EXISTS "${INTAKE_PYTHON}")
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
         set_tests_properties(startup_compute_translate_e2e_wrong_group_${adapter} PROPERTIES
             PASS_REGULAR_EXPRESSION "control wrong-group: rejected at word=[0-9]+ ")
+        add_test(NAME startup_compute_dispatch_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" ${adapter})
+        set_tests_properties(startup_compute_dispatch_${adapter} PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     foreach(backend IN ITEMS warp hardware)
         add_test(NAME startup_stream_draw_${backend} COMMAND "${CMAKE_COMMAND}" -E env "X2W_FXC=${STARTUP_FXC}"
