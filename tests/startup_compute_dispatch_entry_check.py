@@ -13,7 +13,8 @@ program writes the same lanes in every group, so the consumer's Dispatch(3, 2, 2
 2. Case F of startup_compute_store_d16_x_check.py stores with buffer_store_format_d16_x; the manifest takes
    `uav_descword3 0`, `uav_stride 0` and `uav_numrecords 0` from the output's descriptor. Three descriptors give
    three different expectations: 32_FLOAT with stride 8 and 12 records, 16_FLOAT with the same, and 32_FLOAT with
-   stride 12 and 7 records.
+   stride 12 and 7 records. A fourth sets SWIZZLE_ENABLE (word 1 bit 31): the dispatch is translated and the
+   program stores nothing, which holds only while the entry value keeps the upper bits of word 1.
 Before translation each program is refused with "no translation". Exit 77 when the adapter is not available.
 """
 import os
@@ -82,8 +83,8 @@ def run_program(root, name, consumer, dxc, adapter, program, manifest_tail, runs
             assert len(census) == 3 and census[1].endswith(f'reason "{expected}": 1 keys, 1 dispatches'), (label, census)
             print(f'{label}: refused ({expected}), output untouched')
             continue
-        assert expected != untouched
-        wrong = [i for i in range(C.WORDS) if got[i] != expected[i]]
+        assert (expected == untouched) == label.endswith('-swizzle')
+        wrong =[i for i in range(C.WORDS) if got[i] != expected[i]]
         assert not wrong, '%s: word=%d got=%08x expected=%08x (%d words differ)\n%s' % (
             label, wrong[0], got[wrong[0]], expected[wrong[0]], len(wrong), result.stderr[-3000:])
         assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1 and not refused, result.stderr[-3000:]
@@ -111,15 +112,15 @@ def main(consumer, dxc, adapter):
 
         _, words_f, rsrc2_f, group_f, _ = D.PROGRAMS['F']
         runs = []
-        for variant in ('F-f32', 'F-f16'):
+        for variant, label in (('F-f32', 'f32'), ('F-f16', 'f16'), ('F-swizzle-en', 'f32-swizzle')):
             _, source, constants, expected, _ = D.case_inputs(variant)
-            runs.append(('dispatch-store-' + variant[2:], source, (RAW, tuple(constants[3:5]) + (constants[2],)), expected))
+            runs.append(('dispatch-store-' + label, source, (RAW, tuple(constants[3:5]) + (constants[2],)), expected))
         word3_f32, halves = D.F_VARIANTS['F-f32'][0], D.FP16_VALUES
         runs.append(('dispatch-store-f32-stride12', D.poisoned_source(halves), (RAW, (12, 7, word3_f32)), store_f32(halves, 12, 7)))
-        assert runs[0][3] != runs[2][3] != runs[1][3]
+        assert runs[0][3] != runs[3][3] != runs[1][3]
         run_program(root, 'store', consumer, dxc, adapter, (words_f, rsrc2_f, group_f),
                     'udsrc 2 uav_descword3 0\nudsrc 3 uav_stride 0\nudsrc 4 uav_numrecords 0\n', runs)
-        print(f'startup_compute_dispatch_entry: PASS on {adapter} (5 descriptor-word dispatches match, '
+        print(f'startup_compute_dispatch_entry: PASS on {adapter} (6 descriptor-word dispatches match, '
               '1 refused; untouched before translation)')
 
 
