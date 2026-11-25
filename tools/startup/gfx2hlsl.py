@@ -2150,8 +2150,11 @@ class Stage:
         first = self.sym.get(rsrc[1]) if rsrc and rsrc[0] == 's' and rsrc[2] - rsrc[1] == 3 else None
         if not first or first[0] != 'desc' or first[1][0] != 'table' or first[2] is None or first[3] % 4:
             raise Unsupported('buffer store through %s holding %s' % (ops[2], first))
+        # In the entry block program order is exact, so the four words above decide alone: a mark that an earlier
+        # state of these registers or a copy in other registers left on the descriptor says nothing about them.
+        # Past it another path can reach the store with other words, and any mark on the descriptor refuses it.
         if (any(self.sym.get(rsrc[1] + k) != first[:3] + (first[3] + k,) for k in range(4))
-                or desc_key(first) in self.pipe.modified):
+                or getattr(self, 'past_entry', True) and desc_key(first) in self.pipe.modified):
             raise Unsupported('buffer store through a modified descriptor')
         key = desc_key(first)
         terms = [self.u(ops[1])]
