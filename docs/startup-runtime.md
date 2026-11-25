@@ -2082,7 +2082,7 @@ queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves the result b
 Command/result types `1` (open), `2` (close), `3` (packet), and `5` (stop) are established by
 observed callers. The experimental mode echoes any 32-bit type value at `+0x00` verbatim
 (including unobserved types such as `4`) rather than rejecting it, while keeping payload bytes
-outside `+0x00` and `+0x04` zero. Handles are never reused, and each connection's queue buffer is
+outside `+0x00` and `+0x04` zero (`+0x34` carries decoded bytes only in the optional Opus build below). Handles are never reused, and each connection's queue buffer is
 released on `XApuDisconnect`. Default non-permissive mode still traps on every export
 (`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
 
