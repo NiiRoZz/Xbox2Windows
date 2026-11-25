@@ -162,6 +162,7 @@ constexpr std::uint64_t view_heap_probe_floor = 65536;
 
 void log(const char* format, ...);
 bool first_calls(LONG& counter, LONG limit);
+void request_translation(Wrapper* pipeline);
 std::uint64_t accepted_view_heap_descriptors(ID3D12Device* device, UINT node_mask);
 
 std::uint64_t desktop_cpu_handle(std::uint64_t handle, UINT* contiguous = nullptr, UINT* available = nullptr)
@@ -2013,8 +2014,11 @@ void __stdcall list_execute_indirect(Wrapper* self, void* signature, UINT count,
         else if (mesh) bytes = sizeof(D3D12_DISPATCH_MESH_ARGUMENTS);
         else bytes = sizeof(D3D12_DRAW_ARGUMENTS);
         if (type != D3D12_COMMAND_LIST_TYPE_DIRECT || !pass.indirect_graphics.root ||
-            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh)
+            pass.indirect_graphics.root != pass.graphics_root || pass.indirect_graphics.mesh != mesh) {
+            // A console pipeline used only here still gets the request a direct draw writes; nothing is drawn.
+            if (pass.pipeline && !pass.pipeline_real) request_translation(pass.pipeline);
             return refuse("indirect graphics requires a direct list with a matching desktop pipeline and root");
+        }
         if (!pass.targets_bound || pass.target_count != 1 || !pass.target0 ||
             pass.target_formats[0] != pass.indirect_graphics.target_format ||
             pass.dsv_format != DXGI_FORMAT_UNKNOWN || !pass.viewport_set || !pass.scissor_set)

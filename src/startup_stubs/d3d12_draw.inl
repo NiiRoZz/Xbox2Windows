@@ -412,6 +412,14 @@ BoundPipeline* translation_for(Wrapper* pipeline)
     return bound;
 }
 
+// The request translation_for writes on a direct draw, for a pipeline that slot 61 refuses.
+void request_translation(Wrapper* pipeline)
+{
+    AcquireSRWLockExclusive(&draw_lock);
+    translation_for(pipeline);
+    ReleaseSRWLockExclusive(&draw_lock);
+}
+
 bool needs_rtv_variant(DXGI_FORMAT format)
 {
     switch (format) {
