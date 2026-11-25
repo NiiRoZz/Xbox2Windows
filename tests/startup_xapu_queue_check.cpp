@@ -10,8 +10,12 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <string>
+#ifdef X2W_HAVE_OPUS
+#include <opus.h>
+#endif
 
 namespace {
 
@@ -160,6 +164,130 @@ int main(int argc, char** argv)
     check(dequeue(h2, result.data()) == hr_ok, "h2 dequeue #2 succeeds");
     check(dequeue(h2, result.data()) == hr_fail, "h2 drained -> E_FAIL");
     check(disconnect(h2) == hr_ok, "XApuDisconnect(h2) succeeds");
+
+    // Experiment mode (X2W_XAPU_SLOT_RESULTS=1): open/reset/close complete with {type, slot}; a decode
+    // (type 3) and an unknown type are accepted without a result. The old all-zero result fails here.
+    SetEnvironmentVariableA("X2W_XAPU_SLOT_RESULTS", "1");
+    void* h3 = nullptr;
+    check(connect(input.data(), output.data(), &h3) == static_cast<long>(0x80070057) && h3 == nullptr,
+          "slot results: connect with buffer size 0 -> E_INVALIDARG");
+    std::array<unsigned char, 0x18> sized{};
+    const std::uint32_t buffer_bytes = 0x104000;
+    std::memcpy(sized.data() + 0x0C, &buffer_bytes, 4);
+    check(connect(sized.data(), nullptr, &h3) == hr_pointer && h3 == nullptr, "slot results: null output -> E_POINTER");
+    output.fill(0);
+    check(connect(sized.data(), output.data(), &h3) == hr_ok && h3 != nullptr, "XApuConnect h3 (slot results)");
+    unsigned char* shared = nullptr;
+    std::memcpy(&shared, output.data(), sizeof(shared));
+    bool second_untouched = true;
+    for (std::size_t i = 8; i < output.size(); ++i) second_untouched &= output[i] == 0;
+    check(shared != nullptr && second_untouched, "slot results: connect returns the shared buffer in output +0 only");
+    if (shared) {
+        shared[0] = 1;  // first input slot
+        shared[buffer_bytes - 1] = 1;  // end of the last output slot
+        check(shared[0x14000] == 0, "slot results: shared buffer starts zeroed");
+    }
+    auto command = [](std::uint32_t type, std::uint32_t slot) {
+        std::array<unsigned char, 0x40> c{};
+        std::memcpy(c.data(), &type, 4);
+        std::memcpy(c.data() + 4, &slot, 4);
+        return c;
+    };
+    const auto open = command(1, 7), reset = command(5, 7), close = command(2, 7), unknown = command(9, 7);
+    auto decode = command(3, 7);
+    const std::array<unsigned char, 4> packet{0xFC, 0xFF, 0xFE, 0x00};
+    const std::uint32_t frames = 960, bytes = 4;
+    const auto packet_ptr = reinterpret_cast<std::uint64_t>(packet.data());
+    std::memcpy(decode.data() + 0x24, &frames, 4);
+    std::memcpy(decode.data() + 0x28, &bytes, 4);
+    std::memcpy(decode.data() + 0x2C, &packet_ptr, 8);
+    check(enqueue(h3, nullptr, 0, 0) == hr_pointer, "slot results: null command -> E_POINTER");
+    check(enqueue(h3, open.data(), 0, 0) == hr_ok, "slot results: open accepted");
+    check(enqueue(h3, decode.data(), 0, 0) == hr_ok, "slot results: decode accepted");
+    check(enqueue(h3, unknown.data(), 0, 0) == hr_ok, "slot results: unknown type accepted");
+    check(enqueue(h3, reset.data(), 0, 0) == hr_ok, "slot results: reset accepted");
+    check(enqueue(h3, close.data(), 0, 0) == hr_ok, "slot results: close accepted");
+#ifdef X2W_HAVE_OPUS
+    // With libopus a decode always completes; this one names no output buffer, so it decodes 0 bytes.
+    check(get_count(h3, 0) == 4, "slot results: decode completes, unknown type produces no result");
+    const std::uint32_t expected[] = {1u, 3u, 5u, 2u};
+#else
+    check(get_count(h3, 0) == 3, "slot results: decode and unknown type produce no result");
+    const std::uint32_t expected[] = {1u, 5u, 2u};
+#endif
+    for (std::uint32_t want : expected) {
+        result.fill(0xAA);
+        std::uint32_t type = 0, slot = 0;
+        const bool ok = dequeue(h3, result.data()) == hr_ok;
+        std::memcpy(&type, result.data(), 4);
+        std::memcpy(&slot, result.data() + 4, 4);
+        bool rest_zero = true;
+        for (std::size_t i = 8; i < result_bytes; ++i) rest_zero &= result[i] == 0;
+        check(ok && type == want && slot == 7 && rest_zero, "slot results: result {type, slot} in order, rest zero");
+    }
+    check(dequeue(h3, result.data()) == hr_fail, "slot results: drained -> E_FAIL");
+#ifdef X2W_HAVE_OPUS
+    {
+        // A real 20 ms mono CELT packet (as the title's packets are) decodes into the command's output
+        // buffer and completes with {3, slot, 960 * 4 bytes}. A corrupt length completes with 0 bytes.
+        int error = 0;
+        OpusEncoder* enc = opus_encoder_create(48000, 1, OPUS_APPLICATION_RESTRICTED_LOWDELAY, &error);
+        check(enc && error == OPUS_OK, "opus encoder created");
+        float tone[960 * 3];
+        for (int i = 0; i < 960 * 3; ++i) tone[i] = 0.5f * std::sin(6.2831853f * 1000.0f * i / 48000.0f);
+        unsigned char packets[3][400];
+        opus_int32 sizes[3]{};
+        for (int k = 0; enc && k < 3; ++k) sizes[k] = opus_encode_float(enc, tone + 960 * k, 960, packets[k], 400);
+        if (enc) opus_encoder_destroy(enc);
+        check(sizes[0] > 1 && sizes[1] > 1 && sizes[2] > 1, "opus encoder produced three packets");
+        check((packets[0][0] >> 3) == 31 && (packets[0][0] & 4) == 0, "fixture packet is a 20 ms mono CELT frame (TOC config 31)");
+        void* h4 = nullptr;
+        check(connect(sized.data(), output.data(), &h4) == hr_ok, "XApuConnect h4 (decode)");
+        float out[960 * 2];
+        float peak = 0;
+        for (int k = 0; k < 3; ++k) {
+            for (float& f : out) f = 123.0f;
+            auto cmd3 = command(3, 9);
+            const float rate = 48000.0f;
+            const std::uint32_t frames3 = 960, out_bytes = 0xF00, in_bytes = static_cast<std::uint32_t>(sizes[k]);
+            const auto in_ptr = reinterpret_cast<std::uint64_t>(packets[k]);
+            const auto out_ptr = reinterpret_cast<std::uint64_t>(out);
+            std::memcpy(cmd3.data() + 0x1C, &rate, 4);
+            std::memcpy(cmd3.data() + 0x24, &frames3, 4);
+            std::memcpy(cmd3.data() + 0x28, &in_bytes, 4);
+            std::memcpy(cmd3.data() + 0x2C, &in_ptr, 8);
+            std::memcpy(cmd3.data() + 0x34, &out_bytes, 4);
+            std::memcpy(cmd3.data() + 0x38, &out_ptr, 8);
+            check(enqueue(h4, cmd3.data(), 0, 0) == hr_ok, "decode command accepted");
+            std::uint32_t type = 0, slot = 0, value = 0;
+            check(dequeue(h4, result.data()) == hr_ok, "decode result available at once");
+            std::memcpy(&type, result.data(), 4);
+            std::memcpy(&slot, result.data() + 4, 4);
+            std::memcpy(&value, result.data() + 0x34, 4);
+            check(type == 3 && slot == 9 && value == 960 * 4, "decode result {3, slot, 3840 bytes}");
+            check(out[960] == 123.0f, "decode writes no more than one mono frame");
+            for (int i = 0; i < 960; ++i) peak = std::fmax(peak, std::fabs(out[i]));
+        }
+        check(peak > 0.3f && peak < 1.0f, "decoded frames carry the encoded tone");
+        auto bad = command(3, 9);
+        const float rate = 48000.0f;
+        const std::uint32_t frames3 = 960, out_bytes = 0xF00, zero = 0;
+        const auto out_ptr = reinterpret_cast<std::uint64_t>(out);
+        std::memcpy(bad.data() + 0x1C, &rate, 4);
+        std::memcpy(bad.data() + 0x24, &frames3, 4);
+        std::memcpy(bad.data() + 0x28, &zero, 4);
+        std::memcpy(bad.data() + 0x34, &out_bytes, 4);
+        std::memcpy(bad.data() + 0x38, &out_ptr, 8);
+        check(enqueue(h4, bad.data(), 0, 0) == hr_ok, "empty decode accepted");
+        std::uint32_t value = 1;
+        check(dequeue(h4, result.data()) == hr_ok, "empty decode completes");
+        std::memcpy(&value, result.data() + 0x34, 4);
+        check(value == 0, "empty decode reports 0 bytes");
+        check(disconnect(h4) == hr_ok, "XApuDisconnect(h4)");
+    }
+#endif
+    check(disconnect(h3) == hr_ok, "XApuDisconnect(h3) succeeds");
+    SetEnvironmentVariableA("X2W_XAPU_SLOT_RESULTS", nullptr);
 
     FreeLibrary(module);
     std::printf(failures ? "startup_xapu_queue_check: %d failure(s)\n" : "startup_xapu_queue_check: ok\n", failures);

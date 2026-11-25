@@ -4,6 +4,7 @@
 #define X2W_TRAP_MODULE_ID 2
 #include "startup_stubs/trap.h"
 #include "startup_stubs/local_log.h"
+#include "startup_stubs/audio_trace.h"
 
 // Experimental (docs/startup-runtime.md). With X2W_AUDIO_PERMISSIVE=1 the exports
 // stand in for the DSP stream interface; otherwise they trap. Seen:
@@ -43,6 +44,7 @@ extern "C" __declspec(noinline) long XDspActivate(u64 rcx, u64 rdx, u64 r8, u64 
         !stream_out || !x2w_local::writable(stream_out, sizeof(void*))) {
         x2w_local::logf("x2w-audio XDspActivate status_out=%p stream_out=%p -> E_POINTER",
                         static_cast<void*>(status_out), static_cast<void*>(stream_out));
+        X2W_AUDIO_TRACE(0, rcx, rdx, r8, r9, 0, 0, hr_pointer, reinterpret_cast<const void*>(rdx), 0x40);
         return hr_pointer;
     }
     *status_out = nullptr;
@@ -50,6 +52,7 @@ extern "C" __declspec(noinline) long XDspActivate(u64 rcx, u64 rdx, u64 r8, u64 
     x2w_local::logf("x2w-audio XDspActivate status_out=%p stream_out=%p -> 0x8AC810A2 "
                     "(XDSP_E_NO_DEVICE_RESOURCES)",
                     static_cast<void*>(status_out), static_cast<void*>(stream_out));
+    X2W_AUDIO_TRACE(0, rcx, rdx, r8, r9, 0, 0, hr_no_device_resources, reinterpret_cast<const void*>(rdx), 0x40);
     return hr_no_device_resources;
 }
 
@@ -63,6 +66,7 @@ extern "C" __declspec(noinline) long XDspConnectWithMaximumStreamLimit(u64 rcx, 
                         static_cast<unsigned long long>(rcx), static_cast<unsigned long long>(rdx),
                         static_cast<unsigned long long>(r8), static_cast<unsigned long long>(r9),
                         static_cast<unsigned long long>(flag), static_cast<void*>(handle));
+        X2W_AUDIO_TRACE(1, rcx, rdx, r8, r9, flag, handle, hr_pointer);
         return hr_pointer;
     }
     *handle = &connection;
@@ -71,19 +75,24 @@ extern "C" __declspec(noinline) long XDspConnectWithMaximumStreamLimit(u64 rcx, 
                     static_cast<unsigned long long>(rcx), static_cast<unsigned long long>(rdx),
                     static_cast<unsigned long long>(r8), static_cast<unsigned long long>(r9),
                     static_cast<unsigned long long>(flag), static_cast<void*>(handle));
+    X2W_AUDIO_TRACE(1, rcx, rdx, r8, r9, flag, handle, result);
     return result;
 }
 
 extern "C" __declspec(noinline) long XDspDeactivate(u64 rcx, u64 rdx, u64 r8, u64 r9)
 {
     static LONG calls;
-    return accept("XDspDeactivate", 2, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+    const long result = accept("XDspDeactivate", 2, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+    X2W_AUDIO_TRACE(2, rcx, rdx, r8, r9, 0, 0, result);
+    return result;
 }
 
 extern "C" __declspec(noinline) long XDspDisconnect(u64 rcx, u64 rdx, u64 r8, u64 r9)
 {
     static LONG calls;
-    return accept("XDspDisconnect", 3, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+    const long result = accept("XDspDisconnect", 3, rcx, rdx, r8, r9, _ReturnAddress(), calls);
+    X2W_AUDIO_TRACE(3, rcx, rdx, r8, r9, 0, 0, result);
+    return result;
 }
 
 extern "C" __declspec(noinline) long XDspSubmitCommand(u64 rcx, u64 rdx, u64 r8, u64 r9)
@@ -98,15 +107,18 @@ extern "C" __declspec(noinline) long XDspSubmitCommand(u64 rcx, u64 rdx, u64 r8,
         x2w_local::logf("x2w-audio XDspSubmitCommand stream=0x%llx sequence_out=%p -> E_INVALIDARG "
                         "(unknown stream handle)",
                         static_cast<unsigned long long>(rcx), static_cast<void*>(sequence_out));
+        X2W_AUDIO_TRACE(4, rcx, rdx, r8, r9, 0, 0, hr_invalidarg, reinterpret_cast<const void*>(rdx), 0x40);
         return hr_invalidarg;
     }
     if (!sequence_out || !x2w_local::writable(sequence_out, sizeof(*sequence_out))) {
         x2w_local::logf("x2w-audio XDspSubmitCommand stream=0x%llx sequence_out=%p -> E_POINTER",
                         static_cast<unsigned long long>(rcx), static_cast<void*>(sequence_out));
+        X2W_AUDIO_TRACE(4, rcx, rdx, r8, r9, 0, 0, hr_pointer, reinterpret_cast<const void*>(rdx), 0x40);
         return hr_pointer;
     }
     x2w_local::logf("x2w-audio XDspSubmitCommand stream=0x%llx sequence_out=%p -> 0x8AC810A2 "
                     "(XDSP_E_NO_DEVICE_RESOURCES, sequence preserved)",
                     static_cast<unsigned long long>(rcx), static_cast<void*>(sequence_out));
+    X2W_AUDIO_TRACE(4, rcx, rdx, r8, r9, 0, 0, hr_no_device_resources, reinterpret_cast<const void*>(rdx), 0x40);
     return hr_no_device_resources;
 }

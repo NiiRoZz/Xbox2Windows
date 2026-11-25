@@ -401,6 +401,39 @@ endforeach()
 target_link_libraries(startup_stub_xg_xs PRIVATE d3d12 dxguid)
 target_link_libraries(startup_stub_gameinput PRIVATE user32)
 target_link_libraries(startup_stub_xapu PRIVATE winmm)
+# Prototype (docs/audio-roadmap.md): X2W_OPUS_DIR names an installed static libopus (built with the
+# static runtime) so the XApu stand-in decodes its packets; unset, the build is unchanged.
+set(X2W_OPUS_DIR "" CACHE PATH "Installed libopus prefix for the XApu decode prototype")
+if(X2W_OPUS_DIR)
+    find_package(Opus CONFIG REQUIRED PATHS "${X2W_OPUS_DIR}" NO_DEFAULT_PATH)
+    target_link_libraries(startup_stub_xapu PRIVATE Opus::opus)
+    target_compile_definitions(startup_stub_xapu PRIVATE X2W_HAVE_OPUS=1)
+endif()
+# Prototype (docs/audio-roadmap.md): X2W_FFMPEG_DIR names an FFmpeg shared dev build (include/, lib/) so the
+# AcpHal stand-in runs XMA contexts with libavcodec. The DLLs are delay-loaded at run time from
+# X2W_FFMPEG_BIN, so AcpHal.dll still loads where they are absent. Unset, the build is unchanged.
+set(X2W_FFMPEG_DIR "" CACHE PATH "FFmpeg shared dev build for the AcpHal XMA prototype")
+if(X2W_FFMPEG_DIR)
+    target_include_directories(startup_stub_acphal PRIVATE "${X2W_FFMPEG_DIR}/include")
+    # The bundled MinGW import libraries cannot be delay-loaded; regenerate MSVC ones from the .def files.
+    get_filename_component(x2w_msvc_bin "${CMAKE_LINKER}" DIRECTORY)
+    foreach(x2w_ff IN ITEMS avcodec-63 avutil-61)
+        execute_process(COMMAND "${x2w_msvc_bin}/lib.exe" /nologo /machine:x64 "/def:${X2W_FFMPEG_DIR}/lib/${x2w_ff}.def"
+            "/name:${x2w_ff}.dll" "/out:${CMAKE_BINARY_DIR}/ffmpeg-${x2w_ff}.lib" RESULT_VARIABLE x2w_lib_rc OUTPUT_QUIET)
+        if(NOT x2w_lib_rc EQUAL 0)
+            message(FATAL_ERROR "lib.exe could not build the ${x2w_ff} import library")
+        endif()
+    endforeach()
+    target_link_libraries(startup_stub_acphal PRIVATE "${CMAKE_BINARY_DIR}/ffmpeg-avcodec-63.lib"
+        "${CMAKE_BINARY_DIR}/ffmpeg-avutil-61.lib" delayimp)
+    target_link_options(startup_stub_acphal PRIVATE /DELAYLOAD:avcodec-63.dll /DELAYLOAD:avutil-61.dll)
+    target_compile_definitions(startup_stub_acphal PRIVATE X2W_HAVE_FFMPEG=1)
+    add_executable(startup_acphal_xma_check tests/startup_acphal_xma_check.cpp)
+    add_dependencies(startup_acphal_xma_check startup_stub_acphal)
+    add_test(NAME startup_acphal_xma COMMAND startup_acphal_xma_check "$<TARGET_FILE:startup_stub_acphal>"
+        "${X2W_FFMPEG_DIR}/bin")
+    set_tests_properties(startup_acphal_xma PROPERTIES TIMEOUT 60)
+endif()
 # The DirectStorage heartbeat reports this process's peak commit (#1199).
 target_link_libraries(startup_stub_xcrdapi PRIVATE psapi)
 target_sources(startup_stub_gameinput PRIVATE src/startup_stubs/runtime_proxy.cpp)
@@ -582,6 +615,12 @@ add_executable(startup_xapu_queue_check tests/startup_xapu_queue_check.cpp)
 target_compile_features(startup_xapu_queue_check PRIVATE cxx_std_17)
 add_dependencies(startup_xapu_queue_check startup_stub_xapu)
 add_test(NAME startup_xapu_queue COMMAND startup_xapu_queue_check "$<TARGET_FILE:startup_stub_xapu>")
+if(X2W_OPUS_DIR)
+    # The check encodes a known packet with the same libopus the stand-in decodes with.
+    target_link_libraries(startup_xapu_queue_check PRIVATE Opus::opus)
+    target_compile_definitions(startup_xapu_queue_check PRIVATE X2W_HAVE_OPUS=1)
+    set_target_properties(startup_xapu_queue_check PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 set_tests_properties(startup_xapu_queue PROPERTIES TIMEOUT 60)
 
 add_executable(startup_chad_check tests/startup_chad_check.cpp)
