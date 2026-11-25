@@ -155,6 +155,10 @@ def sample(directory, consumer, dxc, env):
     assert len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1, result.stderr[-3000:]
     layer = clean(result)
 
+    got, result = run(directory, consumer, env, 'dispatch-sampled-compute', layout)  # a compute list and queue
+    assert got == expected and len(lines(result, 'Dispatch(3, 2, 2) translated')) == 1, result.stderr[-3000:]
+    clean(result)
+
     got, result = run(directory, consumer, env, 'dispatch-sampled-unbound', layout)
     assert got == untouched, 'a refused Dispatch wrote the output'
     refused = lines(result, 'refused: ')

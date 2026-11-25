@@ -23,6 +23,15 @@ struct ComputeTranslation {
     const char* first_refusal = nullptr;   // reason of the first refused call
     std::uint32_t refusal_words[4] = {};   // the table descriptor that reason was about, if any; a view token's
                                            // last word is replaced by its view format | dimension << 16
+    ~ComputeTranslation()
+    {
+        // The per-process cache is destroyed during DLL detach. A driver may already have shut
+        // down when the process is terminating. Explicit unload still releases both references.
+        if (x2w_d3d12_process_terminating) {
+            pipeline.Detach();
+            root.Detach();
+        }
+    }
 };
 
 // Formats a `float` typed output may be viewed with: the program stores float4.
@@ -69,7 +78,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
             if (line != "stage cs") return "not a compute manifest";
             continue;
         }
-        unsigned i = 0, x = 0, y = 0, z = 0;
+        unsigned i = 0, x = 0, y = 0, z = 0, w = 0;
         int a = 0, b = 0, used = 0;
         const auto whole = [&] { return used == static_cast<int>(line.size()); };
         if (line.empty() || (std::sscanf(line.c_str(), "group %u %u %u%n", &x, &y, &z, &used) == 3 && whole())) continue;
@@ -85,7 +94,7 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uavs.push_back({a, b, true});
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
-        else if (std::sscanf(line.c_str(), "smp %u %x %x %x %x%n", &i, &x, &y, &z, &x, &used) == 5 && whole() &&
+        else if (std::sscanf(line.c_str(), "smp %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5 && whole() &&
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
         else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"
@@ -153,6 +162,9 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
             counter = tr->unmodelled ? &compute_dispatches_unmodelled : &compute_dispatches_untranslated;
         }
     }
+    // A word no slot 37 or 39 call wrote since the compute root was set has no value to pass (it is not 0).
+    for (std::size_t i = 0; !reason && i < tr->uds.size(); ++i)
+        if (!pass.compute_constants.is_bound(tr->uds[i].a, tr->uds[i].b, 1)) reason = "an entry value was not set since the compute root";
     const std::size_t inputs = reason ? 0 : tr->srvs.size(), count = reason ? 0 : inputs + tr->uavs.size();
     for (std::size_t i = 0; i < count && !reason; ++i) {
         const bool output = i >= inputs;
@@ -276,7 +288,9 @@ bool dispatch_translated(Wrapper* self, UINT x, UINT y, UINT z)
     for (std::size_t i = 0; i < count; ++i, dest.ptr += draw_heap_increment) {
         const View& view = views[i];
         if (i < inputs && view.texture) {
-            require_state(self, view.resource, sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            // A compute list accepts no pixel-shader or depth state in a transition.
+            require_state(self, view.resource, type == D3D12_COMMAND_LIST_TYPE_COMPUTE ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                : sampled_state(self, view.resource) | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
             device_of(the_device)->CreateShaderResourceView(view.resource,
                 view.described ? reinterpret_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(view.desc) : nullptr, dest);
             continue;
