@@ -14074,8 +14074,8 @@ a branch and its target. Two cases remained wrong in the emitted HLSL:
 - A path that leaves a loop's textual range and comes back changes a constant the textual range does not cover.
 
 The joined registers are now worked out over the basic blocks and their dominators (a proven `s_setpc_b64` is an
-edge, and ends its block). A joined register keeps its symbol when every path that wrote it brings an equal symbol
-that names one value, is read at run time when it holds a constant, and refuses a read before its next write when a
-path brings a symbol with no run-time value. `startup_gfx2hlsl_join_symbols_check.py` pins the cases; the
+edge, and ends its block). A joined register keeps its symbol when every path into the target brings an equal symbol
+that names one value (a pointer only if no add touched it), is read at run time when it holds a constant, and refuses a
+read before its next write when a path brings a symbol with no run-time value or no definition at all. `startup_gfx2hlsl_join_symbols_check.py` pins the cases; the
 `join_symbols_folded_*` tests run the old OUTSIDE statement and must give 3, not 11. Controls are pure Python plus
 a pixel dispatch on WARP and hardware; `binary` reassembles the fixture words with LLVM 15.

@@ -15,11 +15,14 @@ At a branch target, a register whose program-order symbol may not hold on every 
 and their dominators) keeps a symbol only when every path into the target brings an equal one that names one value.
 Otherwise it is read at run time: every constant is assigned when set, and an entry root constant is assigned at
 entry. A register that holds, on some path into the target, a symbol with no run-time value (a descriptor word, a
-pointer, an unplaced compute user SGPR) refuses any read before its next write.
+pointer, an unplaced compute user SGPR) refuses any read before its next write, and so does one that such a symbol
+reaches while another edge never defined it (DESC_ONE_PATH).
 
 The fixtures are source-built gfx1013 pixel stages behind a fixed vertex stage:
 - PAIR_*, DESC_*: a 64-bit copy and descriptor loads around a join (pure Python); OUTSIDE: a loop whose path leaves the
   loop's textual range and comes back; CS_UNPLACED: a compute program writing an unplaced user SGPR on one path.
+- DESC_ONE_PATH, PTR_OFFSETS: refusal controls: the branch skips the only load of the descriptor, and two paths add
+  different offsets to one pointer.
 - JOIN_SAME, DESC_SAME: the same constant (read at run time since #2279), or the same descriptor, on both paths of a forward join (kept).
 - CS_RELOAD: a compute loop that stores through its descriptor at the header and reloads it from the same table slot
   before the back edge (kept, and dispatched); CS_RELOAD_OTHER reloads another slot (refused).
@@ -106,15 +109,24 @@ SOURCES = {
     'JOIN_RFL': ('s_mov_b32 s23, 1\ns_cmp_eq_u32 s8, 0\ns_cbranch_scc1 1\ns_mov_b32 s23, 2\nv_mov_b32 v7, s23\n'
                  'v_readfirstlane_b32 s24, v7\nv_mov_b32 v0, s24\n' + EXPORT,
                  '810397be' '088006bf' '010085bf' '820397be' '17020e7e' '0705307e' '1802007e' + EXPORT_WORDS),
-    # A path that never wrote the register brings no value to the join: the descriptor loaded on the other path is
-    # kept (DESC_ONE_PATH). A graphics user SGPR (s0-s15) counts as written at entry, so a constant written on one path
-    # into it is read at run time, not folded (USER_ONE_PATH).
+    # A descriptor loaded on only one path has no definition on the other edge: unproven at the join, refused when read
+    # (DESC_ONE_PATH: the branch skips the only load). A graphics user SGPR (s0-s15) counts as written at entry, so a
+    # constant written on one path into it is read at run time, not folded (USER_ONE_PATH).
     'DESC_ONE_PATH': ('s_mov_b32 s30, 0\nv_mov_b32 v0, 0\nv_mov_b32 v1, 0\ns_cmp_eq_u32 s30, 0\ns_cbranch_scc1 2\n'
                       's_load_dwordx8 s[16:23], s[8:9], 0x0\ns_waitcnt lgkmcnt(0)\n'
                       'image_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\ns_waitcnt vmcnt(0)\n'
                       'exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
                       '80039ebe8002007e8002027e1e8006bf020085bf04040cf4000000fa7fc08cbf080f00f000040400703f8cbf'
                       '0f1800f804050607000081bf'),
+    # Two paths add different offsets to one pointer: the symbol keeps ('ptr', source) plus an 'added' mark, so the
+    # equal tuples must not be kept as one pointer (PTR_OFFSETS).
+    'PTR_OFFSETS': ('s_mov_b32 s30, 0\nv_mov_b32 v0, 0\nv_mov_b32 v1, 0\ns_cmp_eq_u32 s30, 0\ns_cbranch_scc1 2\n'
+                    's_add_u32 s8, s8, 4\ns_branch 1\ns_add_u32 s8, s8, 8\n'
+                    's_load_dwordx8 s[16:23], s[8:9], 0x0\ns_waitcnt lgkmcnt(0)\n'
+                    'image_load v[4:7], v[0:1], s[16:23] dmask:0xf dim:SQ_RSRC_IMG_2D\ns_waitcnt vmcnt(0)\n'
+                    'exp mrt0 v4, v5, v6, v7 done vm\ns_endpgm\n',
+                    '80039ebe8002007e8002027e1e8006bf020085bf08840880010082bf08880880'
+                    '04040cf4000000fa7fc08cbf080f00f000040400703f8cbf0f1800f804050607000081bf'),
     'USER_ONE_PATH': ('s_mov_b32 s30, 0\ns_cmp_eq_u32 s30, 0\ns_cbranch_scc1 1\ns_mov_b32 s12, 2\nv_mov_b32 v0, s12\n'
                       + EXPORT, '80039ebe1e8006bf010085bf82038cbe0c02007e' + EXPORT_WORDS),
 }
@@ -142,7 +154,8 @@ def root(*params):
 
 
 ROOTS = {'DESC_CALC': ('t', 1), 'PAIR_READ': ('t', 1), 'PAIR_ROOT': ('t', 1), 'PAIR_WRITE': ('t', 1), 'DESC_LOAD': ('t', 1),
-         'DESC_WORD': ('t', 1), 'DESC_SAME': ('t', 1), 'DESC_ONE_PATH': ('t', 1)}
+         'DESC_WORD': ('t', 1), 'DESC_SAME': ('t', 1), 'DESC_ONE_PATH': ('t', 1),
+         'PTR_OFFSETS': ('t', 1)}
 
 
 def translate(name):
@@ -217,8 +230,9 @@ def check_controls():
         assert "buffer store through s[16:19] holding ('joined at a branch target',)" in str(reason), str(reason)
     else:
         raise AssertionError('CS_RELOAD_OTHER accepted')
-    one = translate('DESC_ONE_PATH')
-    assert '        t = r0.Load(int3(v0, v1, 0));' in one.hlsl_ps().splitlines(), one.hlsl_ps()
+    # Refusal controls: no definition on the skipping edge, and different offsets added to one pointer.
+    refused('DESC_ONE_PATH', "descriptor operand s[16:23] holds ('joined at a branch target',)")
+    refused('PTR_OFFSETS', "s_load through s8 holding ('joined at a branch target',)")
     user = lines('USER_ONE_PATH')
     assert '        v0 = s12;' in user and not any('v0 = 0x00000002u' in l for l in user), user
     # The readfirstlane recompute (uniform since the last join) gets no folded constant from across a join: both are
@@ -229,6 +243,7 @@ def check_controls():
     # in the symbol) and descnum.
     assert not G.names_one_value(('desc', ('table', 0), 0, 0, 'modified')) and not G.names_one_value(('descnum',))
     assert G.names_one_value(('desc', ('table', 0), 0, 0)) and G.names_one_value(('const', 2))
+    assert G.names_one_value(('ptr', ('table', 0))) and not G.names_one_value(('ptr', ('table', 0), 'added'))
     print('loop counters, forward joins, a root-constant loop, 64-bit copies and descriptor joins pass; equal symbols '
           'on every path are kept; straight-line code still folds')
 

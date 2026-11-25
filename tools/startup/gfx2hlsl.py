@@ -465,8 +465,9 @@ def names_one_value(sym):
         return False
     if sym[0] == 'desc':
         return len(sym) == 4  # ('desc', source, load offset, dword); the 'modified' mark drops the written value
-    # shortcut: equal 'ptr' symbols count as one value though s_add_u32 on a pointer keeps its symbol; not covered here (PR #2069)
-    return sym[0] in ('const', 'ud', 'ptr', 'ptrhi', 'execcopy')
+    # An add on a pointer keeps its symbol and marks it 'added' (the offset is not in the tuple), so only an
+    # untouched pointer, exactly (kind, source), names one value.
+    return sym[0] in ('const', 'ud', 'execcopy') or (sym[0] in ('ptr', 'ptrhi') and len(sym) == 2)
 
 
 def scalar_destinations(name, asm):
@@ -1279,6 +1280,10 @@ class Stage:
                 for reg in here:
                     paths = [s[reg] for s, w in arriving if reg in w]  # paths that never wrote it bring nothing
                     force = forced.get(off, {}).get(reg)
+                    if any(reg not in w for _, w in arriving) and any(p and not run_time_symbol(p) for p in paths):
+                        # An edge with no definition brings the hardware's leftover, not this symbol: unproven.
+                        self.sym[reg] = ('joined at a branch target',)
+                        continue
                     if force is None and paths and names_one_value(paths[0]) and all(p == paths[0] for p in paths):
                         self.sym[reg] = kept[off][reg] = paths[0]
                         continue
@@ -1863,6 +1868,8 @@ class Stage:
                     # The word keeps its descriptor identity for loads; an exact-word check (unmodified_descriptor)
                     # sees the mark.
                     self.sym[d] = own[:4] + ('modified',)
+                else:
+                    self.sym[d] = own if len(own) > 2 else own + ('added',)  # the added offset is not tracked
             else:
                 self.sym[d] = ('descnum',)
             return None
