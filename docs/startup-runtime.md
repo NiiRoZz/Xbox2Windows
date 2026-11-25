@@ -2001,7 +2001,11 @@ releases the request. This affects scheduling and preserves the existing audio
 routing and sample format.
 
 With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConnect`
-and `XApuDisconnect`, refuses null or unreadable command headers (`E_POINTER`), null outputs
+and `XApuDisconnect`. `XApuConnect` allocates a zeroed shared buffer of the size given by the
+32-bit value at input `+0x0C` and writes its address to output `+0x00`; the observed caller reads only
+that pointer and copies packets and samples into the buffer. A size of 0 or over 64 MiB is refused
+(`E_INVALIDARG`) without a handle, and the buffer is released on `XApuDisconnect`. It refuses null
+or unreadable command headers (`E_POINTER`), null or unreadable inputs and null or unwritable outputs
 (`E_POINTER`), and unknown or disconnected handles (`E_HANDLE`), and records one `(type, slot)`
 entry per `XApuEnqueueCommand` call (reading the 32-bit command type at `+0x00` and 32-bit slot
 index at `+0x04`) in a per-connection FIFO ring buffer capped at 16,384 entries (128 KiB per
@@ -2044,7 +2048,7 @@ code 77 means no usable render endpoint (or an unsupported mix format). It print
 format and Windows build. A skip is neither a pass nor a failure. Every wait is bounded.
 
 Not established: `XApuEnqueueCommand`/`XApuDequeueResult` payload fields beyond `(+0x00, +0x04, +0x34)`,
-the 16-byte second output argument of `XApuConnect`, what is audible (no capture-path check), and any
+the shared buffer's layout and output bytes past `+0x08` of `XApuConnect`, what is audible (no capture-path check), and any
 hardware or driver glitch count.
 
 ## APU heap stand-in
