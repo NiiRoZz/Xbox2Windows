@@ -405,6 +405,16 @@ It runs the debugger with `out/pe-env/Scripts/python.exe` when that environment 
 The debugger runs the process in a kill-on-close job with a memory cap, **offline**: file opens of
 socket, NetBIOS and DNS devices are refused (`--offline 0` turns this off; do not).
 
+The file hooks that offline mode needs are always armed. The gaming-runtime call hooks
+(`QueryApiImpl`, `InitializeApiImpl*`, `XErrorReport`) and the movie-player call hooks (open,
+close, next frame, frame buffers, pause, skip) are armed only with `--trace-calls 1`
+(`run.ps1 -TraceCalls`), because every hooked call stops the whole process under the debugger.
+Without it those calls are not written to `files.txt`, and the movie-player report at the end of
+`<log>.out` (call counts, movie header, frame buffers and the luma-plane PNG) is absent; with it both
+are as before. The summary states `call tracing: on` or `off`. `startup_debug` checks that a
+source-built DLL loaded under the movie-player module name is not hooked by default and that each of
+its 7 export calls is counted with `--trace-calls 1`.
+
 A process that Windows creates under a debugger normally gets the debug heap: the loader sets the
 heap tail-check, free-check and parameter-validation flags and the low-fragmentation heap is not
 used, so every allocation and free costs more. The debugger starts the process with
@@ -487,10 +497,118 @@ text is grouped as `other (text omitted)` and never copied; raw snippets stay in
 `aliased` or `not aliased` field. Those lines are not counted as unhandled; they are counted by
 outcome (`aliased`, `not_aliased`, `failed`) in a separate table, and a line with an HRESULT other than 0
 (or an uncommitted address) still counts as `failed` and as an unhandled `Device::slot133` event.
+
+The `Run End-Point` section says how far a run got and how it ended, so that reports of runs with different
+memory caps can be told apart. It gives the largest `commit peak=` value of the `x2w-dstorage heartbeat` lines (not
+the last one), the highest heartbeat second, the counts of the last `failed requests by cause` heartbeat line (the
+eight fixed cause names, each with its decimal count, and the second of that line). It reports the first and last observed
+exception and separately reports a confirmed debugger stop. Common first-chance debugger events, such as the loader
+breakpoint, are excluded from the observed exception count. The debugger emits an explicit stop record even for a
+first-chance breakpoint. For older logs, include the debug launcher's `.out` summary in the input directory to confirm
+the stop. The report copies only the 32-bit exception code and whether it was first- or second-chance.
 Check with `python3 -B tests/startup_triage_run_check.py` (ctest
 `startup_triage_run`).
 
+## Iterating on start-up runs
+
+This is one way to turn repeated start-up runs into a list of translator work that others can pick up. It combines the tools above (`run.ps1`, `gfx2hlsl.py`, `triage_run.py`) with Windows Sandbox and a logon script that you write yourself; the script is not in this repository. Nothing from a run (executable, package, logs, shaders, captures) is committed or posted. Only instruction names, refusal reasons and counts leave the machine.
+
+### 1. Run the executable in a disposable VM
+
+Treat a console executable as untrusted input. Windows Sandbox gives a throw-away VM and can share the host GPU. It requires Windows 10 or 11 Pro, Enterprise or Education, with virtualization enabled and the optional feature "Windows Sandbox" turned on. Its state is discarded when the window closes.
+
+The configuration file (`.wsb`) below turns off what the run does not need. vGPU is a deliberate exception, needed for hardware D3D12 rendering; Microsoft documents that it increases the sandbox's attack surface. Only one folder is writable. The paths in capitals are placeholders. Map the Python install and the Windows SDK folder that contains `fxc.exe` at the same paths as on the host, so `out/pe-env` resolves inside the VM.
+
+```xml
+<Configuration>
+  <Networking>Disable</Networking>
+  <vGPU>Enable</vGPU>
+  <MemoryInMB>MEMORY_MB</MemoryInMB>
+  <ClipboardRedirection>Disable</ClipboardRedirection>
+  <PrinterRedirection>Disable</PrinterRedirection>
+  <AudioInput>Disable</AudioInput>
+  <VideoInput>Disable</VideoInput>
+  <ProtectedClient>Enable</ProtectedClient>
+  <MappedFolders>
+    <MappedFolder><HostFolder>PACKAGE</HostFolder><SandboxFolder>C:\pkg</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>
+    <MappedFolder><HostFolder>REPO</HostFolder><SandboxFolder>C:\x2w\repo</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>
+    <MappedFolder><HostFolder>STAGE</HostFolder><SandboxFolder>C:\x2w\stage</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>
+    <MappedFolder><HostFolder>PYTHON_INSTALL</HostFolder><SandboxFolder>PYTHON_INSTALL</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>
+    <MappedFolder><HostFolder>SDK_BIN_X64</HostFolder><SandboxFolder>SDK_BIN_X64</SandboxFolder><ReadOnly>true</ReadOnly></MappedFolder>
+    <MappedFolder><HostFolder>OUT</HostFolder><SandboxFolder>C:\x2w\out</SandboxFolder><ReadOnly>false</ReadOnly></MappedFolder>
+  </MappedFolders>
+  <LogonCommand><Command>powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\x2w\stage\run_in_sandbox.ps1</Command></LogonCommand>
+</Configuration>
+```
+
+`REPO` holds a release build and `out/pe-env`. `STAGE` holds the logon script and anything it copies into the VM. `MEMORY_MB` must leave room for `run.ps1 -MemoryGiB` plus the VM itself.
+
+The logon script runs only inside the VM, so `-ExecutionPolicy Bypass` and writes to the VM's `System32` affect nothing on the host. It does the following:
+
+1. If the title uses the system gaming runtime, copies the host's `xgameruntime.dll` from `STAGE` into the VM's `System32`.
+2. Maps the package to the console's package drive with `subst G: C:\pkg`. Copies the package's top-level `.exe` and `.dll` files into a run folder; the data stays read-only.
+3. Sets `X2W_FXC` to `fxc.exe` in the mapped SDK folder. `run.ps1` does not set it, and the VM has no SDK of its own.
+4. Starts a background loop of `gfx2hlsl.py --pending C:\x2w\out\shader_cache`, so new pipeline requests are translated while the title runs.
+5. Runs `tools/startup/run.ps1` with `-Render`, `-ShaderCache C:\x2w\out\shader_cache`, `-StoragePath` under `C:\x2w\out` and the usual switches (see [Run](#run)). Its offline debugger stays on; the VM is a second barrier around it.
+6. Stops the loop. Writes the output of `triage_run.py <log> --shader-cache <cache>` to `C:\x2w\out` with `Out-File -Encoding utf8`; Windows PowerShell's `>` writes UTF-16.
+
+Every file in `OUT` is written by untrusted code. Read it; do not execute anything from it on the host. Do not rebuild or check out another revision of the mapped repository while a run is in progress: the VM reads `tools/` and the build from it.
+
+**Cost of the loop.** Every pass retries each request without a complete result, including those that already have a `.fail`, and re-runs `fxc` for fxc failures. A result is complete when `<key>.txt` exists and, unless `X2W_FXC` is empty (manifest only), both `.cso` files hold bytecode. That load falls on the run being measured, so choose the interval accordingly.
+
+### 2. Keep the shader cache between runs
+
+Archive each run's logs together with a copy of `shader_cache/`, and leave the cache in place for the next run. With a cold cache, every draw whose pipeline has not been translated yet is counted as "not drawn" and is missing from the frame.
+
+When the translator handles more, the next `--pending` pass retries the waiting requests from the same cache. This holds only while the pipeline key is unchanged. The key hashes a translation revision string (`x2w-startup-shader-N`, in `pipeline_key` in `gfx2hlsl.py` and in the runtime). After a revision change the runtime asks for new keys, and the old requests stay in the cache.
+
+When `fxc` is available, a request that later translates loses its `.fail`. In manifest-only mode (`X2W_FXC` empty) the old `.fail` stays, so on a kept cache the `.fail` categories in `triage.md` can include pipelines that now have a `.txt`. That table counts category tokens over all `.fail` files, up to `--max-items`.
+
+### 3. Measure a run against the previous one
+
+With `-Render`, `d3d12_xs` prints a running total to `stderr.txt` every 300 frames:
+
+```
+x2w-render totals: ... translated draws N (not drawn M), pipelines translated P / missing Q, ...
+```
+
+Compare the last line of each run. More translated draws and fewer "not drawn" mean a translator change reached real draws. "missing" is a live count of pipelines still waiting for a manifest. It can grow while things improve, if the run gets further and requests new pipelines.
+
+### 4. Census, then rank
+
+The first refusal hides the rest. Run the [refusal census](experiments.md#startup-translator-refusal-census) on a copy of the cache:
+
+```powershell
+python -B tools/startup/gfx2hlsl.py --refusals <copy of shader_cache> --json | Out-File -Encoding utf8 census.json
+```
+
+There are two views:
+
+- `per_code_pair.reasons` counts vertex/pixel code pairs, without RTV variants. Each row has `reason`, `scope` (`decode`, `vs`, `ps` or `pipeline`), `under_every_root` and `under_some_roots`. The sum of the last two is the number of pairs where the reason appears.
+- `per_request.reasons` counts request keys, RTV variants included. Each row has `containing`, `first` and `only`.
+
+Counts after the first refusal are approximate, and a pipeline-scope `only` is a lower bound (the `caveat` field).
+
+Rank by the number of pairs a reason appears in, not by first refusals: when most pairs contain several reasons, fixing the most frequent first refusal alone draws few new pipelines. Reasons that share a design, such as descriptor tracking or resource-heap loads, are better handled together.
+
+### 5. Pick work that nobody holds
+
+Before taking a reason:
+
+- search open pull requests and the `help wanted` issues for the instruction name;
+- prefer self-contained instructions with clear semantics (scalar ALU, operand modifiers, inline constants) over design topics;
+- check the semantics against a primary source, such as the AMD RDNA 2 ISA reference or LLVM's AMDGPU backend for assembler field meanings (state the version), not against another translator in this repository;
+- add a negative control that fails when the lowering is removed or its semantics change.
+
+After the change is merged, step 3 on the next run shows whether draws moved.
+
 ## Launcher check
+
+`tools/startup/launch.py` validates timeout and job limits before creating the log directory or
+starting a process. The timeout is at least one millisecond and stays below the Win32 infinite
+wait sentinel. A nonzero memory limit must fit in `size_t` as bytes. The process limit must fit
+in a DWORD. A zero memory or process limit disables that limit. Run
+`ctest --preset release --no-tests=error -R '^startup_launch_cli_check$' -V` for the input checks.
 
 `tests/startup_launch_check.py` (ctest `startup_launch`) drives `tools/startup/launch.py` on the
 source-built `tests/startup_launch_probe.cpp`. A finished run reports the child's exit code and saves
@@ -590,18 +708,32 @@ ctest --preset release --no-tests=error -R '^startup_dstorage_destination$' -V
 ## Local switches, logging, and memory probing
 
 `tests/startup_local_log_check.cpp` (device-free ctest `startup_local_log`, with negative
-control `startup_local_log_guard_drop_control`) verifies `src/startup_stubs/local_log.h`:
-`env_on` (a leading `1` in values up to three characters, preserving `GetLastError`), atomic
-`first_calls` countdowns, `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
+controls `startup_local_log_guard_drop_control`, `startup_local_log_reopen_control`,
+`startup_local_log_cache_failure_control` and `startup_local_log_wrap_control`) verifies
+`src/startup_stubs/local_log.h`: `env_on` (a leading `1` in values up to three characters,
+preserving `GetLastError`), the atomic `first_calls` gate (true for the first N calls; the
+counter stops at N, so a counter that a consumer polling in a loop drives past 2^31 cannot turn
+negative and let every call log again; the wrap control shows the old counting gate doing that
+from a counter set near the wrap point), `logf` (stderr and `X2W_TRAP_LOG` output, CRLF and 1533-byte payload
 truncation, `MAX_PATH` boundary behavior, and `GetLastError` preservation on file-open failure),
+the shared `x2w_trap::append_log` (one `X2W_TRAP_LOG` open per module: in a child process, 8
+threads write 2,000 lines each, every line must arrive intact and the open count must be 1; the
+reopen control respells the path after the first line so each line reopens the file, and passes
+only when the open count is its sole failure; a failed open is not kept: while no handle is kept,
+ordinary lines retry the open at most once per 250 ms and are dropped in between, and trap lines
+always retry. Child processes check that a first open into a missing directory, or of a file held
+without sharing, recovers once the path is usable, that an unusable path costs at most one open
+attempt per 250 ms, and that a trap line opens the log during the wait; the cache-failure control
+is built from a generated copy of `trap.h` that keeps a failed open forever and passes only when
+the two recovery checks are its sole failures),
 `probe_readable` (invalid-pointer and zero-length refusals, multi-page reads, `PAGE_NOACCESS` /
 `MEM_RESERVE` prefix truncation, and `PAGE_GUARD` re-arming verified by `VirtualQuery` and a
 second probe), and `readable`/`writable` boundaries across `PAGE_READONLY`, `PAGE_READWRITE`,
 `PAGE_WRITECOPY`, `PAGE_NOACCESS`, `PAGE_GUARD`, and `MEM_RESERVE`. No GPU is required:
 
 ```powershell
-cmake --build --preset dev --target startup_local_log_check
-ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control)?$' -V
+cmake --build --preset dev --target startup_local_log_check startup_local_log_cache_failure_check
+ctest --preset dev --no-tests=error -R '^startup_local_log(_guard_drop_control|_reopen_control|_cache_failure_control)?$' -V
 ```
 
 ## Trap-by-default header check
@@ -629,15 +761,17 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_XMEM_GPU_MIRROR=1` | pairs a no-access graphics reservation with the read-write reservation of the same size made just before it, and maps every physical page into both (same section) |
 | `X2W_D3D12_PERMISSIVE=1` | wraps the device: recording command lists, console present, view tracking |
 | `X2W_D3D12_RENDER=1` | draws through translated pipelines from `X2W_SHADER_CACHE` and forwards [single-record indirect Dispatch](experiments.md#gpu-written-indirect-dispatch-arguments), [DrawIndexed](experiments.md#gpu-written-indirect-indexed-draw-arguments), [Draw](experiments.md#gpu-written-indirect-draw-arguments), and [DispatchMesh](experiments.md#gpu-written-indirect-mesh-dispatch-arguments) for supported desktop pipelines and tracked placed buffers |
-| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` and no manifest; `X2W_FXC=` (empty) skips compilation and publishes the manifest alone. |
+| `X2W_SHADER_CACHE=<dir>` | translation cache: the runtime writes source requests `req_<key>.{a,b,root}` and, when needed, RTV variants `req_<key>.rtv`. Run `tools/startup/gfx2hlsl.py --pending <dir>` while the process is running, or start the run with `run.ps1 -Translate` (see [Translating shaders during a run](#translating-shaders-during-a-run)). Active draws poll for an absent manifest at most once per second per pipeline and use the published translation on a subsequent draw. The translator compiles `.vs.cso` and `.ps.cso` with `fxc.exe`: `X2W_FXC`, else the Windows SDK 10.0.26100.0 copy, else the newest `Windows Kits\10\bin\<version>\x64`, else `PATH`. When none exists it writes `<key>.fail` naming `X2W_FXC` without publishing a new manifest. `X2W_FXC=` (empty) publishes the manifest alone. Rerun `--pending` with compilation enabled to fill in missing bytecode for an existing manifest. |
 | `X2W_DRAW_NULL_IDENTITY=1` | null descriptors read as identity values instead of zero |
+| `X2W_PRESENT_SIGNATURE_EVERY=<n>` | in render mode, samples a coarse signature of the presented picture every `n` presents from the start, without a script request (`0` off). Unset, sampling starts, every 4 presents, only once a script with a `wait` asks for it: see [Waiting for the presented picture](#waiting-for-the-presented-picture) |
 | `X2W_D3D12_DUMP_SURFACE=<bmp>` | writes the last presented surface |
 | `X2W_DRAW_DUMP_FRAME=<n>`, `X2W_DRAW_DUMP_DIR` | Full-resolution RGB snapshots of single-sample RGBA8/BGRA8 UNORM or sRGB targets after translated draws. A later present writes completed queue-fenced copies. At most 48 copies are pending or written; a copy whose fence reports device removal (`UINT64_MAX`) is released unwritten and frees its slot (`src/startup_stubs/draw_dump_tracking.h`, `ctest --preset dev --no-tests=error -R '^startup_dump_fence_(removed_control_)?warp$' -V`; the control must fail). |
 | `X2W_AUDIO_PERMISSIVE=1` | enables the audio stand-ins. Without a DSP provider, `XDspActivate` clears valid outputs and reports unavailable resources, and failed `XDspSubmitCommand` calls leave the sequence unchanged. |
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
+| `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
-| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses (0x4 = A); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries)$'`) |
+| `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
 | `X2W_XG_VERBOSE=1` | logs every texture layout query with its mip sizes |
 | `X2W_XG_BC7_4K_S_LAYOUT=1` | enables the BC7 tiled layout, copy and draw upload when `X2W_D3D12_PERMISSIVE=1` |
@@ -659,6 +793,190 @@ requests, run `python tools/startup/gfx2hlsl.py --pending <cache-directory>`,
 then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
+For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).
+
+## Input script
+
+`X2W_INPUT_SCRIPT` (`run.ps1 -InputScript`) drives the virtual gamepad of the `GameInput.dll`
+stand-in. It is a comma-separated list; empty items and blanks around an item are ignored. Each
+item is one of:
+
+| Item | Effect |
+|---|---|
+| `<mask>@<s>[+<d>]` | sets the GameInput button bits `<mask>` (hexadecimal, `0x` optional; 4 = A, 8 = B, 1 = Menu) from second `<s>` for `<d>` seconds, default 0.3 |
+| `<axis>=<value>@<s>[+<d>]` | sets one axis from second `<s>` for `<d>` seconds, default 0.3. `lx`, `ly`, `rx`, `ry` are the thumbsticks in [-1, 1] (+1 is right or up); `lt`, `rt` are the triggers in [0, 1]. These are the units of the GameInput gamepad state. |
+| `base=poll` or `base=start` | time base of every entry; first item only. `poll` (the default) counts seconds from the first input poll of the process, `start` from process start. |
+
+Entries that are active at the same time combine: button masks are OR-ed; for one axis the later
+item wins. When an axis entry ends the axis returns to 0. Keyboard and XInput values still merge
+in (buttons OR-ed, for an axis the larger magnitude wins). Examples:
+
+```text
+4@60,1@70,20@80                  A, Menu, then Y for 0.3 s each, counted from the first poll
+4@60+2,8@61                      A held 2 s; B pressed at 61 s while A is still held (mask 0xC)
+base=start,lx=-1@40+1.5,rt=1@41  left stick fully left for 1.5 s and the right trigger at 41 s after process start
+```
+
+A script that was valid before holds and axes (`<mask>@<s>` items only) keeps its meaning: the
+same buttons at the same times on the first-poll base.
+
+Up to 256 timed entries and 4,095 characters are accepted, as before. A longer value is ignored
+as a whole and logged as `x2w-input X2W_INPUT_SCRIPT ignored: <n> characters, at most 4095`. When
+any item is rejected, the stand-in logs
+`x2w-input X2W_INPUT_SCRIPT: <used> of <items> entries used (<malformed> malformed, at most 256)`.
+When it is created it also logs
+`x2w-input script: <n> entries accepted, <m> rejected, time base first-poll|process-start` and, for
+each of the first 32 rejected items,
+`x2w-input script item <index> rejected (<reason>): "<item>"` (index 1 is the first non-empty item).
+Reasons: `missing @<seconds>`, `bad time`, `bad duration`, `trailing text`, `bad mask`, `bad value`,
+`value out of range [-1, 1]` or `[0, 1]`, `unknown token`, `base= must be the first item`,
+`unknown base (use poll or start)` and `over 256 entries`. At the first poll it logs
+`x2w-input script time base <base>: first poll at <s> s, first entry at <s> s since process start`,
+and once the script time passes the end of the last entry
+`x2w-input script time passed its last entry (<n> entries, ended at <s> s on the script time base)`.
+
+The parser and playback are in `src/startup_stubs/input_script.h`. The check reads the stand-in
+through `IGameInput::GetCurrentReading` with the script clock set by `X2W_INPUT_CLOCK_MS`
+(milliseconds since process start; a test seam, not for runs):
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$' -V
+```
+
+It exits 77 (skip) after the parser checks when XInput pad 0 is connected, because that pad's
+values merge into every reading.
+
+### Waiting for the presented picture
+
+Fixed times drift when a run gets slower or faster. A script can instead wait until the presented
+picture changes, and time the items after the wait from the moment it completes:
+
+| Item | Effect |
+|---|---|
+| `wait[=<settle>[/<timeout>[/stop\|/go]]][@<s>]` | takes the presented picture at the moment the wait begins, waits until it changes and then until it has not changed for `<settle>` seconds (default 1). After `<timeout>` seconds (default 120) it logs a timeout and the script goes on (`go`, the default) or stops (`stop`). Empty fields keep their default: `wait=/30`. |
+| `mark[=<label>][@<s>]` | logs the script time and the present number, for picking frames afterwards. The label is up to 32 letters, digits, `_`, `-` or `.`; the default is `mark<item index>`. |
+| `@+<s>` | in place of `@<s>` on any timed item: `<s>` seconds after the previous timed item started (after a wait: after it completed). Without an earlier timed item it counts from 0. |
+
+`wait` and `mark` without `@` mean `@+0`, so a wait begins when the previous item starts, before
+the picture can react to that press. Items after a wait are shifted by the time the wait blocked and
+never start before it completes. An absolute `@<s>` after a wait must not be earlier than the wait;
+`@+` is the form to use there. A hold that started before a wait runs its length in real time.
+A wait cannot take a `+<duration>`.
+
+Wait for a new screen, pause 2 s, press down, pause 0.5 s, press accept, and repeat (about 5 s
+per screen when each screen takes about 2.5 s to appear and settle):
+
+```text
+wait,80@+2,4@+0.5,mark=menu1@+0,wait,80@+2,4@+0.5,mark=menu2@+0
+```
+
+The picture signal comes from the D3D12 stand-in in render mode (`X2W_D3D12_RENDER=1`,
+`run.ps1 -Render`). Sampling is opt-in: it starts only after a script with at least one `wait` has
+asked for it (the GameInput stand-in sets a request field in the signature block and logs
+`x2w-input script: picture signature requested`), so ordinary render runs record no extra GPU work.
+`X2W_PRESENT_SIGNATURE_EVERY=<n>` samples every `n` presents from the start without a request, and
+`0` turns the signature off. While sampling, every fourth present (or every `n`) it
+copies 18 evenly spaced single rows of the presented surface into a small readback buffer on the
+presenting queue, never the whole surface and never waiting for the copy, and on a later present
+reduces them to 32 x 18 cells of mean luma. Command lists do not hold the resources they use, so the
+sampler holds its own reference to the presented surface until the copy's fence has passed; a title
+may release the surface right after the present. If `Signal` fails after the copy was submitted,
+sampling stops and the surface, command list and readback buffer stay referenced for the rest of the
+process. It publishes them in a named block,
+`Local\x2w_present_signature_<process id>`, so other tools can read it too
+(`src/startup_stubs/present_signature.h` describes the layout). The 8-bit and 10:10:10:2 colour
+formats are read; for others it logs
+`x2w-present picture signature: surface format <n> is not sampled` once. Two pictures differ when
+at least 16 cells differ by more than 12 levels, so a blinking cursor does not count as a new screen.
+Without a presenter every wait times out and says so.
+
+Log lines, each once per item:
+
+```text
+x2w-input script: <n> waits, <m> marks; picture signal from Local\x2w_present_signature_<pid>
+x2w-input script: picture signature requested
+x2w-present picture signature: Local\x2w_present_signature_<pid>, every <k> presents once a script wait asks for it|from the start (X2W_PRESENT_SIGNATURE_EVERY)
+x2w-input script wait item <i> begun at <s> s[ (no presenter signal yet)]
+x2w-input script wait item <i>: picture changed at <s> s, <e> s after the wait began
+x2w-input script wait item <i> done at <s> s after <e> s
+x2w-input script wait item <i> timed out at <s> s after <e> s[ (no presenter signal)]; the script goes on|stops
+x2w-input script mark <label> at <s> s (item <i>, present <n>|no presenter signal)
+x2w-present picture signature: first sample published at present <n> in Local\x2w_present_signature_<pid> (every <k> presents)
+x2w-present picture signature: Signal failed after a copy was submitted; sampling stopped, its surface stays referenced
+```
+
+Times are seconds on the script's time base. The rejection reasons of waits and marks are `bad wait option`,
+`bad label`, `duration not allowed on wait or mark` and `time before the preceding wait`. A script
+without `wait`, `mark` or `@+` plays exactly as before. One exception: `@+<s>` used to be read as
+the absolute time `<s>`.
+
+#### Change sensitivity, regions and the fine grid
+
+Options after `;` on a wait (`wait=<settle>/<timeout>;<option>;...`, or `wait;<option>` with no
+settle or timeout) set what counts as a change for that wait only:
+
+| Option | Effect |
+|---|---|
+| `cells=<n>` | at least `n` cells must differ (default 16) |
+| `level=<n>` | a cell differs when its mean luma moves by more than `n` levels of 255 (default 12) |
+| `region=<x0>:<y0>:<x1>:<y1>` | watch only the cells whose centre lies in this rectangle, in fractions of the picture width and height (0:0 is the top left; default the whole picture) |
+| `fine` | compare the fine 64 x 72 grid instead of the 32 x 18 one |
+
+The default grid samples one row in the middle of each eighteenth of the picture, so anything less
+than about 5.6 % of the picture height can fall between two sampled rows. A list highlight is often
+that thin. The WARP check moves a 60 x 4 texel bar (30 % x 3.3 %, 1 % of a 200 x 120 picture) between
+two sampled rows: the default grid sees 0 changed cells, the fine grid 40. The fine grid samples 72
+rows (one every 1.4 % of the height) and 64 columns. The presenter copies its rows only once a script
+with a `fine` wait has asked for them: the GameInput stand-in sets a request field in the signature
+block and logs `x2w-input script: fine picture signature (64 x 72) requested`. Measured CPU-side cost
+of one sampled present at 3840 x 2160 on WARP (release build, every fourth present by default):
+0.16 ms with the default grid (18 rows, 270 KiB copied) and 0.56 ms with the fine grid (90 rows,
+1,350 KiB), against 32,400 KiB for the whole frame; the WARP check prints both.
+
+Rejected options log `bad wait option`, `bad region`, `empty region` (no cell centre inside) or
+`cells larger than the region`.
+
+#### Groups
+
+`group[=<label>]` and `end` bracket a run of items. When a wait inside the group times out, the
+rest of the group is skipped, and the script goes on after `end`, timed from the timeout: the script
+time jumps to that of `end`, so an item `@+<s>` after `end` starts `<s>` seconds after the timeout.
+Later groups run normally. A `/stop` wait inside a group still stops the whole script. Groups do not
+nest. The default label is `group<item index>`. The timeout line then ends in
+`; group <label> is skipped from here`, followed by
+
+```text
+x2w-input script group <label> (items <group>-<end>) failed at step item <i>: rest of the group skipped, the script goes on after item <end> from <s> s
+```
+
+Rejected group items log `nested group` (and its `end` logs `end of a rejected nested group`),
+`end without group`, `group not closed` (its items then run ungrouped), `group and end take no time`,
+`bad label`, and `time before the end of the preceding group` for an absolute time after `end` that
+is earlier than the group's last timed item.
+
+A two-entry list on the left of the screen, where each press must visibly move the highlight: wait
+for the screen; press down and check that the highlight moved; press up and check that it moved back;
+then accept. If a press shows no change within 2 s, the rest of the list steps is skipped and the
+script waits for the next screen:
+
+```text
+wait,group=list,80@+1,wait=0.5/2;fine;cells=4;level=8;region=0.05:0.3:0.45:0.6,40@+0.5,wait=0.5/2;fine;cells=4;level=8;region=0.05:0.3:0.45:0.6,4@+0.5,end,wait=1/30
+```
+
+The timeline is in `src/startup_stubs/input_script.h` and the sampler in
+`src/startup_stubs/present_signature_sampler.h`. The timeline cases run with a controllable clock
+and picture signal; two cases run through the stand-in with the check process publishing the
+pictures. The WARP check presents two different pictures and repeated identical ones, and compares
+the published cells with a CPU reduction of the same rows. The held-source check runs under the
+D3D12 debug layer: it stalls the queue on a fence, lets the sampler record its copy, releases the
+caller's only reference to the surface, then releases the queue, and requires the correct signature
+and no debug-layer error; it also makes `Signal` fail after submission and requires the sampler to
+keep the surface. Its control repeats the stall with a copy that does not hold its source and passes
+only when the debug layer reports the released surface:
+
+```powershell
+ctest --preset dev --no-tests=error -R '^startup_(gameinput_script_syntax|present_signature_(warp|held_source_warp|unheld_source_control_warp))$' -V
+```
 
 ## Game saves
 
@@ -798,6 +1116,15 @@ These are measured on one executable; treat them as hypotheses for others.
   The fixture exercises allocation and retirement without queue submission or guest slot binding.
   Run `cmake --build --preset release --target startup_upload_arena` and
   `ctest --preset release --no-tests=error -R '^startup_upload_arena_' -V`.
+- **Upload arena lifetime.** A queue waits on a fence while the fixture submits a copy of
+  payload A (640 bytes, 16-byte alignment), resets the arena, writes a distinct payload B into
+  a new page and submits a second copy. It opens the gate only after both submissions and
+  compares the exact A and B bytes in readbacks. The reset releases the arena's own page
+  reference, so the fixture holds A's page until the queue drains; this stands in for the
+  retirement a production caller owes. An overwrite control writes B into A's live range
+  before the gate opens and must read B back from A's copy. The fixture does not cover
+  refusal after a normal Close or any command-buffer interaction. Run
+  `ctest --preset release --no-tests=error -R '^startup_upload_lifetime_' -V`.
 - **Inline samplers.** Pixel shaders build sampler descriptors from constants (`s_movk_i32`,
   `s_bfm_b32`, 64-bit moves); the translator folds those into static samplers. A source-built
   pixel stage checks all four manifest words, rejects a mask width from a root constant, and
@@ -822,6 +1149,14 @@ These are measured on one executable; treat them as hypotheses for others.
   high halves of one VGPR and reads mip zero. The packed form requires one address VGPR without an
   NSA extension. Plain loads refuse an empty `dmask`, `r128`, `lwe`, `d16`, `tfe` and reserved bits.
   The source-built startup mip-load check covers this translation on Linux.
+- **Packed 2D sample coordinates.** Plain 2D `image_sample` and `image_sample_lz` with `a16` unpack two
+  IEEE binary16 coordinates from one VGPR (`float2(f16tof32(p), f16tof32(p >> 16))`) without an NSA
+  extension, and both the offline and runtime cache keys advance to `x2w-startup-shader-6` so pre-fix
+  two-VGPR translations are not reused. Non-1D `image_sample` and `image_sample_lz` accept cache-policy
+  flags (`glc`, `slc`, `dlc`) and refuse `unorm`, `r128`, `tfe`, `lwe`, `d16`, reserved bits, an empty
+  `dmask`, wrong address-register counts, fake NSA extensions, and `a16` on 3D or 2D-array images
+  (`ctest --preset dev --no-tests=error -R "^startup_image_sample_a16_" -V`). `image_sample_l` and 3D /
+  2D-array `a16` stay refused.
 - **2D array images.** `image_sample`, `image_sample_lz`, `image_sample_l` and `image_load` with
   `dim:SQ_RSRC_IMG_2D_ARRAY` use a `Texture2DArray<float4>` (manifest kind `tex2da`). The slice is
   the third address component, as `float3(u, v, slice)` for a sample and `int4(x, y, slice, 0)`
@@ -845,7 +1180,9 @@ These are measured on one executable; treat them as hypotheses for others.
   exported registers, so integer words reach the pixel stage unchanged. FXC folds `asfloat()` of a
   constant and flushes binary32 denormal patterns such as 1 or 2 to 0, which a float copy lost
   ([#1259](https://github.com/R0Y00/Xbox2Windows/issues/1259)). Colour exports of constant integer
-  words still go through `float4` and have the same loss. Reproduce with
+  words still go through `float4` and have the same loss. Only the `p0` selector is lowered;
+  `p10` and `p20` are refused in both encodings
+  ([#1890](https://github.com/R0Y00/Xbox2Windows/issues/1890)). Reproduce with
   `ctest --preset release --no-tests=error -R "^startup_flat_param_"`.
 - **Non-fused multiply-add.** The gfx1013 `v_mad_f32`, `v_mac_f32`, `v_madmk_f32`,
   `v_madak_f32` and `v_mad_legacy_f32` forms round the product before the sum and flush
@@ -1067,11 +1404,23 @@ These are measured on one executable; treat them as hypotheses for others.
   zero-valued entry constant so optimized FXC keeps denormal bit patterns. UNORM outputs still
   undergo float-to-UNORM conversion. Packed integer exports and other integer formats remain
   unsupported by this path.
+- A colour export that leaves channels `off` does not write them, so the target keeps what it held
+  there (#1674). `gfx2hlsl.py` records the written channels per target and writes
+  `wmask <target> 0x<mask>` to the manifest when an export leaves any channel unwritten. The draw
+  path removes the other channels from that target's `RenderTargetWriteMask`
+  (`src/startup_stubs/export_write_mask.h`). It expands a shared blend state when active targets
+  need different masks. A shared logic operation with different masks is refused because D3D12
+  requires logic operations to use a shared blend state. Startup cache revision 7 invalidates older
+  zero-filled exports. A compressed export
+  lowers when it writes whole binary16 pairs (channels 0–1, 2–3 or both). A compressed mask that is not
+  a whole pair, an export of no channel, two exports of one target with different masks, a packed
+  integer compressed export and a partial compressed export to a vertex output stay refused
+  (`ctest --preset release --no-tests=error -R "^startup_(gfx2hlsl_)?export_(write_)?mask"`).
 - Colour-blend registers reach the draw path for pipelines created through device slot 57 only
   (#1216): state block A holds the eight `CB_BLENDn_CONTROL` words at +0xD0, and
   `src/startup_stubs/state_block_blend.h` decodes them into the translated pipeline's blend
-  state. `CB_TARGET_MASK` is not located, so all four channels are written; no fixture covers a
-  write mask on this path. A word the decoder refuses for any of the eight targets leaves the
+  state. `CB_TARGET_MASK` is not located, so all four channels are written unless the translated
+  export leaves some unwritten (manifest `wmask`, above). A word the decoder refuses for any of the eight targets leaves the
   registers unused: the pipeline keeps the path it had before and the refusal is logged. No target
   is drawn unblended in place of a refused word
   (`ctest --preset release --no-tests=error -R "^startup_state_block_blend$"`).
@@ -1104,9 +1453,11 @@ routing and sample format.
 With `X2W_AUDIO_PERMISSIVE=1`, `xapu.dll` tracks active handles across `XApuConnect`
 and `XApuDisconnect`, refuses null outputs (`E_POINTER`) and unknown or disconnected
 handles (`E_HANDLE`), and queues one completion entry per `XApuEnqueueCommand` call so
-`XApuGetResultCount` and `XApuDequeueResult` retire commands cleanly (zeroing the
-`0x58`-byte result buffer without fabricating unmeasured fields, and returning `E_FAIL`
-when the queue is empty). The all-zero result is a placeholder: its type field (`+0`) is not a measured
+`XApuGetResultCount` and `XApuDequeueResult` can retire commands. A successful dequeue zeroes the
+`0x58`-byte result buffer. An empty queue returns `XAPU_E_PENDING_RESULTS` (`0x8AC81001`) and preserves
+the result buffer. [Microsoft XAPU error codes](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/errorcodes?view=gdk-2604#xapu)
+
+The all-zero result is a placeholder: its type field (`+0`) is not a measured
 completion value, and no caller has been observed consuming it. Entries are counters only, so memory does
 not grow per command. Handles are never reused. Default non-permissive mode still traps on every export
 (`ctest --preset dev --no-tests=error -R '^startup_xapu_queue$' -V`).
@@ -1213,7 +1564,7 @@ debugger round trip.
 | `CLWB m8` | `CLFLUSHOPT m8` (one ModRM bit); one `NOP` of the same length once a `CLFLUSHOPT` has faulted on this host |
 | `MONITORX`, `MWAITX` | a 3-byte `NOP`; `PAUSE` and `NOP` (the wait may end at any time) |
 | `CLZERO` | a jump to a stub that stores 64 zero bytes at `rax & ~63` |
-| `INSERTQ xmm, xmm, len, idx`, `EXTRQ xmm, len, idx` (xmm0-7) | a jump to a stub that does the field move in integer registers |
+| `INSERTQ xmm, xmm, len, idx`, `INSERTQ xmm, xmm`, `EXTRQ xmm, len, idx`, `EXTRQ xmm, xmm` | a jump to a stub that does the field move in integer registers (xmm0-15) |
 | `MOVNTSS m32, xmm`, `MOVNTSD m64, xmm` | `MOVSS`, `MOVSD` stores (one opcode byte; the non-temporal hint is dropped) |
 | `RDPRU` | `RDTSC`; `NOP` (the time-stamp counter stands in for MPERF and APERF, so their ratio reads 1) |
 | `RDPID r64` | a jump to a stub that runs `RDTSCP` and moves its `ecx` to the register |
@@ -1222,10 +1573,10 @@ debugger round trip.
 The stubs keep the other registers and the flags. Instructions that the 5-byte jump overwrites
 are re-encoded behind the stub with iced-x86. `events.txt` names the first 40 rewritten sites and
 the summary counts them by instruction. `tools/startup/host_cpu.py` lists the forms that are
-refused (register-count `INSERTQ`/`EXTRQ`, xmm8-15, fields past bit 63).
+refused (memory operands, non-zero `ModRM.reg` on immediate `EXTRQ`, malformed prefixes, fields past bit 63).
 
 `python -B tests/startup_host_cpu_check.py` assembles source-built functions, patches them the same
-way and calls them on the host: 288 `INSERTQ`/`EXTRQ` results against a model, `CLZERO` with a
+way and calls them on the host: 1162 `INSERTQ`/`EXTRQ` results against a model, `CLZERO` with a
 moved `lea` and a moved rip-relative load, and decoded `CLWB` and wait rewrites, including the
 `NOP` form for every addressing mode. The fall-back from `CLFLUSHOPT` to `NOP` in the debugger is
 not exercised here: it needs a host without `CLFLUSHOPT`. Stubs that zero 56
@@ -1251,20 +1602,29 @@ memory spent rather than by elapsed time. A physical page holds a slot from its 
 or a DirectStorage write) until its grant is released; `xmem.dll` publishes that count through the
 experimental `x2w_xmem_page_stats` export.
 
-The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab is
-created with the default `CreateFileMappingW` commit behaviour, so all of it is charged to commit when it is
-created, and it is closed only when the process ends: freeing pages returns slots, not commit. A released
-slot is reused lowest first. The experimental `x2w_xmem_slab_stats` export reports the slabs open, the slots
-in use and the slots free in the open slabs, which are the units that matter for commit now. This only
-reports; it does not change when commit is charged. `xmem_slab_slots` checks the bookkeeping on any platform
-without Windows calls. The heartbeat also prints while the request counters are unchanged
+The slots are 64 KiB pieces of shared 256 MiB slabs (4096 slots each, `src/xmem_slab_slots.h`). A slab reserves
+its capacity with `SEC_RESERVE`. Each slot commits on the first mapping or write. A freed slot remains
+committed, is zeroed on reuse, and is chosen before a fresh slot. The experimental `x2w_xmem_slab_stats`
+export reports open slabs and used and free slots. `xmem_slab_slots` checks the bookkeeping without Windows
+calls. `xmem_mapped_pages_commit` measures commit for a small map, and `xmem_mapped_pages_commit_failure`
+injects a commitment failure and checks that the reservation and slab counts are unchanged and the pages
+can be mapped on retry. Caller-owned placeholders must already match the requested view size. The
+heartbeat also prints while the request counters are unchanged
 when either memory value changed, so the cost of a stalled load is visible. Each report is followed
 by a line of failed requests by cause and a line of page-destination requests by end (see
 DirectStorage failure causes and DirectStorage page-request ends under Findings).
 
+The live log window also shows DirectStorage heartbeat lines and `x2w-render totals` as they
+arrive. It reports frame counts and FPS from the graphics heartbeat without inferring whether
+draws were executed. Network refusals are shown when observed; the window does not establish
+that all network activity is blocked. To check this presentation with generated logs, run
+`python -B tests/startup_live_telemetry_check.py`. See [#1199](https://github.com/R0Y00/Xbox2Windows/issues/1199)
+for memory accounting and [#1281](https://github.com/R0Y00/Xbox2Windows/issues/1281) for
+the launcher's concurrent-hook limitation.
+
 ```powershell
 cmake --build --preset release --target xmem_shim startup_stub_xcrdapi xmem_slab_slots_check
-ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|startup_heartbeat_commit)$' -V
+ctest --preset release --no-tests=error -R '^(xmem_slab_slots|xmem_page_stats|xmem_mapped_pages_commit(_failure)?|startup_heartbeat_commit)$' -V
 ```
 
 The `startup_heartbeat_commit` check starts the heartbeat before loading the page provider, then

@@ -307,8 +307,18 @@ def sample_offset_arg(reg, vector, sample_dest, known_ssa_bits):
     return f", int2({x}, {y})"
 
 
-def comparison_sampler_state(words):
+# Word 2 bits 28-30 (value >> 28): MIP_POINT_PRECLAMP, ANISO_OVERRIDE, BLEND_ZERO_PRT. At an explicit level zero
+# with anisotropy refused and no partially resident texture, none of them changes the result.
+LEVEL_ZERO_IGNORED_W2 = 0x7
+
+
+def comparison_sampler_state(words, level_zero=False):
     """Decode the sampler descriptor fields that change an image_sample_c_lz result on a 2D texture.
+
+    level_zero=True is for a caller that samples explicitly at level zero (the startup translator's c_lz form):
+    word 2 bits 28-30 are then accepted, because MIP_POINT_PRECLAMP only acts on mip selection, ANISO_OVERRIDE
+    only on anisotropic filtering (refused above) and BLEND_ZERO_PRT only on partially resident textures.
+    Bit 31 stays refused. The default keeps the strict check the pixel AOT path is verified against.
 
     Field positions are those of SQ_IMG_SAMP_WORD0..3 (registers 0x8F30..0x8F3C in Mesa
     src/amd/registers/gfx10-rsrc.json; enum values in the Linux navi10_enum.h). Not read, because the accepted profile makes them irrelevant: CLAMP_Z,
@@ -344,7 +354,7 @@ def comparison_sampler_state(words):
     mag, minify, mip = (w2 >> 20) & 3, (w2 >> 22) & 3, (w2 >> 26) & 3
     if mag != minify or mag not in COMPARISON_FILTERS:
         raise ValueError("Comparison sampling requires one point or bilinear XY filter")
-    if mip == 3 or w2 >> 28:
+    if mip == 3 or (w2 >> 28) & ~(LEVEL_ZERO_IGNORED_W2 if level_zero else 0):
         raise ValueError("Unsupported mip filter or word 2 bits 28-31")
     if (w3 >> 12) & 0x3ffff:
         raise ValueError("Comparison sampling with word 3 bits 12-29 (UPGRADED_DEPTH on GFX8) is not supported")
@@ -1313,6 +1323,8 @@ DPP_CVT = {
     "cvt_off_f32_i4": (False, "(float(asint({0} << 28) >> 28) * 0.0625f)", None),
     "cvt_i32_f32": (True, "asfloat(cvt_i32_f32({0}))", "cvt_i32_f32"),
     "cvt_u32_f32": (True, "asfloat(cvt_u32_f32({0}))", "cvt_u32_f32"),
+    "cvt_flr_i32_f32": (True, "asfloat(cvt_flr_i32_f32({0}))", "cvt_flr_i32_f32"),
+    "cvt_rpi_i32_f32": (True, "asfloat(cvt_rpi_i32_f32({0}))", "cvt_rpi_i32_f32"),
 }
 DPP_INT32 = {
     "not_b32": (1, "(~{0})", None),
@@ -1403,6 +1415,11 @@ DPP_MOVREL_PATTERN = re.compile(rf"({'|'.join(DPP_MOVREL)}) (.+)")
 # The plain VOP1 (e32) and VOP3 (e64) encodings of the same four moves, as LLVM 15 prints them for gfx1013 and
 # gfx1030 (two VGPR operands; the VOP3 form takes no clamp, omod or source modifier in that spelling).
 PLAIN_MOVREL_PATTERN = re.compile(r"(v_movreld_b32|v_movrels_b32|v_movrelsd_b32|v_movrelsd_2_b32)_e(?:32|64) (v\d+), (v\d+)")
+# Their SDWA encodings (#1917): the source selection applies to the indexed source word and the destination
+# selection to each indexed destination, as v_mov_b32_sdwa applies them.
+SDWA_MOVREL_PATTERN = re.compile(r"(v_movreld_b32|v_movrels_b32|v_movrelsd_b32|v_movrelsd_2_b32)_sdwa (v\d+), "
+                                 r"(sext\()?(v\d+)(\))? dst_sel:(BYTE_[0-3]|WORD_[01]|DWORD) "
+                                 r"dst_unused:(UNUSED_PAD|UNUSED_SEXT|UNUSED_PRESERVE) src0_sel:(BYTE_[0-3]|WORD_[01]|DWORD)")
 
 
 def scalar_const_u32(token, scalar, pending):
@@ -2291,6 +2308,48 @@ def dpp_vgpr(token, vector, sample_dest, *, allow_mods):
     return value, use_abs, neg
 
 
+def half16_dpp_source(token, vector, sample_dest, known_ssa_bits, known_half, *, allow_mods):
+    """Parse one DPP VGPR source of a binary16 VOP1/VOP2 op under the static finite-proof contract.
+
+    Accepts a VGPR holding either a statically known word (known_ssa_bits) or a proven binary16
+    half16 result (known_half), with optional bit-15 abs/neg modifiers on DPP16 (refused on DPP8).
+    """
+    neg = False
+    use_abs = False
+    raw = token
+    if raw.startswith("-"):
+        if not allow_mods:
+            raise ValueError(f"Source modifiers are not allowed on {token}")
+        neg = True
+        raw = raw[1:]
+    if m := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", raw):
+        if not allow_mods:
+            raise ValueError(f"Source modifiers are not allowed on {token}")
+        use_abs = True
+        raw = m.group(1) or m.group(2)
+    m = re.fullmatch(r"v(\d+)", raw)
+    if not m or not 0 <= int(m.group(1)) <= 255:
+        raise ValueError(f"DPP operand must be a VGPR, got {token}")
+    if raw not in vector:
+        raise ValueError(f"DPP operand {raw} is read before it is written")
+    if raw in sample_dest:
+        raise ValueError("Sample used before vmcnt wait")
+    value = vector[raw]
+    if isinstance(value, str) and value in known_ssa_bits:
+        ssa_var, bits = value, known_ssa_bits[value] & 0xffff
+    elif (name := half16_name(raw, vector)) is not None and name in known_half:
+        ssa_var, bits = name, known_half[name] & 0xffff
+    else:
+        raise ValueError(f"binary16 operand lacks a finite proof: {raw}")
+    if (bits >> 10) & 0x1f == 0x1f:
+        raise ValueError(f"binary16 operand is not finite: {raw}")
+    if use_abs:
+        bits &= 0x7fff
+    if neg:
+        bits ^= 0x8000
+    return ssa_var, bits, use_abs, neg
+
+
 def parse_dpp(rest, operand_count):
     """Parse operands and quad-local DPP16 (quad_perm) or DPP8 (dpp8) modifiers."""
     parts_ = rest.split(", ")
@@ -2530,7 +2589,11 @@ def fma_mix_operand(token, is_f16, is_hi, scalar, vector, pending, sample_dest):
     if m := re.fullmatch(r"abs\(([^()|]+)\)|\|([^()|]+)\|", token):
         use_abs = True
         token = m.group(1) or m.group(2)
-    if is_f16:
+    if re.fullmatch(r"-\d+", token) and -16 <= int(token) <= -1:
+        raise ValueError(f"Ambiguous mixed-precision inline constant {token}")
+    if token == "-0":
+        expr = "asfloat(0x80000000u)"
+    elif is_f16:
         if token in INLINE_F16:
             word = f"{INLINE_F16[token]}u"
         elif re.fullmatch(r"[vs]\d+", token):
@@ -2567,6 +2630,7 @@ def fma_mix_operand(token, is_f16, is_hi, scalar, vector, pending, sample_dest):
 
 
 def parse_fma_mix(rest):
+    """Parse LLVM selectors: op_sel_hi enables f16 and op_sel picks its high half."""
     parts_ = rest.split(", ")
     if len(parts_) != 3:
         raise ValueError("Invalid mixed-precision operand count")
@@ -2588,7 +2652,7 @@ def parse_fma_mix(rest):
             raise ValueError(f"Unsupported mixed-precision modifier {mod}")
     op_sel = opts.get("op_sel", [0, 0, 0])
     op_sel_hi = opts.get("op_sel_hi", [0, 0, 0])
-    if any(hi and not f16 for f16, hi in zip(op_sel, op_sel_hi)):
+    if any(hi and not f16 for hi, f16 in zip(op_sel, op_sel_hi)):
         raise ValueError("High-half selection requires an f16 operand")
     return operands, op_sel, op_sel_hi, clamp
 
@@ -3228,10 +3292,9 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             lines.append(f"    precise float alu{i}_{dst} = ({region['cond']} ? {inner} : {outer});")
             vector[dst] = f"alu{i}_{dst}"
             join_f64_word(vector[dst], inner, outer)
-        if region["skipped"]:
-            # A wave that skipped the region (or one arm) never ran its waits, so what was outstanding at the opener
-            # still is.
-            before_pending, before_samples = region["outstanding"]
+        if region["skip"] is not None:
+            # A wave that skipped the final arm never ran its waits. An earlier skip already joined at the transition.
+            before_pending, before_samples = region["arm_outstanding"]
             pending.update(before_pending)
             sample_dest.update(before_samples)
         vector.masked = False
@@ -3300,8 +3363,8 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                     raise ValueError(f"Unsupported s_waitcnt_expcnt SGPR operand in a masked region: {line}")
                 # A wait is a scalar instruction: it runs whatever the execution mask, so the main wait handler
                 # below resolves outstanding vm/lgkm work exactly as it does outside a region. A region that the
-                # whole wave may skip (s_cbranch_execz) leaves that work outstanding on the skipping path, so
-                # close_region puts the pre-region outstanding state back after such a region. No export can be
+                # whole wave may skip (s_cbranch_execz) leaves that work outstanding on the skipping path, so the
+                # end of each arm joins that arm's incoming outstanding state if it has a skip. No export can be
                 # outstanding (only s_endpgm may follow one). Scratch stores are not tracked on the store
                 # counter, so vscnt is unknown once any store has been lowered.
                 if "vs" in counters and scratch_written:
@@ -3591,7 +3654,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             region = {"save": pair, "cond": condition[1], "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False,
                       "scalar_written": set(), "scc_written": False, "opener": "saveexec",
-                      "outstanding": (set(pending), dict(sample_dest))}
+                      "arm_outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
             scc = None
@@ -3662,7 +3725,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             region = {"save": pair, "cond": f"cmp{i}", "written": {}, "skip": None, "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False,
                       "scalar_written": set(), "scc_written": False, "opener": "cmpx",
-                      "outstanding": (set(pending), dict(sample_dest))}
+                      "arm_outstanding": (set(pending), dict(sample_dest))}
             vector.masked = True
             scalar.masked = True
         elif m := match(r"s_cbranch_scc([01]) (-?0x[0-9a-f]+|-?\d+)"):
@@ -3695,8 +3758,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
             region = {"save": None, "cond": scc if m[1] == "0" else f"(!{scc})", "written": {}, "skip": None,
                       "start": i, "arm_start": i, "else": None, "then": {}, "else_written": {},
                       "else_undefined": set(), "skipped": False, "scalar_written": set(), "scc_written": False,
-                      "opener": "scc", "end": end - 1 if join is not None else end, "join": join,
-                      "outstanding": (set(pending), dict(sample_dest))}
+                      "opener": "scc", "end": end - 1 if join is not None else end, "join": join}
             vector.masked = True
         elif m := match(r"s_cbranch_execz (-?0x[0-9a-f]+|-?\d+)"):
             # The whole-wave empty-mask skip may sit right after the save, or right after the else transition
@@ -3741,11 +3803,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 # A wave that skipped the then arm did not run its scalar writes or its waits before the else arm:
                 # what was outstanding at the opener may still be outstanding here.
                 scalar.conditional.update(region["scalar_written"])
-                before_pending, before_samples = region["outstanding"]
+                before_pending, before_samples = region["arm_outstanding"]
                 pending.update(before_pending)
                 sample_dest.update(before_samples)
             region["skip"] = None
             region["else"] = region["arm_start"] = i
+            region["arm_outstanding"] = (set(pending), dict(sample_dest))
             scc = None
         elif m := match(r"s_or_b64 exec, exec, (s\[\d+:\d+\])"):
             close_region(i, sgpr_pair(m[1]))
@@ -5436,8 +5499,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 expression = f"saturate({expression})"
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {expression};")
-        elif (m := DPP_MOVREL_PATTERN.fullmatch(line)) or (plain := PLAIN_MOVREL_PATTERN.fullmatch(line)):
-            # The plain forms index exactly as the DPP forms do, each lane reading its own VGPRs (no swizzle).
+        elif ((m := DPP_MOVREL_PATTERN.fullmatch(line)) or (plain := PLAIN_MOVREL_PATTERN.fullmatch(line))
+              or (sdwa := SDWA_MOVREL_PATTERN.fullmatch(line))):
+            # The plain and SDWA forms index exactly as the DPP forms do, each lane reading its own VGPRs (no swizzle).
+            sdwa_sel = None
             if m:
                 op, rest = m.groups()
                 if mask != "entry":
@@ -5445,11 +5510,21 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 ops, perm, _ = parse_dpp(rest, 2)
                 if not all(re.fullmatch(r"v\d+", t) for t in ops):
                     raise ValueError(f"Expected two VGPR operands without modifiers for {op}")
-            else:
+            elif plain:
                 op, *ops = plain.groups()
                 perm = None
                 if mask != "entry":
                     raise ValueError(f"Invalid {op} outside entry mask")
+            else:
+                op, dst_tok, sext, src_tok, close, dst_sel, unused, src_sel = sdwa.groups()
+                ops, perm = [dst_tok, src_tok], None
+                if mask != "entry":
+                    raise ValueError(f"Invalid {op}_sdwa outside entry mask")
+                if bool(sext) != bool(close):
+                    raise ValueError(f"Unbalanced sext in {op}_sdwa")
+                if unused == "UNUSED_SEXT":
+                    raise ValueError("UNUSED_SEXT is not lowered")
+                sdwa_sel = (src_sel, bool(sext), dst_sel, unused)
             kind = op if op.endswith("_dpp") else f"{op}_dpp"  # the indexing rule is the same for both encodings
             dst_base, src_base = int(ops[0][1:]), int(ops[1][1:])
             if not (0 <= dst_base <= 255 and 0 <= src_base <= 255):
@@ -5507,8 +5582,12 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 lines.append(f"    precise float dpp_src{i} = asfloat({sel});")
                 swizzled = (f"asuint(dpp_src{i})" if perm is None
                             else emit_quad_swizzle_u32(lines, i, f"dpp_src{i}", perm))
+            if sdwa_sel:
+                swizzled = sdwa_source(swizzled, sdwa_sel[0], sdwa_sel[1])
             if len(dst_offsets) == 1:
                 dst_reg = f"v{dst_base + dst_offsets[0]}"
+                if sdwa_sel:
+                    swizzled = sdwa_dest(swizzled, sdwa_sel[2], sdwa_sel[3], vector.get(dst_reg))
                 vector[dst_reg] = f"alu{i}"
                 lines.append(f"    precise float alu{i} = asfloat({swizzled});")
             else:
@@ -5517,8 +5596,10 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 lines.append(f"    uint dpp_doff{i} = {doff_expr};")
                 for k, prev in prev_dsts:
                     dst_reg = f"v{dst_base + k}"
+                    written = (sdwa_dest(f"dpp_val{i}", sdwa_sel[2], sdwa_sel[3], prev) if sdwa_sel
+                               else f"dpp_val{i}")
                     vector[dst_reg] = f"alu{i}_{k}"
-                    lines.append(f"    precise float alu{i}_{k} = (dpp_doff{i} == {k}u) ? asfloat(dpp_val{i}) : {prev};")
+                    lines.append(f"    precise float alu{i}_{k} = (dpp_doff{i} == {k}u) ? asfloat({written}) : {prev};")
         elif m := match(r"v_swaprel_b32 (v\d+), (v\d+)"):
             # VGPR[vdst + m0[25:16]] and VGPR[vsrc + m0[9:0]] exchange their values (#1795), with the m0 rules of
             # the movrel forms: both sides are read before either is written, so a pair naming one register is
@@ -5584,6 +5665,31 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 helpers.add(helper)
             vector[dst] = f"alu{i}"
             lines.append(f"    precise float alu{i} = {template.format(bits)};")
+        elif m := match(r"v_cvt_pkrtz_f16_f32_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 compressed-export pack: src0 is swizzled across the quad,
+            # src1 stays on the current lane, DPP16 allows abs/neg on either source, and the
+            # destination holds the same (lo, hi) compressed-export pair as v_cvt_pkrtz_f16_f32_e32.
+            dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid pack DPP operation")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 2)
+            s0_val, abs0, neg0 = dpp_vgpr(tokens[0], vector, sample_dest, allow_mods=not is_dpp8)
+            s1_val, abs1, neg1 = dpp_vgpr(tokens[1], vector, sample_dest, allow_mods=not is_dpp8)
+            s0_bits = emit_quad_swizzle_u32(lines, i, s0_val, perm)
+            if abs0:
+                s0_bits = f"({s0_bits} & 0x7fffffffu)"
+            if neg0:
+                s0_bits = f"({s0_bits} ^ 0x80000000u)"
+            s1_bits = f"asuint({s1_val})"
+            if abs1:
+                s1_bits = f"({s1_bits} & 0x7fffffffu)"
+            if neg1:
+                s1_bits = f"({s1_bits} ^ 0x80000000u)"
+            lines.append(f"    precise float alu{i}_lo = asfloat({s0_bits});")
+            lines.append(f"    precise float alu{i}_hi = asfloat({s1_bits});")
+            vector[dst] = (f"alu{i}_lo", f"alu{i}_hi")
         elif m := match(rf"({'|'.join(DPP_EXTRA)}) (v\d+), (.+)"):
             op, dst, rest = m.groups()
             if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
@@ -5736,6 +5842,67 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 bits = f"({bits} ^ 0x80000000u)"
             vector[dst] = ("half16", f"alu{i}")
             lines.append(f"    precise float alu{i} = asfloat(narrow16(asfloat({bits})));")
+        elif m := match(rf"v_({'|'.join(VOP2_F16)})_f16_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 binary16 VOP2 arithmetic under the shared low-16-only and
+            # static finite-proof contract (#839): src0 is quad-swizzled via emit_quad_swizzle_u32,
+            # src1 stays on the current lane, DPP16 allows bit-15 abs/neg modifiers on either source
+            # (refused on DPP8), and the destination is tagged ("half16", alu) with its proven bits.
+            name, dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid f16 DPP operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 2)
+            s0_val, b0, abs0, neg0 = half16_dpp_source(
+                tokens[0], vector, sample_dest, known_ssa_bits, known_half, allow_mods=not is_dpp8)
+            s1_val, b1, abs1, neg1 = half16_dpp_source(
+                tokens[1], vector, sample_dest, known_ssa_bits, known_half, allow_mods=not is_dpp8)
+            result = f16_vop2_result(name, b0, b1)
+            if result is None:
+                raise ValueError(f"binary16 result overflows: v_{name}_f16_dpp")
+            s0_bits = f"(({emit_quad_swizzle_u32(lines, i, s0_val, perm)}) & 0xffffu)"
+            if abs0:
+                s0_bits = f"({s0_bits} & 0x7fffu)"
+            if neg0:
+                s0_bits = f"({s0_bits} ^ 0x8000u)"
+            s1_bits = f"(asuint({s1_val}) & 0xffffu)"
+            if abs1:
+                s1_bits = f"({s1_bits} & 0x7fffu)"
+            if neg1:
+                s1_bits = f"({s1_bits} ^ 0x8000u)"
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    uint hf{i}_1 = {s1_bits};")
+            expression = VOP2_F16[name].format(f"widen16(hf{i}_0)", f"widen16(hf{i}_1)")
+            lines.append(f"    precise float hs{i} = {expression};")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
+        elif m := match(rf"v_({'|'.join(VOP1_F16_ROUND)})_f16_dpp (v\d+), (.+)"):
+            # Quad-local DPP16/DPP8 binary16 VOP1 rounding under the same low-16-only and
+            # static finite-proof contract (#839).
+            name, dst, rest = m.groups()
+            if mask != "entry" or not 0 <= int(dst[1:]) <= 255:
+                raise ValueError("Invalid f16 DPP operation")
+            if half_denorm != HALF_DENORM_PRESERVE:
+                raise ValueError("binary16 denormal mode unknown at entry")
+            if dst in sample_dest:
+                raise ValueError("Write overlaps an outstanding sample")
+            tokens, perm, is_dpp8 = parse_dpp(rest, 1)
+            s0_val, b0, abs0, neg0 = half16_dpp_source(
+                tokens[0], vector, sample_dest, known_ssa_bits, known_half, allow_mods=not is_dpp8)
+            result = f16_round_result(name, b0)
+            s0_bits = f"(({emit_quad_swizzle_u32(lines, i, s0_val, perm)}) & 0xffffu)"
+            if abs0:
+                s0_bits = f"({s0_bits} & 0x7fffu)"
+            if neg0:
+                s0_bits = f"({s0_bits} ^ 0x8000u)"
+            lines.append(f"    uint hf{i}_0 = {s0_bits};")
+            lines.append(f"    precise float hs{i} = {VOP1_F16_ROUND[name].format(f'widen16(hf{i}_0)')};")
+            lines.append(f"    precise float alu{i} = asfloat(narrow16(hs{i}));")
+            vector[dst] = ("half16", f"alu{i}")
+            known_half[f"alu{i}"] = result
         elif m := match(rf"v_({'|'.join(DPP_INT32)})_dpp (v\d+), (.+)"):
             op, dst, rest = m.groups()
             arity, template, helper = DPP_INT32[op]
@@ -5925,7 +6092,7 @@ def lower(instructions, texture_sgpr, interp_sgpr, sampler, constant_descriptor=
                 raise ValueError("Write overlaps an outstanding sample")
             tokens, op_sel, op_sel_hi, clamp = parse_fma_mix(rest)
             args = [fma_mix_operand(t, f16, hi, scalar, vector, pending, sample_dest)
-                    for t, f16, hi in zip(tokens, op_sel, op_sel_hi)]
+                    for t, f16, hi in zip(tokens, op_sel_hi, op_sel)]
             expr = f"mad({args[0]}, {args[1]}, {args[2]})"
             if clamp:
                 expr = f"saturate({expr})"
