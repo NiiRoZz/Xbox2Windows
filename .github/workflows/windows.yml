@@ -264,6 +264,7 @@ jobs:
             tests/startup_gfx2hlsl_loop_constants_check.py \
             tests/startup_gfx2hlsl_join_symbols_check.py \
             tests/startup_gfx2hlsl_readfirstlane_recompute_check.py \
+            tests/startup_gfx2hlsl_readfirstlane_load_recompute_check.py \
             tests/startup_compute_readfirstlane_check.py \
             tests/startup_gfx2hlsl_calculated_target_check.py \
             tests/startup_triage_run_check.py \
