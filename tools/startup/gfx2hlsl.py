@@ -3178,6 +3178,8 @@ def translate_compute(out_dir, key):
     """Writes <key>.cs.hlsl, then <key>.cs.cso (DXC cs_6_0) and <key>.txt last, or <key>.fail with the reason.
     X2W_FXC set to the empty string publishes the manifest alone, as for graphics."""
     name = os.path.join(out_dir, '%016x' % key)
+    with suppress(FileNotFoundError):
+        os.remove(name + '.txt')  # the result is unpublished until validation and compilation finish
     try:
         pipe = load_compute_request(out_dir, key)
         hlsl, manifest = pipe.hlsl_cs(), pipe.manifest()
@@ -3201,11 +3203,7 @@ def translate_compute(out_dir, key):
                 lines = [re.sub(r'^.*?\.cs\.hlsl(:\d+:\d+)?:\s*', '', line) for line in r.stderr.strip().splitlines()]
                 detail = lines[0] if lines else ('?' if r.returncode else 'no bytecode produced')
                 open(name + '.fail', 'w').write('dxc cs: %s\n' % detail[:500])
-                with suppress(FileNotFoundError):
-                    os.remove(name + '.txt')  # no manifest next to a failure, as on the success path
                 return 'dxc cs failed: %s' % detail[:500]
-            with suppress(FileNotFoundError):
-                os.remove(name + '.txt')  # withdraw an older manifest before its bytecode changes
             os.replace(bytecode, name + '.cs.cso')
     temporary = '%s.txt.%d.tmp' % (name, os.getpid())
     with open(temporary, 'w') as result:

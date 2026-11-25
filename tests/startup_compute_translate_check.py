@@ -82,6 +82,15 @@ def check_requests(directory):
     # The pending scan treats the translated request as done (manifest-only mode) and retries the others.
     pending = G.pending_keys(str(cache), skip_failed=False)
     assert key not in pending and moved in pending, pending
+    # A retry of a previously published request must withdraw it if a required part vanishes.
+    root = cache / ('req_%016x.root' % key)
+    saved_root = root.read_bytes()
+    root.unlink()
+    assert G.translate_request(str(cache), key) == 'unsupported: unreadable shader request'
+    assert not (cache / ('%016x.txt' % key)).exists(), 'a manifest was left next to a refused request'
+    assert key in G.pending_keys(str(cache), skip_failed=False)
+    root.write_bytes(saved_root)
+    assert G.translate_request(str(cache), key) == 'ok'
     # A failed compile withdraws the manifest an earlier pass left. The Python interpreter stands in for DXC and
     # exits non-zero on DXC's options.
     os.environ.pop('X2W_FXC')
