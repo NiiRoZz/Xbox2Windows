@@ -6470,6 +6470,19 @@ half. SCC is unchanged. The fixture covers in-place, immediate and `m0` forms.
 Disabling the lowering or swapping the sources fails the check. Wave masks,
 symbolic descriptors and reserved scalar encodings stay refused. [Refs #1996](https://github.com/R0Y00/Xbox2Windows/issues/1996)
 
+**Scalar unsigned multiply-high.** The same check covers `s_mul_hi_u32`, the
+high 32 bits of the unsigned 64-bit product of two scalar words, with SCC
+unchanged. Startup HLSL has no 64-bit integer type, so a `mul_hi_u32` helper in
+the common preamble builds the high word from halfword products, as the
+`pixel_aot` scalar helper does. The check runs the emitted helper text on the
+CPU against `(a * b) >> 32` over the SOP2 forms above, edge pairs such as all
+ones squared and `0x80000000 x 2`, and seeded random pairs. The low word, the
+signed high word, a helper without either carry term, an added SCC write and a
+disabled lowering each fail. Wave-mask sources, a vcc or exec destination,
+symbolic descriptors and reserved scalar encodings stay refused; an SGPR that
+held a compare mask may be overwritten and loses its mask mark.
+`s_mul_hi_i32` is still refused by name.
+
 **Scalar bit tests.** Startup translation sets SCC for `s_bitcmp0_b32` and
 `s_bitcmp1_b32` by comparing the selected bit of the first word to zero or
 one. Only the low five bits of the index are used. EXEC, VCC and SGPRs tracked
