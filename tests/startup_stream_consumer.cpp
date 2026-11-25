@@ -295,7 +295,8 @@ static int dispatch_slot67(void* device, const std::string& mode)
 // unordered access view of it (device slot 19) whose token the stand-in writes into the title heap at table byte 64,
 // three root constants, Dispatch of 2x1x1 groups, and the texture copied to a readback buffer whose 1024 halves go
 // to X2W_TEST_DISPATCH_OUT. texture-store-none records no Dispatch; texture-store-denied creates the texture
-// without unordered access, so the stand-in records its view as not created.
+// without unordered access, so the stand-in records its view as not created. texture-store-uint makes the texture
+// and its view RGBA16_UINT; texture-store-self also creates a shader resource view of the texture at table byte 0.
 static int texture_slot67(void* device, const std::string& mode)
 {
     constexpr UINT width = 32, height = 8, pitch = width * 8, bytes = pitch * height;
@@ -303,7 +304,8 @@ static int texture_slot67(void* device, const std::string& mode)
     const auto make = [&](D3D12_HEAP_TYPE type, const D3D12_RESOURCE_DESC& desc, D3D12_RESOURCE_STATES state) {
         return make_committed(device, type, desc, state);
     };
-    const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT,
+    const DXGI_FORMAT format = mode == "texture-store-uint" ? DXGI_FORMAT_R16G16B16A16_UINT : DXGI_FORMAT_R16G16B16A16_FLOAT;
+    const D3D12_RESOURCE_DESC texture_desc{D3D12_RESOURCE_DIMENSION_TEXTURE2D, 0, width, height, 1, 1, format,
         {1, 0}, D3D12_TEXTURE_LAYOUT_UNKNOWN,
         mode == "texture-store-denied" ? D3D12_RESOURCE_FLAG_NONE : D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS};
     const D3D12_RESOURCE_DESC buffer_desc{D3D12_RESOURCE_DIMENSION_BUFFER, 0, bytes, 1, 1, 1, DXGI_FORMAT_UNKNOWN, {1, 0},
@@ -329,11 +331,14 @@ static int texture_slot67(void* device, const std::string& mode)
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence))))) return 72;
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
-    const D3D12_UNORDERED_ACCESS_VIEW_DESC view{DXGI_FORMAT_R16G16B16A16_FLOAT, D3D12_UAV_DIMENSION_TEXTURE2D};
+    const D3D12_UNORDERED_ACCESS_VIEW_DESC view{format, D3D12_UAV_DIMENSION_TEXTURE2D};
     invoke(device, 19, word(texture), 0, word(&view), cpu + 64);
+    D3D12_SHADER_RESOURCE_VIEW_DESC read{format, D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING};
+    read.Texture2D.MipLevels = 1;
+    if (mode == "texture-store-self") invoke(device, 18, word(texture), word(&read), cpu);
     D3D12_TEXTURE_COPY_LOCATION image{static_cast<ID3D12Resource*>(texture), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     D3D12_TEXTURE_COPY_LOCATION source{static_cast<ID3D12Resource*>(upload), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
-    source.PlacedFootprint = {0, {DXGI_FORMAT_R16G16B16A16_FLOAT, width, height, 1, pitch}};
+    source.PlacedFootprint = {0, {format, width, height, 1, pitch}};
     D3D12_TEXTURE_COPY_LOCATION result = source;
     result.pResource = static_cast<ID3D12Resource*>(readback);
     const UINT constants[3] = {1, 2, 3};

@@ -100,6 +100,25 @@ def store(directory, consumer, dxc, env):
     refused = lines(result, 'refused: ')
     assert len(refused) == 1 and 'an output texture view was not created on the desktop' in refused[0], result.stderr[-3000:]
 
+    # Refusals the runtime already had, each with its one logged reason and an untouched texture: an integer view
+    # format, another manifest version, another stage, and (with a manifest line added here for a view the consumer
+    # creates) the output texture named as an input too.
+    manifest = cache / f'{key:016x}.txt'
+    original = manifest.read_text()
+    for mode, old, new, reason in (
+            ('texture-store-uint', '', '', 'an output texture format is not a float or normalized one'),
+            ('texture-store', 'x2w-manifest 2', 'x2w-manifest 3', 'manifest version'),
+            ('texture-store', 'stage cs', 'stage ps', 'not a compute manifest'),
+            ('texture-store-self', 'uav 0 tex2d', 'srv 0 tex2d table 1 0' + chr(10) + 'uav 0 tex2d',
+             'an output texture is also an input of the dispatch')):
+        assert not old or original.count(old) == 1, original
+        manifest.write_bytes(original.replace(old, new).encode() if old else original.encode())
+        got, result = run(directory, consumer, env, mode, layout)
+        refused = lines(result, 'refused: ')
+        assert got == untouched and len(refused) == 1 and refused[0].endswith('refused: ' + reason), (
+            mode, reason, refused, result.stderr[-3000:])
+    manifest.write_bytes(original.encode())
+
     # The same compiled program under a manifest without entry values (the program reads none of its three): the
     # runtime binds no constants. The manifest is edited here; the translator writes `ud 0` for a root without them.
     manifest = cache / f'{key:016x}.txt'
