@@ -3310,7 +3310,7 @@ class Stage:
                 self.sym[dst[1] + i] = ('const', 0, 'unassigned')
             self.pipe.notes.add('dynamic sampler index replaced by a default sampler')
             return
-        if p[1] == ('resheap',) and self.kind == 'cs':
+        if p[1] == ('resheap',) and getattr(self, 'kind', None) == 'cs':
             return self.heap_record(dst, base, token, imm, count)
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
 
