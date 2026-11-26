@@ -489,6 +489,7 @@ SPLICE = {
     'buffer_store_dwordx2 v[5:6], off, s[16:19], 0': '000074e000050480',
     'v_lshrrev_b64 v[5:6], 4, s[20:21]': '050000d784280000',
     'v_lshrrev_b64 v[5:6], 4, v[3:4]': '050000d784060200',
+    's_cbranch_execz 4': '040088bf',
 }
 
 
@@ -895,6 +896,18 @@ def check_off_stores():
     hlsl = lines('v_lshrrev_b64 v[5:6], 4, s[20:21]', 'buffer_store_dwordx2 v[5:6], off, s[16:19], 0')
     at = hlsl.index('    a = (0) & 0xfffffffcu;')
     assert hlsl[at + 1] == '    u0.Store2(a, uint2(v5, v6));', hlsl[at:at + 2]
+    # Past the entry block (inside a guard that skips per lane) the recomputable expression carries the proof.
+    guard = ['v_cmp_gt_u32 vcc_lo, 1, v0', 's_and_saveexec_b32 s0, vcc_lo']
+    hlsl = lines(*guard, 's_cbranch_execz 3', 'v_mov_b32 v5, s20', 'buffer_store_dword v5, off, s[16:19], 0',
+                 's_or_b32 exec_lo, exec_lo, s0')
+    assert 'if (exec & 1) u0.Store(a, v5);' in [line.strip() for line in hlsl], hlsl
+    hlsl = lines(*guard, 's_cbranch_execz 4', 'v_lshrrev_b64 v[5:6], 4, s[20:21]',
+                 'buffer_store_dwordx2 v[5:6], off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0')
+    assert 'if (exec & 1) u0.Store2(a, uint2(v5, v6));' in [line.strip() for line in hlsl], hlsl
+    # The saveexec between the definition and the store ends the proof (conservative: these lanes are a subset).
+    refused('buffer store off with data not proven wave-uniform', lambda: lines(
+        'v_mov_b32 v5, s20', *guard, 's_cbranch_execz 3', 's_waitcnt lgkmcnt(0)',
+        'buffer_store_dword v5, off, s[16:19], 0', 's_or_b32 exec_lo, exec_lo, s0'))
     # Negative controls: per-lane data (a shift of the thread index; the per-lane load), and uniform data written
     # before an EXEC change, where the entry-block proof no longer knows which lanes store.
     for code in (('v_lshrrev_b64 v[5:6], 4, v[3:4]', 'buffer_store_dwordx2 v[5:6], off, s[16:19], 0'),
