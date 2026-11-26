@@ -118,7 +118,11 @@ the registers the routine loaded. The routine's code is not in the shader contai
 
 The stand-in reads the `INPUT_LAYOUT` subobject and publishes it next to the request as `req_<key>.ia`, before
 `.a`. The file holds `ia1 <count>` and then one line per element: semantic, index, format, slot, offset, class
-and step rate. A stream with a non-empty layout includes that text in its cache key; other keys are unchanged.
+and step rate. A stream with a non-empty layout includes that text in its cache key; other keys are unchanged. A layout declared
+with zero elements publishes nothing by default, so the fetch is refused and not drawn, like an absent or unreadable
+layout. With the experimental opt-in `X2W_STREAM_ZERO_FILL=1` it is published as the single line `ia1 0`, and the
+translation reads every fetched register as zero. That zero value is an assumption, not a measurement: no independent
+reference shows what a fetched input holds for a zero-element layout, so no startup claim rests on it.
 One log line per stream gives the element count and, for each element, format, slot, offset and class:
 `x2w-draw stream input layout: 2 elements (format/slot/offset/class) 6/0/0/0 6/0/4294967295/0`.
 
@@ -1360,6 +1364,7 @@ ctest --preset dev --no-tests=error -R '^startup_trap_header(_prefix_control|_pr
 | `X2W_RUNTIME_PROXY=1` | proxies the gaming runtime and logs every call. Rewrites regular-IAT `GetProcAddress` and a direct `xgameruntime.dll!QueryApiImpl` import on the main EXE and on DLLs that share its directory (package helpers). Dynamic `QueryApiImpl` / `InitializeApiImpl*` are wrapped only when the provider module's basename is `xgameruntime.dll`. `LdrRegisterDllNotification` only flags that another scan is needed. A worker holds each matching module live while rewriting after linking. Loading a helper and immediately calling it can precede the scan. The enabled proxy stays loaded until process exit. Delay-import IAT slots are not rewritten. Skips this stand-in's own `GetProcAddress` IAT so the hook does not recurse (`src/startup_stubs/runtime_gpa_patch.h`, `ctest --preset dev --no-tests=error -R '^startup_runtime_gpa_patch(_name_only_control)?$'`, and the control must print `FAIL:`; Windows also runs `startup_runtime_proxy_scope` for a late-loaded helper through the real loader) |
 | `X2W_FAKE_USER=1` | answers the user, gamertag and save APIs for one local user, and creates one offline store context for that user |
 | `X2W_RUNTIME_LOCAL=1` | with `X2W_RUNTIME_PROXY` and `X2W_FAKE_USER`, for a host where the system gaming runtime cannot initialize (no Gaming Services). The first failed `InitializeApiImpl*` is reported as `S_OK`, and every later initialization call returns `S_OK` without calling the real export. Once initialization failure is latched, a failed real `QueryApiImpl` call can fall back only with an exact match of both GUIDs to a supported provider/interface pair for user (including gamertag), game save, package, title, connectivity or store. Persistent local storage uses its existing fake-user gate and requires its exact provider GUID and IID. Unmatched failed queries keep the real HRESULT. The proxy clears a writable output on failure only when fake user is enabled and the initialization failure is latched. A local object's `QueryInterface` accepts only `IID_IUnknown` and the IID it was created for. The local answers above apply, calls that carry the local user or store handle fail as before, and other unanswered methods return `E_NOTIMPL`. `XUserAddAsync` and async operations completed on behalf of a local answer require the real runtime's `QueryApiImpl` to return the XAsync provider (`073b7dcb`). Those operations complete with `S_OK` through XAsync, or return the query failure if XAsync is unavailable (`ctest --preset dev --no-tests=error -R '^startup_runtime_local(_control)?$'`, and the control must print `FAIL:`). |
+| `X2W_DEVICE_TYPE=<n>` | with `X2W_RUNTIME_PROXY=1`, answers the title's reads of the OEM `ConsoleMode` registry value: `6` = 0x60 (Series S), `7` = 0x64 (Series X), `1` = value missing (PC); unset, the real registry answers. See [Console profile](#console-profile) |
 | `X2W_STORAGE_PATH`, `X2W_STORAGE_MB`, `X2W_TITLE_ID` | persistent local storage and the manifest values the runtime would return. The path is UTF-8, with a trailing separator added when missing. If the path is invalid or exceeds 259 bytes including the separator, the proxy logs the refusal and uses `S:\` (`src/startup_stubs/storage_root_utf8.h`, `ctest --preset release --no-tests=error -R '^startup_storage_root'`). |
 | `X2W_INPUT_SCRIPT=mask@sec,...` | timed virtual gamepad presses, holds, stick or trigger values and waits for the presented picture: see [Input script](#input-script); keyboard and XInput pad 0 also work. Up to 256 entries and 4,095 characters; a longer value is ignored and logged, and dropped or malformed entries are logged (`ctest --preset dev --no-tests=error -R '^startup_gameinput_script_(long|entries|syntax)$'`) |
 | `X2W_SAMPLER_HEAP=1` | `gfx2hlsl.py` translates a sampler-heap load with a run-time offset into `SamplerState qh[2048] : register(s0, space1)` and writes `smpheap 2048 1 fallback 2047`. The stand-in uses entries 0 to 2046 for the bound heap and reserves entry 2047 for unaligned or out-of-range offsets. It also accepts the original `smpheap 2048 1` manifest with all 2,048 entries available. [#1143](https://github.com/R0Y00/Xbox2Windows/issues/1143) |
@@ -1386,6 +1391,34 @@ then start the build again. The new key keeps the former bytecode and manifest
 together under their original name. A 16-dword table load can contain two
 independent image descriptors at offsets 0 and 32 from the load address.
 For a read-only census of cached shader refusals, use `python -B tools/startup/gfx2hlsl.py --refusals <cache-directory> [--json]` with a translator that supports the flag. Earlier versions treat it as `--pending` and write into the directory. See [Startup translator refusal census](experiments.md#startup-translator-refusal-census).
+
+## Console profile
+
+`X2W_DEVICE_TYPE` answers the two registry reads a title makes of
+`HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM\ConsoleMode`
+(`src/startup_stubs/console_mode.h`, `registry_console_mode.inl`): with `X2W_RUNTIME_PROXY=1` the
+stand-in rewrites the registry imports of the EXE and package helpers. `6` answers 0x60 (Series S),
+`7` answers 0x64 (Series X) and `1` reports the value missing (PC); unset, every call goes to the real
+registry. Only registry imports that the Windows registry provides are rewritten: an IAT entry must
+name `advapi32.dll`, `kernelbase.dll`, `kernel32.dll` or an `api-ms-win-core-registry-*` API set and be
+bound inside the system-directory copy of the first three, and `GetProcAddress` must be called on one
+of those modules. A package DLL that exports the same names keeps its own exports and is never kept as
+the real registry. Opening the key and reading the value are logged a few times either way, and a
+seventeenth OEM key handle open at once is logged once and not tracked. What the values mean on the
+console is taken from public notes, not measured here.
+`ctest --preset dev --no-tests=error -R '^startup_console_mode(_control|_provider_control)?$'` runs it
+against fake registry functions and a source-built decoy DLL with the same export names, with the switch
+unset and set. The control leaves the switch unset for the answered cases and the provider control
+matches registry imports by name alone; both must print `FAIL:`. `startup_runtime_proxy_scope` checks the
+same decoy rule through the real loader against `advapi32.dll`.
+
+The switch changes only what the registry reads answer. A title can take a different start-up path
+for each profile: on the Series S profile, one loaded an upscaler package module that the other
+profiles do not, and that module met desktop refusals the other profiles did not reach
+(`Device::slot76`, views with `ViewDimension` 0, and `R9G9B9E5_SHAREDEXP` textures with unordered
+access, the last covered by the
+[shared-exponent stand-in](#shared-exponent-render-and-unordered-access-targets)). Choosing a profile
+is not evidence that the path it leads to runs.
 
 ## D3D12 resource budget
 
@@ -1575,6 +1608,26 @@ every call, and the fixture must fail. Slots 19 to 21 are not exercised.
 ```powershell
 cmake --build --preset dev --target startup_view_census
 ctest --preset dev --no-tests=error -R "^startup_view_census" -V
+```
+
+## Wrapper allocation failure
+
+Every object the D3D12 stand-in returns is a wrapper allocated in `wrap()`. When that allocation (or its
+registration) fails, the creating call releases the desktop object it made and returns `E_OUTOFMEMORY` with
+a null output ([#2653](https://github.com/R0Y00/Xbox2Windows/issues/2653)). Before, the failure was a write
+through a null pointer inside the stand-in. This was seen at the job commit limit in a startup run, at the
+slot 55 derived-pipeline placeholder. Whether the title handles the error is not established.
+
+`startup_wrap_allocation_warp` makes the next wrapper allocation fail through the fixture-only export
+`x2w_d3d12_fail_wraps`. Device creation and slots 8, 9, 14, 16, 55, 73 and 127 must return
+`E_OUTOFMEMORY` with a null output, then succeed. After a failed attempt to create a second device,
+`GetDevice` on a live queue must still return the original device. The
+`startup_wrap_allocation_control_warp` test leaves the failure injection disabled and checks that
+the fixture detects the unexpected success.
+
+```powershell
+cmake --build --preset dev --target startup_wrap_allocation
+ctest --preset dev --no-tests=error -R "^startup_wrap_allocation" -V
 ```
 
 ## Input script
@@ -2865,6 +2918,20 @@ freed slots are reused in address order so that pages reused together share a vi
 `VirtualQuery` on a page of a shared view reports the view's base as the allocation base and the
 bytes from the queried page to the end of the view, not one page. A placed buffer on such memory
 is not affected: section-backed pages already took the committed, not-aliased path.
+
+## Committed resources (device slot 76)
+
+Device slot 76 (Xbox order, +0x260) takes the seven arguments of desktop `CreateCommittedResource`:
+heap properties, heap flags, desc, initial state, clear value, riid and ppv. Measured: a console
+package module (an upscaler) creates its resources through it. The stand-in shares the
+committed-resource path of slot 127 (the `CreateCommittedResource3` order, with protected session and
+castable formats, which slot 76 does not pass): the same initial-state choice per heap, the same
+clear-value retry and title memory, and a log line naming the slot. Run
+`ctest --preset dev --no-tests=error -R '^startup_committed_slot76_(warp|control)$'`
+(`tests/startup_committed_slot76_check.cpp`): a render target with a clear value and buffers on the
+default, upload and readback heaps, passed with initial state 0xffffffff as a title passes them, must
+be created and leave the device alive. The control asks for a 2D texture on an upload heap and must
+return `E_INVALIDARG` with no resource and leave the device alive. The control also requires all four valid creations to pass. `startup_committed_slot76_hardware` runs the creation checks on a physical GPU.
 
 - `ctest --preset release --no-tests=error -R '^xmem_shim_(mapped_pages|page_runs)$' -V` runs the
   earlier contract check and `tests/xmem_page_runs_check.py`: a batch across two sections with

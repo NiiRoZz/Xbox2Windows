@@ -463,10 +463,22 @@ u64 unwrap(u64 value)
     return w ? reinterpret_cast<u64>(w->own().real) : value;
 }
 
+volatile LONG wraps_to_fail;  // fixture-only, set by x2w_d3d12_fail_wraps
+constexpr u64 out_of_memory = static_cast<std::uint32_t>(E_OUTOFMEMORY);  // for slots that return u64
+
+// Returns nullptr when the wrapper cannot be allocated or registered (#2653). The caller still owns
+// `real` then: it releases what it created and returns E_OUTOFMEMORY.
 Wrapper* wrap(IUnknown* real, Kind kind)
 {
+    for (LONG n = wraps_to_fail; n > 0; n = wraps_to_fail)
+        if (InterlockedCompareExchange(&wraps_to_fail, n - 1, n) == n) return nullptr;
     const std::size_t area = kind == list_kind ? 0x10000 : sizeof(Wrapper);
     auto* block = static_cast<unsigned char*>(_aligned_malloc(sizeof(WrapperOwn) + area, 16));
+    if (!block) {
+        static LONG failed;
+        if (first_calls(failed, 4)) log("x2w-d3d12 wrap(%s): wrapper allocation failed -> E_OUTOFMEMORY", kind_names[kind]);
+        return nullptr;
+    }
     std::memset(block, 0, sizeof(WrapperOwn) + area);
     auto* w = reinterpret_cast<Wrapper*>(block + sizeof(WrapperOwn));
     w->vtable = tables[kind];
@@ -475,7 +487,13 @@ Wrapper* wrap(IUnknown* real, Kind kind)
     w->own().kind = kind;
     if (kind == fence_kind && real) w->own().completed = static_cast<LONG64>(static_cast<ID3D12Fence*>(real)->GetCompletedValue());
     AcquireSRWLockExclusive(&registry_lock);
-    registry().insert(w);
+    try {
+        registry().insert(w);
+    } catch (const std::bad_alloc&) {
+        ReleaseSRWLockExclusive(&registry_lock);
+        _aligned_free(block);
+        return nullptr;
+    }
     ReleaseSRWLockExclusive(&registry_lock);
     return w;
 }
@@ -878,6 +896,11 @@ __declspec(noinline) u64 create_slot(Wrapper* self, u64 a, u64 b, u64 c, u64 d, 
         if (Desc >= 0 && kind == resource_kind && requested_format != DXGI_FORMAT_UNKNOWN)
             x2w_startup::mark_packed_stand_in(static_cast<ID3D12Resource*>(*out), requested_format);
         Wrapper* child = wrap(static_cast<IUnknown*>(*out), kind);
+        if (!child) {
+            static_cast<IUnknown*>(*out)->Release();
+            *out = nullptr;
+            return out_of_memory;
+        }
         if constexpr (K == device_kind && N == 27) {
             if (kind == resource_kind && args[0])
                 retire_set_class(child, *reinterpret_cast<const D3D12_HEAP_PROPERTIES*>(args[0]),
@@ -1049,6 +1072,10 @@ HRESULT __stdcall device_create_command_queue(Wrapper* self, const D3D12_COMMAND
         desc->Priority, desc->Flags, desc->NodeMask, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     *out = wrap(queue, queue_kind);
+    if (!*out) {
+        queue->Release();
+        return E_OUTOFMEMORY;
+    }
     register_retire_queue(static_cast<Wrapper*>(*out));
     return S_OK;
 }
@@ -1073,6 +1100,10 @@ HRESULT __stdcall device_create_command_queue_x(Wrapper* self, const D3D12_COMMA
         desc->Type, desc->Priority, desc->Flags, desc->NodeMask, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     *out = wrap(queue, queue_kind);
+    if (!*out) {
+        queue->Release();
+        return E_OUTOFMEMORY;
+    }
     register_retire_queue(static_cast<Wrapper*>(*out));
     return S_OK;
 }
@@ -1169,7 +1200,7 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
             }
         }
         *output = wrap(nullptr, command_signature_kind);
-        return S_OK;
+        return *output ? u64{S_OK} : out_of_memory;
     }
     const u64 result = create_slot<device_kind, 41, 2>(self, reinterpret_cast<u64>(desc), root, iid, out, 0, 0, 0, 0);
     if (SUCCEEDED(static_cast<HRESULT>(result)) && out && desc && root && desc->NumArgumentDescs > 1) {
@@ -1222,7 +1253,7 @@ u64 __stdcall device_create_command_signature(Wrapper* self, const D3D12_COMMAND
         for (UINT i = 0; i < desc->NumArgumentDescs; ++i) {
             if (static_cast<UINT>(desc->pArgumentDescs[i].Type) > D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH) {
                 *output = wrap(nullptr, command_signature_kind);
-                return S_OK;
+                return *output ? u64{S_OK} : out_of_memory;
             }
         }
     }
@@ -1991,6 +2022,10 @@ HRESULT __stdcall device_create_root_signature(Wrapper* self, UINT node, const v
         return hr;
     }
     Wrapper* w = wrap(root, root_signature_kind);
+    if (!w) {
+        root->Release();
+        return E_OUTOFMEMORY;
+    }
     note_root_blob(w, blob, size);
     std::vector<RootParameter> parameters;
     UINT heap_flags = 0;
@@ -4123,6 +4158,7 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
     // Some callers pass the 16-byte desktop descriptor; the words after it are then unrelated stack
     // data. The extension is taken only when it holds a pointer and exactly the heap's size.
     std::uint64_t title_memory = extra[0] >= 0x10000 && extra[1] == bytes ? extra[0] : 0;
+    const std::uint64_t supplied_memory = title_memory;
     // The title copies descriptors between heaps with its own memory copies. A view heap without
     // title memory therefore gets plain memory of ours as its CPU side, so that the view ids written
     // there (note_view) travel with those copies; the desktop heap behind it is still filled. A heap
@@ -4134,6 +4170,11 @@ HRESULT __stdcall device_create_descriptor_heap(Wrapper* self, const D3D12_DESCR
         return E_OUTOFMEMORY;
     }
     Wrapper* w = wrap(heap, descriptor_heap_kind);
+    if (!w) {
+        if (title_memory != supplied_memory) VirtualFree(reinterpret_cast<void*>(title_memory), 0, MEM_RELEASE);
+        heap->Release();
+        return E_OUTOFMEMORY;
+    }
     if (title_memory) {
         w->own().title_cpu = title_memory;
         AcquireSRWLockExclusive(&descriptor_lock);
@@ -4377,6 +4418,10 @@ HRESULT __stdcall device_create_command_list_x(Wrapper* self, const void* desc, 
             allocator, pso, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     Wrapper* child = wrap(list, list_kind);
+    if (!child) {
+        list->Release();
+        return E_OUTOFMEMORY;
+    }
     child->own().list_device = self;
     *out = child;
     return S_OK;
@@ -4469,6 +4514,11 @@ HRESULT publish_placed_buffer(Wrapper* self, void* address, const D3D12_RESOURCE
                               ID3D12Resource* resource, bool aliased, x2w_budget::Ticket* backing_budget, void** out)
 {
     Wrapper* w = wrap(resource, resource_kind);
+    if (!w) {
+        if (x2w_startup::linear_buffer_mode() != x2w_startup::LinearBufferMode::off) linear_buffers().discard(resource);
+        resource->Release();
+        return E_OUTOFMEMORY;
+    }
     if (release_retired_enabled()) w->own().retire_never = static_cast<std::uint8_t>(RetireNever::buffer);
     w->own().title_memory = address;
     const ResourceInfo record{*desc, desc->Width, aliased ? Placement::aliased_buffer : Placement::copied_buffer, self, initial_state};
@@ -4539,6 +4589,10 @@ HRESULT __stdcall device_place_resource_x(Wrapper* self, void* address, const D3
         if (FAILED(texture_hr)) return texture_hr;
         x2w_startup::mark_packed_stand_in(created, desktop_format(desc->Format));
         Wrapper* w = wrap(created, resource_kind);
+        if (!w) {
+            created->Release();
+            return E_OUTOFMEMORY;
+        }
         w->own().budget = x2w_budget::committed(device_of(self), created, props.Type);
         w->own().title_memory = address;
         note_resource(w, desc, 0);
@@ -5362,6 +5416,12 @@ extern "C" __declspec(dllexport) std::size_t x2w_d3d12_view_census_line(char* ou
     return view_census_line(out, capacity);
 }
 
+// Fixture-only: the next `count` wrapper allocations fail as an exhausted heap would (#2653).
+extern "C" __declspec(dllexport) void x2w_d3d12_fail_wraps(LONG count)
+{
+    InterlockedExchange(&wraps_to_fail, count);
+}
+
 // Fixture probe (startup_resource_retire): what still names a resource of the class by its raw desktop pointer, how many
 // resources the open recording of a list moved out of COMMON, and how many it holds. Counts entries only.
 struct RetireProbe {
@@ -5628,6 +5688,7 @@ HRESULT __stdcall device_create_compute_pipeline_x(Wrapper*, const D3D12_COMPUTE
             static_cast<unsigned long long>(desc->CS.BytecodeLength), desc->NodeMask, desc->Flags, extra0, extra1, text, bytes);
     if (kind_for(*iid) != pipeline_kind) return E_NOINTERFACE;
     *out = wrap(nullptr, pipeline_kind);
+    if (!*out) return E_OUTOFMEMORY;
     auto* pipeline = static_cast<Wrapper*>(*out);
     note_pipeline(pipeline, 62, nullptr, desc, sizeof(*desc));
     note_compute_binding_pipeline(pipeline, *desc);
@@ -5680,6 +5741,10 @@ HRESULT __stdcall device_create_pipeline_stream_x(Wrapper*, const D3D12_PIPELINE
             log("x2w-render stream pipeline -> %s%s", real_pipeline ? "REAL desktop pipeline" : "placeholder: ", real_pipeline ? "" : why);
     }
     *out = wrap(real_pipeline, pipeline_kind);
+    if (!*out) {
+        if (real_pipeline) real_pipeline->Release();
+        return E_OUTOFMEMORY;
+    }
     static_cast<Wrapper*>(*out)->own().compute_pipeline = real_pipeline && compute;
     static_cast<Wrapper*>(*out)->own().pipeline_root = pipeline_root;
     static_cast<Wrapper*>(*out)->own().indirect_graphics = graphics;
@@ -5737,6 +5802,7 @@ HRESULT __stdcall device_create_pipeline_placeholder(Wrapper*, const void* desc,
         log("x2w-d3d12 Device::slot%d(pipeline?) desc=[%s] riid=%s -> placeholder", N, bytes, text);
     }
     *out = wrap(nullptr, pipeline_kind);
+    if (!*out) return E_OUTOFMEMORY;
     if constexpr (N == 67) {
         // A translated Dispatch finds its program by this key (d3d12_compute_dispatch.inl).
         if (const u64 key = publish_compute_request(desc)) {
@@ -5771,6 +5837,7 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT coun
             w ? kind_names[w->own().kind] : "not a wrapper", count, bytes, text);
     }
     *out = wrap(nullptr, pipeline_kind);
+    if (!*out) return E_OUTOFMEMORY;
     note_pipeline(static_cast<Wrapper*>(*out), 55, base, desc, bytes_in_patches);
     return S_OK;
 }
@@ -5782,10 +5849,10 @@ HRESULT __stdcall device_create_derived_pipeline(Wrapper*, void* base, UINT coun
 // COMMON, GENERIC_READ on an upload heap and COPY_DEST on a readback heap (the initial states D3D12
 // requires there; the Windows 10 runtime refuses COMMON with E_INVALIDARG). When desktop rejects the
 // clear value it is retried without one.
-HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
-                                            const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
-                                            void* session, UINT castable_count, const void* castable, const GUID* iid,
-                                            void** out)
+// Slot 76 shares the work with the slot number in the log line.
+HRESULT create_committed(int slot, Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                         const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear, void* session,
+                         UINT castable_count, const void* castable, const GUID* iid, void** out)
 {
     char text[48];
     guid_text(iid, text, sizeof(text));
@@ -5794,7 +5861,7 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     const D3D12_RESOURCE_DESC copy = sanitized(*desc);
     const auto flags = static_cast<D3D12_HEAP_FLAGS>(heap_flags);
     const D3D12_RESOURCE_ALLOCATION_INFO info = device_of(self)->GetResourceAllocationInfo(0, 1, &copy);
-    check_device("Device before slot", 127);
+    check_device("Device before slot", slot);
     void* const title_memory = info.SizeInBytes != ~0ull ? title_resource_memory(info.SizeInBytes, info.Alignment) : nullptr;
     ID3D12Resource* resource = nullptr;
     const D3D12_RESOURCE_STATES initial = props->Type == D3D12_HEAP_TYPE_UPLOAD     ? D3D12_RESOURCE_STATE_GENERIC_READ
@@ -5812,19 +5879,43 @@ HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROP
     }
     static LONG calls;
     if (first_calls(calls, 12))
-        log("x2w-d3d12 Device::slot127(CreateCommittedResource3?) heap=%d flags=0x%x dim=%d %llux%u fmt=%d rflags=0x%x "
-            "state=0x%x clear=%p%s session=%p castable=%u/%p riid=%s -> 0x%08lx", props->Type, heap_flags, desc->Dimension,
+        log("x2w-d3d12 Device::slot%d(%s) heap=%d flags=0x%x dim=%d %llux%u fmt=%d rflags=0x%x "
+            "state=0x%x clear=%p%s session=%p castable=%u/%p riid=%s -> 0x%08lx", slot,
+            slot == 76 ? "CreateCommittedResource" : "CreateCommittedResource3?", props->Type, heap_flags, desc->Dimension,
             desc->Width, desc->Height, desc->Format, desc->Flags, state, static_cast<const void*>(clear),
             clear && !cleared ? "(dropped)" : "", session, castable_count, castable, text, static_cast<unsigned long>(hr));
     if (FAILED(hr)) return hr;
     x2w_startup::mark_packed_stand_in(resource, desktop_format(desc->Format));
     Wrapper* w = wrap(resource, resource_kind);
+    if (!w) {
+        resource->Release();  // title_memory came from the title's allocator, which has no free hook here
+        return E_OUTOFMEMORY;
+    }
     w->own().budget = x2w_budget::committed(device_of(self), resource, props->Type);
     w->own().title_memory = title_memory;
     retire_set_class(w, *props, flags, copy, title_memory);
     note_resource(w, desc, info.SizeInBytes != ~0ull ? info.SizeInBytes : 0);
     *out = w;
     return S_OK;
+}
+
+HRESULT __stdcall device_create_committed_x(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                                            const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
+                                            void* session, UINT castable_count, const void* castable, const GUID* iid,
+                                            void** out)
+{
+    return create_committed(127, self, props, heap_flags, desc, state, clear, session, castable_count, castable, iid, out);
+}
+
+// Device slot 76 (Xbox order, +0x260): the seven arguments of desktop CreateCommittedResource
+// (heap properties, heap flags, desc, initial state, clear value, riid, ppv). Seen from a console
+// package module (an upscaler) that a title loaded only on the Series S profile. Same desktop
+// creation as slot 127 (tests/startup_committed_slot76_check.cpp).
+HRESULT __stdcall device_create_committed(Wrapper* self, const D3D12_HEAP_PROPERTIES* props, UINT heap_flags,
+                                          const D3D12_RESOURCE_DESC* desc, UINT state, const D3D12_CLEAR_VALUE* clear,
+                                          const GUID* iid, void** out)
+{
+    return create_committed(76, self, props, heap_flags, desc, state, clear, nullptr, 0, nullptr, iid, out);
 }
 
 // Device slot 80 (Xbox order): (type, timeout, 0, flags, &token) -> HRESULT, the frame-event wait
@@ -6286,6 +6377,7 @@ void build_tables()
     tables[device_kind][48] = reinterpret_cast<void*>(&device_create_command_queue_x);
     tables[device_kind][70] = reinterpret_cast<void*>(&device_memory_srv);
     tables[device_kind][73] = reinterpret_cast<void*>(&device_create_command_list_x);
+    tables[device_kind][76] = reinterpret_cast<void*>(&device_create_committed);
     tables[device_kind][78] = reinterpret_cast<void*>(&device_frame_interval);
     tables[device_kind][79] = reinterpret_cast<void*>(&device_frame_event);
     tables[device_kind][80] = reinterpret_cast<void*>(&device_wait_frame_event);
@@ -6405,9 +6497,14 @@ void x2w_startup::attach_device(ID3D12Device* device, void** wrapped)
 {
     static const bool ready = (build_tables(), true);
     (void)ready;
+    Wrapper* const candidate = wrap(device, device_kind);
+    *wrapped = candidate;
+    if (!candidate) {
+        device->Release();
+        return;
+    }
+    the_device = candidate;
     removal_device = device;
-    the_device = wrap(device, device_kind);
-    *wrapped = the_device;
 }
 
 HRESULT x2w_startup::resolve_placed_build(void* guest_device, UINT64 dest, UINT64 scratch,
@@ -6490,7 +6587,8 @@ HRESULT x2w_d3d12_permissive_create_device(IUnknown* adapter, const void* parame
     log("x2w-d3d12 D3D12XboxCreateDevice adapter=%p params=[%s] riid=%s -> 0x%08lx build=%s", static_cast<void*>(adapter),
         block, text, static_cast<unsigned long>(hr), x2w_build_rev);
     if (FAILED(hr)) return hr;
-    if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
     x2w_startup::attach_device(device, out);
+    if (!*out) return E_OUTOFMEMORY;
+    if (debug) device->QueryInterface(IID_PPV_ARGS(&info_queue));
     return S_OK;
 }
