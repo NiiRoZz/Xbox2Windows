@@ -368,6 +368,29 @@ def float_word(token, scalar, vector, pending, sizes=None):
     return word
 
 
+def float_e64_source(token, scalar, vector, pending):
+    """The HLSL word of a VOP3 binary32 source after its source modifiers, or None for an unknown word.
+
+    LLVM prints the VOP3 source modifiers on a register as -v, |v| and -|v|. They act on the sign bit of the word:
+    abs clears bit 31, then neg flips it, as pixel_aot does for v_cvt_f64_f32_e64 and binary64 compare sources, so a
+    zero or NaN keeps its other bits. Modifiers on a constant (neg(0x...), |1.0|) and the abs() spelling are refused.
+    """
+    m = re.fullmatch(r"(-?)(\|?)(s\d+|v\d+)(\|?)", token)
+    if not m and not re.fullmatch(FLOAT_SOURCE, token):
+        raise ValueError(f"Unsupported float source modifier: {token}")
+    if m and m[2] != m[4]:
+        raise ValueError(f"Unsupported float source modifier: {token}")
+    word = float_word(m[3] if m else token, scalar, vector, pending)
+    if word is None:
+        return None
+    expression = hlsl_word(word)
+    if m and m[2]:
+        expression = f"({expression} & 0x7fffffffu)"
+    if m and m[1]:
+        expression = f"({expression} ^ 0x80000000u)"
+    return expression
+
+
 def vector_operands(line):
     """VGPR numbers named by an instruction, single or as a range."""
     regs = set()
@@ -878,7 +901,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
         raise ValueError("Unknown image SRV dimension")
     if image_srv_dimension == "1d" and not (rgba32_float_image and image_srv_descriptor is not None):
         raise ValueError("1D image loads require a separate gfx1013 RGBA32 FLOAT SRV binding")
-    # gfx1013 takes the shared image atomic lowering on an R32_UINT UAV only (add, umax, cmpswap; see lower()).
+    # gfx1013 takes the shared image atomic lowering on an R32_UINT UAV only
+    # (add, umin, umax, cmpswap; see lower()).
     gfx1013_image_atomic = cpu == "gfx1013" and image_atomic_type is not None and image_format == "R32_UINT"
     if image_output:
         if ((cpu != "gfx1030" and not float_image and not gfx1013_image_atomic)
@@ -2103,6 +2127,21 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             if dst > 255:
                 raise ValueError("Invalid vector destination")
             vector[dst] = ("alu", f"(inputData.Load({partial[1]}) & 0xffffu)")
+        elif ((m := re.fullmatch(r"(v_(?:add|sub|subrev|mul)_f32)_e64 v(\d+), ([^,\s]+), ([^,\s]+)( .+)?", line))
+              and any(token.startswith(("-", "|", "neg(", "abs(")) and not re.fullmatch(FLOAT_SOURCE, token)
+                      for token in m.groups()[2:4])):
+            # The VOP3 spelling with a source modifier on at least one source; either source is any binary32 source.
+            # The unmodified _e64 form is left to the fall-through. clamp and omod (mul:2, mul:4, div:2) are refused.
+            op, dst = m[1] + "_e32", int(m[2])
+            if m[5]:
+                raise ValueError(f"Unsupported float output modifier: {line}")
+            sources = [float_e64_source(token, scalar, vector, pending) for token in m.groups()[2:4]]
+            if dst > 255 or None in sources:
+                raise ValueError("Unverified float operand")
+            expression = FALU[op].format(*sources)
+            if len(expression) > ALU_EXPRESSION_LIMIT:
+                raise ValueError("ALU expression too large")
+            vector[dst] = ("alu", expression)
         elif m := re.fullmatch(rf"(v_(?:add|sub|subrev|mul)_f32_e32) v(\d+), {FLOAT_SOURCE}, (v\d+)", line):
             op, dst = m[1], int(m[2])
             words = [float_word(token, scalar, vector, pending, sizes) for token in m.groups()[2:]]
@@ -2500,8 +2539,8 @@ def lower(instructions, group, *, table_reg, descriptor_offset=None, group_reg=N
             op = m["op"]
             signed = op in ("smin", "smax")
             # gfx1013 is limited to the forms its draws cover; the lowering itself is the gfx1030 one.
-            if cpu == "gfx1013" and op not in ("add", "umax", "cmpswap"):
-                raise ValueError("gfx1013 image atomics require add, umax or cmpswap")
+            if cpu == "gfx1013" and op not in ("add", "umin", "umax", "cmpswap"):
+                raise ValueError("gfx1013 image atomics require add, umin, umax or cmpswap")
             if (image_atomic_type != ("int" if signed else "uint") or image_float != (op in IMAGE_FLOAT_ATOMIC_OPS)
                     or guard_span is not None or stores):
                 raise ValueError("Unsupported image atomic target or binding")
