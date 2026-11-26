@@ -13,9 +13,14 @@ translator mutations at the end (union instead of intersection, one pass instead
 removed) must each turn a control red.
 
   (no arguments)   pure Python
+  binary <llvm-mc>  the draw fixtures assemble to their words
+  draw <dxc> <offscreen_check> <warp|hardware> [fxc]   both uniform choices drawn, read back, opposite arm refused
 """
 import re
+import struct
+import subprocess
 import sys
+import tempfile
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +30,9 @@ TOOLS = HERE.parent / 'tools'
 sys.path.insert(0, str(TOOLS))
 sys.path.insert(0, str(TOOLS / 'startup'))
 import gfx2hlsl as G  # noqa: E402
+sys.path.insert(0, str(HERE))
+from startup_flat_param_check import assemble  # noqa: E402
+from startup_image_3d_check import FULLSCREEN_VS, VS_WORDS, compile_hlsl, root_blob  # noqa: E402
 
 failures = []
 
@@ -250,9 +258,98 @@ def mutated(old, new):
     return module
 
 
+# The same slot drawn on D3D12: two uniform branch choices write different words to v10 lane 3, the join reloads it and
+# exports it OR-ed with the packed screen position. s3 is 5 (the compare s2 == s3 holds: first arm) or 6 (second arm).
+WIDTH = HEIGHT = 16
+PACKED = (0x8000, 0x8000)  # SPI_PS_INPUT_ENA/ADDR: the packed screen position only, in v0
+ARM_WORDS = (0x40200000, 0x40400000)  # binary32 words with no bit below 21, clear of x | y << 16
+FIXTURE_TEXT = '''s_mov_b32 s0, 0x40200000
+s_mov_b32 s1, 0x40400000
+s_mov_b32 s2, 5
+s_mov_b32 s3, %d
+s_cmp_eq_u32 s2, s3
+s_cbranch_scc0 3
+v_writelane_b32 v10, s0, 3
+s_branch 2
+v_writelane_b32 v10, s1, 3
+v_readlane_b32 s5, v10, 3
+v_or_b32_e32 v1, s5, v0
+exp mrt0 v1, v1, v1, v1 done vm
+s_endpgm
+'''
+_COMMON = (0xbe8003ff, 0x40200000, 0xbe8103ff, 0x40400000, 0xbe820385)
+_TAIL = (0xbf060302, 0xbf840003, 0xd761000a, 0x00010600, 0xbf820002, 0xd761000a, 0x00010601, 0xd7600005,
+         0x0001070a, 0x38020005, 0xf800180f, 0x01010101, 0xbf810000)
+CHOICES = {5: ARM_WORDS[0], 6: ARM_WORDS[1]}
+CHOICE_WORDS = {s3: struct.pack('<19I', *_COMMON, 0xbe830380 | s3, *_TAIL) for s3 in CHOICES}
+
+
+def pixel_image(arm):
+    return [(x | y << 16) | arm for y in range(HEIGHT) for x in range(WIDTH) for _ in range(4)]
+
+
+def check_binary(llvm_mc):
+    for s3 in CHOICES:
+        check('llvm-mc assembles the s3 == %d fixture to the same words' % s3,
+              assemble(llvm_mc, FIXTURE_TEXT % s3) == CHOICE_WORDS[s3])
+
+
+def words_file(directory, name, words):
+    path = directory / ('%s.bin' % name)
+    path.write_bytes(struct.pack('<%dI' % len(words), *words))
+    return path
+
+
+def draw(renderer, adapter, vs, ps, expected):
+    run = subprocess.run([renderer, adapter, '--startup-pixel-words', str(vs), str(ps), str(WIDTH), str(HEIGHT),
+                          str(expected)], capture_output=True, text=True)
+    if run.returncode == 77:
+        print(run.stdout + run.stderr)
+        sys.exit(1 if failures else 77)
+    return run
+
+
+def check_draw(dxc, renderer, adapter, fxc=None):
+    texts = {}
+    for s3, words in CHOICE_WORDS.items():
+        refusals = []
+        texts[s3] = G.Pipeline(VS_WORDS, words, root_blob(), ps_hw_inputs=PACKED, refusals=refusals).hlsl_ps()
+        check('s3 == %d: the pixel stage translates with no refusal' % s3, not refusals, str(refusals))
+    with tempfile.TemporaryDirectory() as tmp:
+        directory = Path(tmp)
+        images = {s3: words_file(directory, 'image%d' % s3, pixel_image(arm)) for s3, arm in CHOICES.items()}
+        for name, compiler, profile_vs, profile_ps in (
+                [('dxc', dxc, 'vs_6_0', 'ps_6_0')] + ([('fxc', fxc, 'vs_5_1', 'ps_5_1')] if fxc else [])):
+            vs = compile_hlsl(compiler, name, FULLSCREEN_VS, 'vs_' + name, profile_vs, directory)
+            for s3, text in texts.items():
+                ps = compile_hlsl(compiler, name, text, 'ps_%s_%d' % (name, s3), profile_ps, directory)
+                run = draw(renderer, adapter, vs, ps, images[s3])
+                check('%s %s s3 == %d: all %d pixels equal the selected arm' % (adapter, name, s3, WIDTH * HEIGHT),
+                      run.returncode == 0 and 'all %d pixels matched' % (WIDTH * HEIGHT) in run.stdout,
+                      run.stdout + run.stderr)
+                # Negative control: the opposite arm's reference must differ from what this choice draws.
+                run = draw(renderer, adapter, vs, ps, images[11 - s3])
+                check('%s %s s3 == %d: the opposite arm as reference fails' % (adapter, name, s3),
+                      run.returncode != 0 and 'pixel mismatch' in run.stderr, run.stdout + run.stderr)
+
+
 def main():
     if len(sys.argv) != 1:
-        raise SystemExit(__doc__)
+        mode, *args = sys.argv[1:]
+        if mode == 'binary':
+            check_binary(*args)
+        elif mode == 'draw':
+            controls()
+            check_draw(*args)
+        else:
+            raise SystemExit(__doc__)
+        if failures:
+            print('FAIL')
+            for text in failures:
+                print('  ' + text)
+            sys.exit(1)
+        print('PASS')
+        return
     controls()
     # The straight-line requirement stays for a stage with no block graph (a unit probe that skips translate()).
     probe = G.Stage.__new__(G.Stage)
