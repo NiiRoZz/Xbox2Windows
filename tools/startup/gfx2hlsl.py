@@ -3142,6 +3142,9 @@ class Stage:
             self.whole_read_v = set()   # VGPRs read outside a proven low-16-bit consumer
             self.float_const_s = {}     # SGPR -> 32-bit pattern from s_mov_b32 of an inline float constant
             self.has_branches = bool(targets)
+            self.quad_flow_reads = []     # (offset, mnemonic) of DPP quad reads lowered in a program with branches
+            self.divergent_branches = {}  # s_cbranch offset -> mnemonic, for branches not proven wave-uniform
+            self.wqm_set_at = None        # offset of the s_wqm exec, exec that proved whole-quad EXEC first
             self.spill_slots = {}       # (vgpr, lane) -> (sym, uniform) for constant-lane SGPR spills
             self.vcc_events = {}
             self.vcc_lost = self.vcc_descriptor_overwritten = False
@@ -3320,6 +3323,7 @@ class Stage:
                         if not cond_uniform:
                             # Divergent CF: later SampleBias / CalculateLevelOfDetail would see uneven quads.
                             self.uniform_cf = False
+                            self.divergent_branches[off] = base
                             b_target = int(parse(asm)[1][0].split('_')[1], 16)
                             regs, affected = div_targets.get(off, (set(), set()))
                             regs = {r for r in regs if isinstance(r, int)}
@@ -3387,6 +3391,12 @@ class Stage:
             refusals.append((reason, self.kind))
         if self.lines:
             self.blocks.append((start, self.lines, None))
+        for at, reason in self.quad_flow_refusals(branches, targets):
+            if refusals is None:
+                error = Unsupported(reason)
+                error.instruction = names[at]
+                raise error
+            refusals.append((reason, self.kind))
         self.materialized = materialize  # declarations() assigns these before the body (and before any loop)
         if set(scc_effects.values()) - {'emitted'}:
             for kind, name in self.descriptor_scc_reads(dict(branches), scc_effects):
@@ -3644,6 +3654,78 @@ class Stage:
                                                     expr)
         return term
 
+    def quad_flow_straight(self):
+        """Whether a DPP quad read sits in straight-line code (the quad intrinsics then run in uniform flow)."""
+        return not getattr(self, 'has_branches', True) and not getattr(self, 'blocks', [])
+
+    def quad_flow_allowed(self):
+        """Whether a DPP quad read in a pixel program with branches or loops may be lowered now and proven over the
+        whole program after translation (Stage.quad_flow_refusals). Unit probes without translate() cannot."""
+        return getattr(self, 'kind', None) == 'ps' and getattr(self, 'quad_flow_reads', None) is not None
+
+    def note_quad_flow(self, base):
+        if not self.quad_flow_straight() and getattr(self, 'quad_flow_reads', None) is not None:
+            self.quad_flow_reads.append((self.pc, base))
+
+    def quad_flow_refusals(self, branches, targets):
+        """[(offset, reason)] for DPP quad reads lowered in a pixel program with branches or loops.
+
+        The one-lane model runs each lane as its own HLSL thread through the pc dispatch, so the QuadReadLaneAt /
+        QuadReadAcross* of a lane reads its neighbours only when all four threads of the quad reach that statement
+        together (same block, same pass of the dispatch loop) with the word the guest lanes hold. The guest runs
+        the wave as one: its scalar branches are wave-wide, and the quad is whole when EXEC is the s_wqm mask. A
+        read is kept when, on every path to it:
+        - the s_wqm exec, exec that proved whole-quad EXEC ran first: it sits before every branch and target;
+        - no other instruction that can write EXEC reaches it (so EXEC is still that mask and every VGPR write ran
+          on all four lanes, helper lanes included);
+        - every conditional branch that reaches it is wave-uniform (SCC proven uniform by the translator), or an
+          execz/execnz branch, whose EXEC is the whole-quad mask by the rule above and so never taken. A vccz/vccnz
+          branch, or SCC from lane data, can split a quad, and the read is refused.
+        Then the four threads ran the same branch outcomes, so they are in the same block on the same dispatch
+        pass. No wave size is assumed: the SM 6.0 quad operations need only the 2x2 quad of four lanes."""
+        reads = getattr(self, 'quad_flow_reads', [])
+        if not reads:
+            return []
+        index, block_of, succ, _dom, _writes, _reached = self.flow
+        after = {}
+
+        def reaches(src, dst):
+            a, b = index[src], index[dst]
+            if block_of[a] == block_of[b] and a < b:
+                return True
+            start = block_of[a]
+            if start not in after:
+                seen, todo = set(), list(succ[start])
+                while todo:
+                    blk = todo.pop()
+                    if blk not in seen:
+                        seen.add(blk)
+                        todo += succ[blk]
+                after[start] = seen
+            return block_of[b] in after[start]
+        # No branch or target (a dead read behind an early s_endpgm): nothing for the s_wqm to precede.
+        first = min([off for off, _ in branches] + list(targets), default=float('inf'))
+        writers = [off for off, _n, name, asm in self.ins if writes_exec(name, parse(asm)[1])
+                   and not (re.sub(r'_e(32|64)$', '', name) in ('s_wqm_b32', 's_wqm_b64')
+                            and parse(asm)[1] in (['exec', 'exec'], ['exec_lo', 'exec_lo']))]
+        out = []
+        for at, base in reads:
+            if self.wqm_set_at is None or self.wqm_set_at >= first:
+                out.append((at, '%s_dpp quad read at +0x%x in a program with branches: the s_wqm exec, exec does not '
+                                'run before every branch' % (base, at)))
+                continue
+            writer = next((w for w in writers if reaches(w, at)), None)
+            if writer is not None:
+                out.append((at, '%s_dpp quad read at +0x%x in a program with branches: the EXEC write at +0x%x reaches '
+                                'it' % (base, at, writer)))
+                continue
+            split = next((b for b, name in sorted(self.divergent_branches.items())
+                          if name not in ('s_cbranch_execz', 's_cbranch_execnz') and reaches(b, at)), None)
+            if split is not None:
+                out.append((at, '%s_dpp quad read at +0x%x in a program with branches: %s at +0x%x is not proven '
+                                'wave-uniform' % (base, at, self.divergent_branches[split], split)))
+        return out
+
     def dpp_pair(self, base, asm, ops, mods):
         """A DPP16 spelling whose SRC0 is a quad pair broadcast (#2125 item C).
 
@@ -3667,7 +3749,7 @@ class Stage:
         perm = tuple(int(c) for c in re.findall(r'\d', perms[0]))
         if perm not in DPP_PAIR:
             raise Unsupported('%s_dpp with %s' % (base, perms[0]))
-        if (self.kind != 'ps' or getattr(self, 'has_branches', True) or not getattr(self, 'exec_known', False) or
+        if (self.kind != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False) or
                 not getattr(self, 'wqm_exec', False) or getattr(self, 'fetched', False)):
             raise Unsupported('%s_dpp %s outside straight-line pixel code with a whole-quad exec mask (s_wqm exec, exec)'
                               % (base, perms[0]))
@@ -3679,6 +3761,7 @@ class Stage:
         if not src:
             raise Unsupported('%s_dpp source %s' % (base, ops[1]))
         word = self.u('v%s' % src.group(2))  # records the original source as a used VGPR
+        self.note_quad_flow(base)
         self.needs_sm6 = True
         self.used_v.add(DPP_SCRATCH)
         self.uniform_v.discard(DPP_SCRATCH)
@@ -3741,6 +3824,8 @@ class Stage:
         if base in ('s_wqm_b32', 's_wqm_b64'):
             if ops[0] in ('exec', 'exec_lo') and ops[1:] == ops[:1] and getattr(self, 'exec_known', False):
                 self.wqm_exec = True   # every lane of a touched quad is now active, helper lanes included
+                if getattr(self, 'wqm_set_at', False) is None:
+                    self.wqm_set_at = getattr(self, 'pc', None)  # where the quad-read flow proof starts
             if hasattr(self, 'uniform_v'):
                 self.uniform_v.clear()
             if hasattr(self, 'scc_uniform'):
@@ -3980,8 +4065,9 @@ class Stage:
         if self.kind != 'ps':
             raise Unsupported('%s_dpp outside a straight-line pixel stage with the entry EXEC mask' % base)
         # A branch to offset zero also makes the nominal entry block re-entrant.
-        if (getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))) or
-                not getattr(self, 'exec_known', False)):
+        # The whole-program proof (quad_flow_refusals) replaces the entry-prefix test once translate() runs it.
+        if (not getattr(self, 'exec_known', False) or
+                (not self.quad_flow_allowed() and getattr(self, 'past_entry', bool(getattr(self, 'blocks', ()))))):
             raise Unsupported('%s_dpp outside the entry prefix of a pixel stage with the entry EXEC mask' % base)
         if not getattr(self, 'wqm_exec', False):
             # The entry EXEC can leave out lanes of a partly covered quad, and the guest then reads an inactive
@@ -4003,6 +4089,7 @@ class Stage:
         rewritten = 'v%d' % self.DPP_TEMP
         rewritten = '|%s|' % rewritten if absolute else rewritten
         rewritten = '-' + rewritten if neg else rewritten
+        self.note_quad_flow(base)
         self.needs_sm6 = True
         self.set_v(self.DPP_TEMP, 'QuadReadLaneAt(%s, %su)' % (self.u(token), lanes.group(1)))
         operands = [ops[0], rewritten] + ops[2:]
@@ -4065,12 +4152,12 @@ class Stage:
                 src_neg_abs.append((neg, absolute, base_tok))
         elif len(ops) != arity + 1 or any(not re.fullmatch(r'v\d+', o) for o in ops):
             raise Unsupported('%s_dpp needs VGPR operands without modifiers' % base)
-        if (getattr(self, 'kind', None) != 'ps' or getattr(self, 'has_branches', True) or getattr(self, 'blocks', True)
-                or not getattr(self, 'exec_known', False)):
+        if getattr(self, 'kind', None) != 'ps' or not (self.quad_flow_straight() or self.quad_flow_allowed()) or not getattr(self, 'exec_known', False):
             raise Unsupported('%s_dpp requires a straight-line pixel shader with entry EXEC' % base)
         if not getattr(self, 'wqm_exec', False):
             raise Unsupported('%s_dpp requires whole-quad EXEC (s_wqm of exec first): a partly covered quad has '
                               'inactive source lanes that the hardware masks and QuadReadAcross does not' % base)
+        self.note_quad_flow(base)
         self.needs_sm6 = True
         # src0 is the exchanged lane; a VOP2 src1 stays this lane's own register.
         if kind == 'f':
@@ -6993,7 +7080,10 @@ class Stage:
     # AMDGPU spill lowering). Both ignore EXEC. With a constant k and a VGPR that no other instruction
     # touches, vN is only a table of scalar slots, so one scalar variable per (vN, k) is an exact model
     # and no other lane is ever read. Anything else keeps the one-lane model out of reach and is refused.
-    # Pixel stages are wave32 (lanes 0..31). Slot 57 mesh is wave64 (lanes 0..63), matching #2127.
+    # Lanes 0..63 cover a wave64 program. A wave32 program uses only bits 4:0 of the lane select (RDNA 2 ISA,
+    # v_readlane/v_writelane: the lane is taken modulo the wave size), so k and k + 32 name one slot there and two in
+    # wave64; the translator does not know the wave size, so a VGPR whose lanes include such a pair is refused.
+    # Slot 57 mesh is wave64 (#2127). Vertex stages use the same model: the two instructions touch no other lane and no stage input.
     #
     # With branches the slot variable is assigned on the pixel's own path, while the hardware slot holds the last
     # write on the wave's path. The two paths differ only inside the region of a branch not proven uniform (an
@@ -7003,7 +7093,8 @@ class Stage:
     # the write lies in such a region that the read is outside (a loop or arm the wave can run after this pixel
     # left it). Several writes: the value is chosen by the path, so every write must lie outside every such region;
     # the reload then keeps a constant only if all of them stored it, and is not claimed uniform.
-    SPILL_LANES = 32
+    SPILL_LANES = 64
+    SPILL_STAGES = ('ps', 'vs', 'ms')
 
     def spill_reaching(self, cfg):
         """Instruction index of each v_readlane_b32 -> the v_writelane_b32 indices that can supply its (VGPR, lane), or
@@ -7083,16 +7174,34 @@ class Stage:
         except ValueError:
             raise Unsupported('%s requires a constant lane, got %s' % (name, ops[2])) from None
         kind = getattr(self, 'kind', None)
-        lanes = 64 if kind == 'ms' else self.SPILL_LANES
-        if not 0 <= lane < lanes:
-            raise Unsupported('%s lane %d outside 0..%d' % (name, lane, lanes - 1))
-        if kind not in ('ps', 'ms'):
-            raise Unsupported('%s is lowered in pixel and mesh stages only' % name)
+        if not 0 <= lane < self.SPILL_LANES:
+            raise Unsupported('%s lane %d outside 0..%d' % (name, lane, self.SPILL_LANES - 1))
+        if kind not in self.SPILL_STAGES:
+            raise Unsupported('%s is lowered in pixel, vertex and mesh stages only' % name)
         if not self.tracks_uniformity() or (getattr(self, 'has_branches', True) and
                                             (kind != 'ps' or getattr(self, 'spill_reach', None) is None)):
             raise Unsupported('%s needs straight-line code to prove write-before-read' % name)
         self.require_spill_only(vreg[1], name)
+        if kind in ('ps', 'vs'):  # the wave size is unknown there; slot 57 mesh is always wave64, so k and k + 32 are two slots
+            self.require_spill_lanes_apart(vreg[1], name)
         return vreg[1], sreg, lane
+
+    def require_spill_lanes_apart(self, n, name):
+        """Refuse when two lanes of spill VGPR v<n> differ by 32: one slot in wave32, two in wave64."""
+        lanes = set()
+        for _, _, op, asm in getattr(self, 'ins', ()):
+            if re.sub(r'_e(32|64)$', '', op) not in ('v_writelane_b32', 'v_readlane_b32'):
+                continue
+            ops = parse(asm)[1]
+            if len(ops) == 3 and n in [r[1] for r in map(reg_range, ops[:2]) if r and r[0] == 'v']:
+                try:
+                    lanes.add(int(ops[2], 0))
+                except ValueError:
+                    continue  # a register lane is refused where it is read
+        for lane in lanes:
+            if lane + 32 in lanes:
+                raise Unsupported('%s: v%d lanes %d and %d are one slot in wave32 and two in wave64'
+                                  % (name, n, lane, lane + 32))
 
     def require_spill_only(self, n, name):
         """Refuse unless every instruction naming v<n> is a lane write or read of it."""
