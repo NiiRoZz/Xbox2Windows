@@ -19,6 +19,8 @@ memory; the output words are read from that memory after the queue's fence. Four
    call), dispatch-root-changed (another compute root and back after the constants), dispatch-reset (list closed
    and reset after the constants), dispatch-wrong-root (recorded under a root the pipeline was not created with)
    and dispatch-same-buffer (the output buffer is also the input).
+7. slot 35 selects the correct table at descriptor index 2 instead of the swapped pair at the heap start;
+   changing the compute root or view heap after binding must refuse at the table lookup, not an earlier check.
 Exit 77 when the adapter is not available.
 """
 import os
@@ -109,8 +111,28 @@ def main(consumer, dxc, adapter):
             assert got == untouched, f'{mode}: a refused Dispatch wrote the output'
             refused = lines(result, 'refused: ')
             assert len(refused) == 1 and refused[0].endswith('refused: ' + reason), f'{mode}: {refused}\n{result.stderr[-3000:]}'
-        print(f'startup_compute_dispatch: PASS on {adapter} (all {C.WORDS} words match after translation and with the '
-              'same root set again; untouched before translation, without a Dispatch and for 6 refusals)')
+        debug_enabled = bool(layer and '0x00000000' in layer[0])
+        for mode in ('dispatch-table-root-changed', 'dispatch-table-heap-changed', 'dispatch-table-offset'):
+            got, result = dispatch(directory, consumer, env, mode)
+            if debug_enabled:
+                initialized = lines(result, 'x2w-d3d12 debug layer: ')
+                assert len(initialized) == 1 and '0x00000000' in initialized[0], f'{mode}: debug layer not initialized'
+            refused = lines(result, 'refused: ')
+            translated = lines(result, 'Dispatch(3, 2, 2) translated')
+            if mode == 'dispatch-table-offset':
+                wrong = sum(a != b for a, b in zip(got, expected))
+                assert not wrong, f'{mode}: {wrong} words differ from the CPU reference\n{result.stderr[-3000:]}'
+                assert len(translated) == 1 and not refused, result.stderr[-3000:]
+                print(f'{mode}: all {C.WORDS} words match the CPU reference')
+            else:
+                written = sum(word != C.SENTINEL for word in got)
+                assert not written, f'{mode}: {written} output words changed after table invalidation\n{result.stderr[-3000:]}'
+                assert not translated and len(refused) == 1 and refused[0].endswith(
+                    'Dispatch(3, 2, 2) refused: a table descriptor is not bound'), result.stderr[-3000:]
+                print(f'{mode}: exact table refusal, all {C.WORDS} sentinel words unchanged')
+            errors = [line for line in lines(result, 'x2w-d3d12-debug ') if ' sev=0 ' in line or ' sev=1 ' in line]
+            assert not errors, errors[0]
+        print(f'startup_compute_dispatch: PASS on {adapter}')
 
 
 if __name__ == '__main__':
