@@ -761,11 +761,17 @@ def mask_lanes(name, asm):
     return m.group(1), words[0], words[1:]
 
 
+def high_half_of_b32(lanes, word):
+    """True for a 32-bit form that names the high half of a mask (vcc_hi): its bit n is lane 32 + n, which the word
+    position of a one-word operand (always the low half) does not say, so no lane-wise rule applies to it."""
+    return word.endswith('_hi') and len(lanes[1]) == 1
+
+
 def exec_absorbs(name, asm, word):
     """True when an instruction reads `word` only through an operation whose result bit is fixed while the exec bit
     of the same lanes is clear: W & exec and exec & W give 0, ~(W & exec) and W | ~exec give 1."""
     lanes = mask_lanes(name, asm)
-    if not lanes or lanes[0] not in ('and', 'nand', 'orn2'):
+    if not lanes or lanes[0] not in ('and', 'nand', 'orn2') or high_half_of_b32(lanes, word):
         return False
     a, c = lanes[2]
     pairs = [(a, c)] if lanes[0] == 'orn2' else [(a, c), (c, a)]
@@ -787,7 +793,7 @@ def lane_read(name, asm, word, halves):
     `word` in a position whose lanes are in `halves`, any exec operand there the exec word of those lanes, and the
     result there written to that exec word or back to `word`, not copied to another register."""
     lanes = mask_lanes(name, asm)
-    if not lanes:
+    if not lanes or high_half_of_b32(lanes, word):
         return False
     _, dest, srcs = lanes
     at = {p for src in srcs for p, w in enumerate(src) if w == word}
@@ -826,6 +832,9 @@ def scalar_effects(name, asm):
         may |= EXEC_KEYS
     if (base in SCA and SCA[base][1]) or 'saveexec' in base or 'wrexec' in base:
         writes.add('scc')
+    # A wave64 compare or carry-out prints its mask destination in the 32-bit spelling vcc_lo but writes vcc_hi too.
+    if 'vcc' in writes and base.startswith(('v_cmp', 'v_add_co', 'v_sub_co', 'v_subrev_co', 'v_div_scale')):
+        may.add('vcc_hi')
     return reads, writes, writes | may | ({'scc'} if base.startswith('s_') else set())
 
 # Forms with no scalar destination: their printed operands are all sources (v_cmpx writes only EXEC, which the

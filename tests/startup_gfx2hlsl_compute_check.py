@@ -1465,7 +1465,7 @@ def check_controls():
         's_and_b32 s23, vcc_lo, exec_lo': '6a7e1787', 's_and_b32 s23, exec_lo, vcc_lo': '7e6a1787',
         's_nand_b32 s23, vcc_lo, exec_lo': '6a7e178c', 's_orn2_b32 s23, vcc_lo, exec_lo': '6a7e178b',
         's_and_b32 vcc_lo, vcc_lo, exec_lo': '6a7e6a87', 's_orn2_b32 s23, exec_lo, vcc_lo': '7e6a178b',
-        's_mov_b32 s23, vcc_lo': '6a0397be', 's_and_b32 s23, vcc_lo, exec_hi': '6a7f1787',
+        's_mov_b32 s23, vcc_lo': '6a0397be', 's_and_b32 s23, vcc_lo, exec_hi': '6a7f1787', 's_and_b32 s23, vcc_hi, exec_lo': '6b7e1787',
         's_cbranch_scc1 65533': 'fdff85bf'})
     compare = ['s_cbranch_execz 1', 'v_cmp_gt_u32 vcc_lo, 3, v0']
     for read in ('s_and_b32 s23, vcc_lo, exec_lo', 's_and_b32 s23, exec_lo, vcc_lo', 's_orn2_b32 s23, vcc_lo, exec_lo',
@@ -1504,6 +1504,12 @@ def check_controls():
                                 (['s_and_b32 s23, vcc_lo, exec_lo'], ['s_cbranch_scc1 65533'], 's_and_b32')):
         refused('%s: read by %s after the join' % (live, name), lambda before=before, after=after: translate(
             'A', code=splice(*enter, *compare, *before, *leave, *after)).hlsl_cs())
+    # Wave64: the compare writes vcc_hi too (its decoded text names vcc_lo only). A 32-bit read of vcc_hi after the join
+    # is not lane-wise against exec_lo, so it is refused where the same read of vcc_lo above is accepted.
+    refused('v_cmp_gt_u32_e32 inside a block s_cbranch_execz skips per lane: definition of vcc_hi, live where the block '
+            'joins: read by s_and_b32 after the join',
+            lambda: translate('A', code=splice(*enter, *compare, *leave, 's_and_b32 s23, vcc_hi, exec_lo')).hlsl_cs())
+    assert G.exec_absorbs('s_and_b32', 's_and_b32 s2, vcc_hi, exec_lo', 'vcc_hi') is False
     # The rule on its own: which reads exec absorbs for a word.
     for line, word, absorbed in (('s_and_b32 s2, s3, exec_lo', 's3', True), ('s_and_b64 s[2:3], exec, s[4:5]', 's5', True),
                                  ('s_nand_b32 s2, exec_lo, s3', 's3', True), ('s_orn2_b32 s2, s3, exec_lo', 's3', True),
