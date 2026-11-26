@@ -6781,6 +6781,17 @@ The result becomes an inline HLSL expression, like a vector result, and a vector
 
 The check assembles one fixture that chains all six operations over the cap word and the bound, and requires the decoded program to lower to the same HLSL as its text.
 
+#### Single-bit set and clear
+
+The SOP1 forms `s_bitset0_b32 sD, s` and `s_bitset1_b32 sD, s` clear or set bit `s[4:0]` of `sD` and keep its other bits (RDNA ISA: `D.u32[S0.u32[4:0]] = 0` or `1`; SCC is not written). They read `sD` as well as write it, so `sD` must already hold a known word, and `s` is a known word as above. The result is `sD & ~(1u << (s & 31u))` or `sD | (1u << (s & 31u))`. A destination that holds no known word (an unwritten SGPR, a descriptor, the table pointer, a group ID, the saved exec mask, or a load still waiting), an unknown or wider-than-32-bit source, a destination past s105, a vector source and the 64-bit forms stop the lowering, as does an expression over 1024 characters.
+
+`tests/compute_salu_bitset_check.py` dispatches one invocation that applies both forms to eight root constant words and stores eight results. Between its two constant sets it sets bit 0, clears and sets bit 31 (through a runtime index, the inline constants `63` and `-1`), uses runtime indices above 31 (`0x47`, `0x20`, `0xffffffe3`), sets bits that are already set, clears bits that are already clear, and reads a destination that is also the source. A CPU reference that rewrites one entry of the word's bit list gives the expected words, and the check also lists them as hand-worked values. Swapped set and clear, an unmasked index, a dropped destination and the other run's words must each fail the readback, and so must mutated translations. `controls` runs the translator checks only:
+
+```powershell
+.\out\pe-env\Scripts\python.exe -B tests/compute_salu_bitset_check.py controls
+ctest --preset dev --no-tests=error -R '^compute_store_aot_salu_bitset_warp$' -V
+```
+
 #### Scalar bit-field extract
 
 `s_bfe_u32 sD, S0, S1` and `s_bfe_i32 sD, S0, S1` (SOP2) extract a `S1[22:16]`-bit field starting at `S1[4:0]` from a known 32-bit scalar word `S0`, zero- or sign-extending to 32 bits (`0` when `S1[22:16] == 0`, and `S0 >> S1[4:0]` when `S1[4:0] + S1[22:16] > 32`). `SCC` is written (`D != 0`) but unread in this subset. Both lower to explicit HLSL helpers (`s_bfe_u32` and `s_bfe_i32`) emitted only when referenced, so a width of `0` returns `0` rather than shifting by `32`, and every shift count stays in `0..31`.
@@ -9858,6 +9869,19 @@ a full-EXEC `v_cmp_*` from wave-uniform SGPRs or constants. A compare with a
 VGPR source, a different VCC write, or a narrowed EXEC at the branch
 invalidates the proof. The CPU-reference draws cover both outcomes for each
 branch polarity and a VCC-zero branch after a join.
+
+The `startup_mesh57_lane_spill_{warp,hardware}` tests cover the constant-lane
+`v_writelane_b32` / `v_readlane_b32` spill idiom in `translate_mesh57` (#2413 T7).
+A source-built program parks ordinary scalars in fixed wave64 lanes of a spill-only
+VGPR (including lane 63), reloads them, and uses the colour reload as vertex red.
+Raw `exec_lo` / `exec_hi` sources stay refused under the one-lane model. Host checks
+also refuse an unwritten slot, a register-selected lane, lane 64, ordinary vector use
+of the spill VGPR, and a spill into an exchange VGPR. The draw compares all 1,024
+pixels with a CPU rasterizer; zeroing the spilled colour assignment in HLSL (not the
+multi-decl) must change the image.
+Run `python -B tests/startup_mesh57_lane_spill_check.py` for host refusals, or
+`ctest --preset release --no-tests=error -R '^startup_mesh57_lane_spill' -V`
+for WARP and hardware.
 
 The `startup_mesh57_skeleton_wave_shift_{warp,hardware}` tests cover a single
 `s_lshl_b32` behind a forward EXEC-zero branch after the count exchange. From
