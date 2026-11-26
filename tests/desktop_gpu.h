@@ -34,7 +34,7 @@ int check_startup_image_store(ID3D12Device* device, const char* vertex_path, con
 void check_startup_flat_param(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                               std::uint32_t* words, UINT width = 1, UINT height = 1,
                               D3D12_CULL_MODE cull = D3D12_CULL_MODE_NONE, BOOL front_ccw = FALSE,
-                              UINT vertices = 3);
+                              UINT vertices = 3, const std::uint32_t* constants = nullptr);
 void check_startup_entry_words(ID3D12Device* device, const char* vertex_path, const char* pixel_path,
                                const std::uint32_t* entry, UINT entry_count, std::uint32_t* words,
                                UINT width = 1, UINT height = 1);
@@ -102,7 +102,7 @@ void check_pixel_quad_lod(ID3D12Device* device, const char* shader, const char* 
                          bool allowUpperRawLodStep = false);
 void check_pixel_mip_clamp(ID3D12Device* device, const char* shader, unsigned expectedLevel);
 void check_pixel_mip_blend(ID3D12Device* device, const char* shader, float clamp, float tolerance);
-void check_pixel_compare(ID3D12Device* device, const char* shader, const char* reference);
+void check_pixel_compare(ID3D12Device* device, const char* shader, const char* reference, bool twoMips = false);
 void check_pixel_gather(ID3D12Device* device, const char* shader, const char* reference);
 void check_pixel_compare_gather(ID3D12Device* device, const char* shader, const char* reference,
                                 const char* sampler_line, const char* vsPath = nullptr);
