@@ -178,6 +178,7 @@ static void* slot67_other_root;  // a second root signature object, for the root
 // another compute root and the first one again after the constants, dispatch-same-root sets the same root again;
 // dispatch-reset closes and resets the list after the constants; dispatch-wrong-root records under the other
 // root; dispatch-same-buffer names the output buffer as the input too.
+// Table controls bind away from the heap start or change the root/view heap after slot 35 without rebinding.
 static int dispatch_slot67(void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
@@ -214,7 +215,25 @@ static int dispatch_slot67(void* device, const std::string& mode)
         FAILED(static_cast<HRESULT>(invoke(device, 36, 0, 0, word(&__uuidof(ID3D12Fence)), word(&fence))))) return 72;
     const StreamWord cpu = invoke(heap, 9), gpu = invoke(heap, 10);
     if (!cpu || !gpu) return 73;
-    std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
+    const bool change_table_root = mode == "dispatch-table-root-changed";
+    const bool change_table_heap = mode == "dispatch-table-heap-changed";
+    StreamWord table_gpu = gpu;
+    if (mode == "dispatch-table-offset") {
+        const UINT increment = static_cast<UINT>(invoke(device, 15, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        if (increment < sizeof(descriptors[0])) return 73;
+        const StreamWord offset = StreamWord{2} * increment;
+        // The heap starts with the wrong pair, but both records are well-formed. The correct pair starts at index 2.
+        std::memcpy(reinterpret_cast<void*>(cpu), descriptors[1], sizeof(descriptors[1]));
+        std::memcpy(reinterpret_cast<void*>(cpu + sizeof(descriptors[1])), descriptors[0], sizeof(descriptors[0]));
+        std::memcpy(reinterpret_cast<void*>(cpu + offset), descriptors, sizeof(descriptors));
+        table_gpu += offset;
+    } else {
+        std::memcpy(reinterpret_cast<void*>(cpu), descriptors, sizeof(descriptors));
+    }
+    void* other_heap = nullptr;
+    if (change_table_heap &&
+        (FAILED(static_cast<HRESULT>(invoke(device, 14, word(&heap_desc), word(&__uuidof(ID3D12DescriptorHeap)),
+                 word(&other_heap)))) || !other_heap || other_heap == heap)) return 72;
     const UINT constants[2] = {0x01234567, 0x9e3779b9}, graphics[2] = {0xdeadbeef, 0xfeedface};
     const auto bind = [&] {
         invoke(list, 32, 1, word(&heap));
@@ -232,7 +251,18 @@ static int dispatch_slot67(void* device, const std::string& mode)
         if (FAILED(static_cast<HRESULT>(invoke(list, 9))) || FAILED(static_cast<HRESULT>(invoke(list, 139, word(allocator))))) return 74;
         bind();
     }
-    invoke(list, 35, 1, gpu);
+    invoke(list, 35, 1, table_gpu);
+    if (change_table_root) {
+        invoke(list, 33, word(slot67_other_root));
+        invoke(list, 33, word(slot67_root));
+    }
+    if (change_table_heap) invoke(list, 32, 1, word(&other_heap));
+    if (change_table_root || change_table_heap) {
+        // Give Dispatch the expected entry values without rebinding slot 35.
+        invoke(list, 37, 0, constants[0], 0);
+        invoke(list, 39, 0, 1, word(&constants[1]), 1);
+    }
+    if (mode == "dispatch-table-offset") invoke(list, 32, 1, word(&heap));  // same heap keeps the offset table
     if (mode != "dispatch-none") invoke(list, 14, 3, 2, 2);
     if (FAILED(static_cast<HRESULT>(invoke(list, 9)))) return 75;
     invoke(queue, 10, 1, word(&list));
