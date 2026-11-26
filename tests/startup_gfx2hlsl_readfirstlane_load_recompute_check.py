@@ -64,10 +64,6 @@ ACCEPTED = [
     # The temporary already holds the words, so a later write of the offset scalar does not matter.
     ('offset scalar rewritten after the load', JOIN + (SCALAR, LOAD, 's_mov_b32 s3, 0', READ),
      ['a = s3 + 0;', 'v7 = r0.Load(a + 0);', 'ulc_7 = r0.Load(a + 0);', 's3 = 0x00000000u;', 's9 = ulc_7;']),
-    # Under a narrowed EXEC the address is the expression of the VGPR, read before the load overwrites it.
-    ('address from the expression under a narrowed exec',
-     JOIN + (NARROW, SCALAR, 'v_mov_b32_e32 v7, s3', 'buffer_load_dword v7, v7, s[4:7], 0 offen', READ),
-     ['a = (s3) + 0;', 'if (exec & 1) v7 = r0.Load(a + 0);', 'ul14_7 = r0.Load(a + 0);', 's9 = ul14_7;']),
     # While EXEC is the entry mask every lane ran the address definition, so its copy serves even after the
     # scalar it read is rewritten.
     ('address copy under the entry exec',
@@ -111,6 +107,11 @@ REFUSED = [
     ('load inside a block one lane skips', JOIN + (SCALAR, 's_and_saveexec_b32 s8, vcc_lo', 's_cbranch_execz label_0018',
                                                    LOAD, 's_mov_b32 exec_lo, s8', READ, 's_endpgm')),
     ('EXEC narrowed between load and read', JOIN + (SCALAR, LOAD, NARROW, READ)),
+    # On empty EXEC, RDNA 2 reads the old lane-0 VGPR, not an unguarded reload.
+    ('empty EXEC keeps the old lane-zero VGPR', JOIN + ('v_mov_b32_e32 v7, 17', 's_mov_b32 exec_lo, 0',
+                                                        SCALAR, LOAD, READ)),
+    ('address expression with potentially empty EXEC',
+     JOIN + (NARROW, SCALAR, 'v_mov_b32_e32 v7, s3', 'buffer_load_dword v7, v7, s[4:7], 0 offen', READ)),
     # Under a narrowed EXEC a lane that skipped the address definition holds an older copy, and the expression
     # is gone once its scalar is rewritten.
     ('stale address copy under a narrowed exec',
