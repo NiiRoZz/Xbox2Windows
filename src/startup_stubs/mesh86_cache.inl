@@ -255,8 +255,8 @@ ID3D12PipelineState* try_cached_mesh86(const D3D12_PIPELINE_STATE_STREAM_DESC& d
     std::memcpy(request.stream.data() + request.root_offset + 8, &request.root, sizeof(request.root));
     const D3D12_PIPELINE_STATE_STREAM_DESC desktop{request.stream.size(), request.stream.data()};
     bool compute = false;
-    ID3D12RootSignature* compute_root = nullptr;  // a mesh stream declares no compute stage
-    auto* result = build_stream_pipeline(&desktop, why, why_size, compute, graphics, compute_root,
+    ID3D12RootSignature* pipeline_root = nullptr;
+    auto* result = build_stream_pipeline(&desktop, why, why_size, compute, graphics, pipeline_root,
         static_cast<ID3D12RootSignature*>(request.root->own().real));
     if (result) graphics.cached_srv_root = srv_root;
     static LONG loaded;
