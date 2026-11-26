@@ -4321,7 +4321,7 @@ class Stage:
         return key
 
     def raw_table_uav_store(self, kind_label, ops, mods, data_count, *, allow_glc=False, allow_scalar_address=False,
-                            raw_conversion_ok=False):
+                            raw_conversion_ok=False, uniform_off=False):
         """Validate a fixed-table raw UAV descriptor, data range, byte address, and 4-byte alignment."""
         offset = 0
         glc = False
@@ -4333,7 +4333,7 @@ class Stage:
             elif m != 'offen':
                 raise Unsupported('%s modifier %s' % (kind_label, m))
         offen = 'offen' in mods
-        if len(ops) != 4 or (not offen and not (allow_scalar_address and glc and ops[1] == 'off')):
+        if len(ops) != 4 or not (offen or ops[1] == 'off' and (allow_scalar_address and glc or uniform_off)):
             raise Unsupported('%s without the offen address form' % kind_label)
         data = reg_range(ops[0])
         if not data or data[0] != 'v' or data[2] - data[1] != data_count - 1 or data[2] > 255:
@@ -4345,7 +4345,7 @@ class Stage:
         key = self.store_descriptor(ops[2], 4, kind_label, stride0_ok=True, raw_conversion_ok=raw_conversion_ok)
         terms = [self.u(ops[1])] if offen else []
         if re.fullmatch(r'0x[0-9a-f]+|\d+', ops[3]):
-            if not offen:
+            if not offen and not uniform_off:
                 raise Unsupported('%s off requires a scalar register soffset' % kind_label)
             offset += int(ops[3], 0)
         else:
@@ -4367,7 +4367,12 @@ class Stage:
             return self.op_buffer_store_vs(ops, mods, count)
         if self.kind != 'cs':
             raise Unsupported('buffer_store_dword' + ('x%d' % count if count > 1 else ''))  # the unknown-op refusal
-        src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count, raw_conversion_ok=True)
+        src, uav, address, _ = self.raw_table_uav_store('buffer store', ops, mods, count, raw_conversion_ok=True,
+                                                        uniform_off=True)
+        # The `off` form (no VGPR address, MUBUF offen = idxen = 0) gives every lane the same byte address, so the
+        # lanes race; with one proven value in all of them any order stores the same words.
+        if ops[1] == 'off' and not all(self.proven_uniform_v(n) for n in range(src[1], src[2] + 1)):
+            raise Unsupported('buffer store off with data not proven wave-uniform')
         words = [self.u('v%d' % n) for n in range(src[1], src[2] + 1)]
         data = words[0] if count == 1 else 'uint%d(%s)' % (count, ', '.join(words))
         # Store* needs a multiple of four. As in #2059, the run-time part (VGPR and register soffset) is rounded down:
@@ -5591,14 +5596,21 @@ class Stage:
     def op_v_mbcnt_hi_u32_b32(self, ops, mods):
         self.op_v_mbcnt_lo_u32_b32(ops, mods, high=True)
 
+    def proven_uniform_v(self, n):
+        """VGPR n holds one value in every lane EXEC enables now. In the entry block EXEC is known; past it, a
+        recomputable expression proves no join, EXEC write or overwrite lies between the definition and here."""
+        if not self.tracks_uniformity() or n not in self.uniform_v:
+            return False
+        # Past the entry block of a branch-free program is only dead code after s_endpgm: nothing to recompute.
+        if getattr(self, 'past_entry', True):
+            return n in getattr(self, 'uniform_expr', {}) and getattr(self, 'has_branches', False)
+        return getattr(self, 'exec_known', False)
+
     def op_v_readfirstlane_b32(self, ops, mods):
         src, dst = reg_range(ops[1]), reg_range(ops[0])
         past_entry = getattr(self, 'past_entry', True)
-        # Past the entry block of a branch-free program is only dead code after s_endpgm: nothing to recompute.
-        if (mods or not self.tracks_uniformity() or not dst or dst[0] != 's' or dst[1] != dst[2] or
-                not src or src[0] != 'v' or src[1] != src[2] or src[1] not in self.uniform_v or
-                (src[1] not in getattr(self, 'uniform_expr', {}) or not getattr(self, 'has_branches', False)
-                 if past_entry else not getattr(self, 'exec_known', False))):
+        if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
+                not src or src[0] != 'v' or src[1] != src[2] or not self.proven_uniform_v(src[1])):
             raise Unsupported('v_readfirstlane_b32 requires a proven uniform source')
         if past_entry:
             # The first active lane ran the definition: no join, EXEC write or overwrite of the VGPR and no write
@@ -6089,6 +6101,17 @@ class Stage:
         self.clear_low16(dst[2])
         self.used_v.update((dst[1], dst[2]))
         self.emit(body if self.exec_known else 'if (exec & 1) ' + body)
+        # Scalar or literal sources give every lane the same result, under the conditions Stage.one uses for VALU.
+        pair = reg_range(ops[2])
+        sources = [ops[1]] + (['%s%d' % (pair[0], pair[1]), '%s%d' % (pair[0], pair[2])] if pair else [])
+        if (self.tracks_uniformity() and not any(reg_range(t)[0] == 'v' for t in sources if reg_range(t)) and
+                all(self.uniform_source(t) for t in sources) and
+                (getattr(self, 'past_entry', False) and hasattr(self, 'uniform_expr') or
+                 not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False))):
+            self.uniform_v.update((dst[1], dst[2]))
+            if hasattr(self, 'uniform_expr'):
+                for n, half in ((dst[1], 'x'), (dst[2], 'y')):
+                    self.uniform_expr[n] = '%s(%s, %s, %s).%s' % (helper, low, high, amount, half)
 
     def carry_out_op(self, ops, mods, kind):
         """v_{add,sub,subrev}_co_u32 D, SDST, S0, S1: a 32-bit add or subtract with a carry or borrow out.

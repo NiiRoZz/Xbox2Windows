@@ -484,11 +484,21 @@ SPLICE = {
     's_mov_b32 s19, s31': '1f0393be',
     's_mov_b32 s17, s29': '1d0391be',
     's_cbranch_scc1 2': '020085bf',
+    'buffer_store_dword v5, off, s[16:19], 0': '000070e000050480',
+    'buffer_store_dword v5, off, s[16:19], s20 offset:8': '080070e000050414',
+    'buffer_store_dwordx2 v[5:6], off, s[16:19], 0': '000074e000050480',
+    'v_lshrrev_b64 v[5:6], 4, s[20:21]': '050000d784280000',
+    'v_lshrrev_b64 v[5:6], 4, v[3:4]': '050000d784060200',
 }
 
 
 def splice(*lines, at=STORE_A):
     return WORDS_A[:at] + b''.join(bytes.fromhex(SPLICE[line]) for line in lines) + WORDS_A[at:]
+
+
+def replace_store(*lines):
+    """Case A with its store replaced by `lines` (the last one is the new store)."""
+    return WORDS_A[:STORE_A] + b''.join(bytes.fromhex(SPLICE[line]) for line in lines) + WORDS_A[STORE_A + 8:]
 
 
 # Case I is case A with the store descriptor's stride field cleared before the store (expected words as case A).
@@ -871,6 +881,29 @@ def check_formatted_pointer_copy():
     assert switch in translate('L-uint', code=skip_one + bytes.fromhex('000080bf') + copy + high + target + load + tail).hlsl_cs()
 
 
+def check_off_stores():
+    """The `off` store (MUBUF offen = idxen = 0): every lane writes the same address, accepted with uniform data."""
+    def lines(*code):
+        return translate('A', code=replace_store(*code)).hlsl_cs().splitlines()
+    hlsl = lines('v_mov_b32 v5, s20', 'buffer_store_dword v5, off, s[16:19], 0')
+    at = hlsl.index('    a = (0) & 0xfffffffcu;')
+    assert hlsl[at + 1] == '    u0.Store(a, v5);', hlsl[at:at + 2]
+    hlsl = lines('v_mov_b32 v5, s20', 'buffer_store_dword v5, off, s[16:19], s20 offset:8')
+    at = hlsl.index('    a = (s20 + 8) & 0xfffffffcu;')
+    assert hlsl[at + 1] == '    u0.Store(a, v5);', hlsl[at:at + 2]
+    # A 64-bit shift of scalar sources is uniform in both halves.
+    hlsl = lines('v_lshrrev_b64 v[5:6], 4, s[20:21]', 'buffer_store_dwordx2 v[5:6], off, s[16:19], 0')
+    at = hlsl.index('    a = (0) & 0xfffffffcu;')
+    assert hlsl[at + 1] == '    u0.Store2(a, uint2(v5, v6));', hlsl[at:at + 2]
+    # Negative controls: per-lane data (a shift of the thread index; the per-lane load), and uniform data written
+    # before an EXEC change, where the entry-block proof no longer knows which lanes store.
+    for code in (('v_lshrrev_b64 v[5:6], 4, v[3:4]', 'buffer_store_dwordx2 v[5:6], off, s[16:19], 0'),
+                 ('buffer_store_dword v5, off, s[16:19], 0',),
+                 ('v_mov_b32 v5, s20', 'v_cmp_gt_u32 vcc_lo, 3, v0', 's_mov_b32 exec_lo, vcc_lo',
+                  'buffer_store_dword v5, off, s[16:19], 0')):
+        refused('buffer store off with data not proven wave-uniform', lambda code=code: lines(*code))
+
+
 def check_controls():
     ff1 = bytes.fromhex('7e1385be')
     end = bytes.fromhex('000081bf')
@@ -923,7 +956,7 @@ def check_controls():
     refused('numeric use of s7', lambda: translate('A', rsrc2=(8 << 1) | tidig(3)).hlsl_cs())
     # Store forms outside this slice (the store is the dword at +0x60 of WORDS_A: offen, soffset 0x80, s[16:19]).
     store = '001070e004050480'
-    for word, fragment in (('000070e004050480', 'offen address form'),     # off: no offen
+    for word, fragment in (('000070e004050480', 'not proven wave-uniform'),  # off: one address, per-lane data
                            ('002070e004050480', 'modifier idxen'),         # idxen, no offen
                            ('005070e004050480', 'modifier glc'),           # glc offen
                            ('001070e004050380', 'used for a load and a store')):  # store through the read descriptor
@@ -936,6 +969,7 @@ def check_controls():
             assert str(reason) == text, str(reason)
         else:
             raise AssertionError('graphics store accepted')
+    check_off_stores()
     # A register soffset is added to the address.
     hlsl = translate('A', code=patch(WORDS_A, store, '001070e004050414')).hlsl_cs()
     assert '    a = (v4 + s20 + 0) & 0xfffffffcu;' in hlsl.splitlines(), hlsl
