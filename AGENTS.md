@@ -209,6 +209,7 @@ python3 -m venv out/pe-env
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_loop_constants_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_join_symbols_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_recompute_check.py
+./out/pe-env/bin/python -B tests/startup_gfx2hlsl_readfirstlane_load_recompute_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sop2_complement_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_pack_absdiff_check.py
 ./out/pe-env/bin/python -B tests/startup_gfx2hlsl_sdwa_cvt_check.py

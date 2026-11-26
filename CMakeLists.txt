@@ -4757,6 +4757,9 @@ if(EXISTS "${INTAKE_PYTHON}")
     # v_readfirstlane_b32 past the entry block of a branched program: recomputed definition, joins and EXEC refused.
     add_test(NAME startup_gfx2hlsl_readfirstlane_recompute COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_readfirstlane_recompute_check.py")
+    # A uniform compute buffer load past the entry block: per-lane temporary, joins, EXEC and per-lane addresses refused.
+    add_test(NAME startup_gfx2hlsl_readfirstlane_load_recompute COMMAND "${INTAKE_PYTHON}" -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_readfirstlane_load_recompute_check.py")
     add_test(NAME startup_gfx2hlsl_calculated_target COMMAND "${INTAKE_PYTHON}" -B
         "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_gfx2hlsl_calculated_target_check.py")
     # Startup shader translator: read-only census of every refusal site (--refusals).

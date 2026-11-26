@@ -2467,6 +2467,11 @@ class Stage:
             self.clear_low16(n)
         self.used_v.add(n)
         self.emit('v%d = %s;' % (n, expr) if self.exec_known else 'if (exec & 1) v%d = %s;' % (n, expr))
+        temps = getattr(self, 'uniform_temps', None)
+        if temps is not None:  # a uniform load past the entry block (one()): every lane keeps the words
+            temps[n] = 'ul%x_%d' % (self.pc, n)
+            self.uniform_load_temps.add(temps[n])
+            self.emit('%s = %s;' % (temps[n], expr))
 
     def f_mods(self, expr, mods=()):
         # The hardware applies the output modifier before the clamp, but the disassembler prints `clamp`
@@ -3194,6 +3199,7 @@ class Stage:
             }
             self.descriptor_block_first = 0
             self.uniform_expr = {}    # proven VGPR -> uniform HLSL expression over scalars that defined it
+            self.uniform_load_temps = set()  # temporaries of uniform loads past the entry block (set_v)
             self.uniform_branches = set()  # s_cbranch_* offsets proven uniform in this pass (spill-slot proof)
             self.spill_writes = {}    # instruction index of a v_writelane_b32 translated in this pass -> (sym, uniform)
             self.heap_index = {}      # SGPR -> what its word is for a resource-heap s_load (see heap_record)
@@ -3628,22 +3634,28 @@ class Stage:
                 if sources and all(self.uniform_source(tok) for tok in sources):
                     dst = candidate[1]
         # A compute load through a read-only descriptor (a descriptor is never both loaded and stored) with a uniform
-        # address reads the same dword in every lane. Entry block only: the value has no recomputable expression.
-        loaded = (dst is None and base in UNIFORM_LOADS and len(ops) == 4 and self.tracks_uniformity() and
-                  getattr(self, 'kind', None) == 'cs' and not getattr(self, 'past_entry', True) and
-                  getattr(self, 'exec_known', False) and
-                  all(m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:') for m in mods) and
-                  not ('idxen' in mods and 'offen' in mods) and (ops[1] == 'off') == ('idxen' not in mods and 'offen' not in mods) and
-                  (ops[1] == 'off' or self.uniform_source(ops[1])) and self.uniform_source(ops[3]))
+        # address reads the same dword in every lane. In the entry block with known exec every lane ran it.
+        load_form = (dst is None and base in UNIFORM_LOADS and len(ops) == 4 and self.tracks_uniformity() and
+                     getattr(self, 'kind', None) == 'cs' and
+                     all(m in ('idxen', 'offen', 'glc', 'slc', 'dlc') or m.startswith('offset:') for m in mods) and
+                     not ('idxen' in mods and 'offen' in mods) and (ops[1] == 'off') == ('idxen' not in mods and 'offen' not in mods) and
+                     (ops[1] == 'off' or self.uniform_source(ops[1])) and self.uniform_source(ops[3]))
+        loaded = load_form and not getattr(self, 'past_entry', True) and getattr(self, 'exec_known', False)
+        # With empty EXEC, READFIRSTLANE uses the old VGPR in lane zero. An unguarded reload
+        # cannot reproduce it. Require the entry mask until the path proves a nonempty wave.
+        vaddr = reg_range(ops[1]) if load_form and ops[1] != 'off' else None
+        exprs = getattr(self, 'uniform_expr', None)
+        recomputed = (load_form and getattr(self, 'past_entry', False) and exprs is not None
+                      and getattr(self, 'exec_known', False))
         loaded_regs = ()
-        if loaded:
+        if loaded or recomputed:
             candidate = reg_range(ops[0])
             # Exactly the registers the opcode writes, as many as its name says.
             count = UNIFORM_LOAD_WORDS[base]
             if candidate and candidate[0] == 'v' and candidate[2] <= 255 and candidate[2] - candidate[1] + 1 == count:
                 dst, loaded_regs = candidate[1], range(candidate[1], candidate[2] + 1)
             else:
-                loaded = False
+                loaded = recomputed = False
         # A shift right of the X thread id, or of (uniform << K) + thread id, that leaves no thread-id bit.
         shifted = None
         if (dst is None and base == 'v_lshrrev_b32' and not mods and len(ops) == 3 and
@@ -3655,13 +3667,21 @@ class Stage:
                 dst = candidate[1]
             else:
                 shifted = None
+        if recomputed:
+            # Read before the load can overwrite its own address register.
+            self.uniform_vaddr = '(%s)' % exprs[vaddr[1]] if vaddr and vaddr[1] in exprs else None
+            self.uniform_temps = {}
         self.last_v = None
         if hasattr(self, 'heap_index'):  # unit probes build a Stage without the tracking state
             # Any write ends a register's mark; the lowering below sets the new one, if any.
             wrote = scalar_destinations(name, asm)
             wrote = set(self.heap_index) if 'any' in wrote else wrote & set(self.heap_index)
             self.heap_index_was = {r: self.heap_index.pop(r) for r in wrote}
-        term = self.lower(base, asm, ops, mods)
+        try:
+            term = self.lower(base, asm, ops, mods)
+        finally:
+            temps = getattr(self, 'uniform_temps', None)
+            self.uniform_vaddr = self.uniform_temps = None
         uniform_written = self._uniform_written
         if self.tracks_uniformity() and getattr(self, 'since_join', None) is not None and wrote_s:
             self.since_join -= (wrote_s - uniform_written)
@@ -3684,7 +3704,7 @@ class Stage:
                 vs = [int(n) for n in re.findall(r'\bv(\d+)\b', expr or '')]
                 if shifted is not None:
                     self.uniform_expr[dst] = shifted
-                elif expr is None or loaded or any(n not in self.uniform_expr for n in vs):
+                elif expr is None or loaded_regs or any(n not in self.uniform_expr for n in vs):
                     self.uniform_expr.pop(dst, None)
                 elif sum(len(self.uniform_expr[n]) for n in vs) > UNIFORM_EXPR_LIMIT:
                     # A VGPR used as both operands (v10 = v10 + v10) doubles the text each time: past the limit the
@@ -3693,6 +3713,8 @@ class Stage:
                 else:
                     self.uniform_expr[dst] = re.sub(r'\bv(\d+)\b', lambda m: '(%s)' % self.uniform_expr[int(m[1])],
                                                     expr)
+                if recomputed:
+                    self.uniform_expr.update(temps)
         return term
 
     def quad_flow_straight(self):
@@ -5478,12 +5500,12 @@ class Stage:
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
                 raise Unsupported('buffer vaddr %s for idxen' % ops[1])
             stride = self.pipe.ud(('stride', self.pipe.resources[key]['index']))
-            terms.append('%s * ud%d' % (self.u(ops[1]), stride))
+            terms.append('%s * ud%d' % (getattr(self, 'uniform_vaddr', None) or self.u(ops[1]), stride))
         elif offen:
             r = reg_range(ops[1])
             if not r or r[0] != 'v' or r[1] != r[2] or r[1] > 255:
                 raise Unsupported('buffer vaddr %s for offen' % ops[1])
-            terms.append(self.u(ops[1]))
+            terms.append(getattr(self, 'uniform_vaddr', None) or self.u(ops[1]))
         elif ops[1] != 'off':
             raise Unsupported('buffer vaddr %s without idxen or offen' % ops[1])
         if soffset is not None:
@@ -8383,6 +8405,8 @@ class Stage:
             lines.append('    v%d = (uint(i.pos.x) & 0xffffu) | ((uint(i.pos.y) & 0xffffu) << 16);' % packed)
         if getattr(self, 'spill_slots', None):
             lines.append('    uint %s;' % ', '.join('sp%d_%d = 0' % k for k in sorted(self.spill_slots)))
+        if getattr(self, 'uniform_load_temps', None):
+            lines.append('    uint %s;' % ', '.join('%s = 0' % n for n in sorted(self.uniform_load_temps)))
         lines.append('    uint vcc = 0, exec = 1, m0 = 0, a = 0, w = 0; bool scc = false; float4 t = 0;')
         if getattr(self, 'mesh_wave_loads', {}):
             lines.append('    bool wave_any = false;')
