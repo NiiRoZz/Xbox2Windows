@@ -127,7 +127,12 @@ const char* load_compute_translation(ComputeTranslation& tr)
             tr.uavs.push_back({a, b, true});
         else if (std::sscanf(line.c_str(), "srv %u tex2d table %d %d%n", &i, &a, &b, &used) == 3 && whole() && i == tr.srvs.size())
             tr.srvs.push_back({a, b, true});
-        else if (std::sscanf(line.c_str(), "smp %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5 && whole() &&
+        // A static sampler, plain (smp) or with the descriptor's LOD clamp (smpl), decoded as the draw path does.
+        // Not modelled here: comparison samplers (smpc) and the run-time sampler heap table (smpheap).
+        else if (line.rfind("smpc", 0) == 0) return "a comparison sampler";
+        else if (line.rfind("smpheap", 0) == 0) return "a sampler from the sampler heap";
+        else if ((std::sscanf(line.c_str(), "smp %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5 ||
+                  std::sscanf(line.c_str(), "smpl %u %x %x %x %x%n", &i, &x, &y, &z, &w, &used) == 5) && whole() &&
                  i == tr.samplers.statics.size())
             tr.samplers.read_manifest_line(line.c_str());
         else return line.rfind("srv", 0) == 0 ? "a resource that is not a raw table buffer or a 2D texture"

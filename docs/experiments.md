@@ -1,5 +1,7 @@
 # Experiment notes and reproduction commands
 
+New notes go in `docs/experiments/<topic>.md` (see [the folder guide](experiments/README.md)); this file keeps the older notes.
+
 ## Desktop culling and front-face winding
 
 `raster_winding_warp` and `raster_winding_hardware` draw two mirrored triangles
@@ -16669,6 +16671,14 @@ Measured on two synthetic programs. In a local set of 29 compute programs whose 
 ```powershell
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_entry_" -V
 ```
+
+### Static samplers with a LOD clamp
+
+The translator writes a constant sampler of `image_sample`, `_l` or `_lz` whose mip filter is not 0 as an `smpl` line (#2482): a static sampler whose MinLOD and MaxLOD come from the descriptor's word 1. The compute Dispatch now reads `smpl` lines as the draw path does, through the same `TranslatedSamplers::read_manifest_line` and `create_translated_root`; the only difference for compute is that the root signature is set with `SetComputeRootSignature`, and static samplers need nothing else. A comparison sampler (`smpc`) and the run-time sampler heap table (`smpheap`) are still refused, as "a comparison sampler" and "a sampler from the sampler heap". Binding the heap table for compute would need the draw path's sampler snapshot (`snapshot_samplers`, `create_sampler_snapshot_heap`) taken from the compute root's sampler heap pointer, the sampler heap set with `SetDescriptorHeaps` and its table set with `SetComputeRootDescriptorTable`.
+
+`tests/startup_compute_dispatch_texture_check.py` adds a filtered case: the texture input program with a wrap, linear sampler (`smpl 0 0x0 0xc00000 0x18500000 0x0`) reads a 2x1 RGBA8 texture whose left texel has red 0 and right texel red 1.0, at the left edge. Only a linear filter that wraps reads 0.5 there. On WARP and on a physical adapter, every thread read red 0.5, and the debug layer reported no error. The control is the same program with the manifest's sampler changed to clamp: it reads red 0, which the check refuses. The `smpc` and `smpheap` lines refuse with their reasons and leave the output untouched. Without the new `smpl` reading, the Dispatch refuses with "a sampler that is not a plain static one" and the case fails. The texture has one mip, so the LOD clamp itself is not exercised here.
+
+In a local census, 7 compute programs (about 135 thousand Dispatch calls) had an `smpl` line as their first refusal, each with one or two `smpl` lines and no other sampler form. Read against the classifier, all 7 manifests now load; their next refusal, if any, comes from the bindings at Dispatch and has not been measured.
 
 ### An input named by a resource heap record
 
