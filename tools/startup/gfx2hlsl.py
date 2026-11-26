@@ -7846,9 +7846,13 @@ def translate_mesh57(out_dir, key):
     if ps:
         pixel = decode(strip_header(ps))
         # A pixel shader with no colour output ends in a null-target export (LLVM SILateBranchLowering, Mesa ACO create_fs_null_export): depth-only.
-        null_only = {a.split()[1] for _, _, op, a in pixel if op == 'exp'} == {'null'}
+        targets = {a.split()[1] for _, _, op, a in pixel if op == 'exp'}
+        null_only = targets == {'null'}
         if not pixel or pixel[-1][2] != 's_endpgm' or classify_decoded(pixel) != 'ps' and not null_only:
             raise Unsupported('slot 57 pixel stage has an incompatible export or termination')
+        # The slot 57 depth-only profile is the null export alone; the general pixel path keeps its mixed forms.
+        if 'null' in targets and not null_only:
+            raise Unsupported('slot 57 pixel stage mixes the null export with another export')
     pipe = MeshPipeline(ms, ps or None, root)
     sources = [('ms', 'ms_6_5', pipe.hlsl_ms())]
     if ps:

@@ -9507,7 +9507,10 @@ with no `SV_Target`, and the manifest has an empty `targets` line instead of
 `ps none`, because the stage still decides coverage. Run
 `python -B tests/startup_mesh57_depth_only_check.py`: it checks the discard,
 the empty `targets` line, a control without the EXEC narrowing (no discard)
-and a null export followed by a position export (still refused). Nothing is
+and a null export followed by a position export (still refused). A slot 57
+pixel stage that has the null export next to an `mrt0`, `mrtz` or `param0`
+export, in either order, is refused before any source or manifest is written;
+the general pixel path keeps those mixed forms. Nothing is
 drawn. The runtime does not load slot 57 results yet, so these draws are not
 submitted.
 
