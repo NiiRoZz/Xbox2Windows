@@ -102,6 +102,13 @@ target_compile_features(memory_query_check PRIVATE cxx_std_17)
 target_link_libraries(memory_query_check PRIVATE psapi)
 add_test(NAME desktop_memory_query COMMAND memory_query_check)
 
+# tracy_new.cpp against a recording stand-in for Tracy's memory macros (no Tracy fetched, runs in every build).
+add_executable(tracy_new_check tests/tracy_new_check.cpp)
+target_compile_features(tracy_new_check PRIVATE cxx_std_17)
+target_include_directories(tracy_new_check PRIVATE tests/fixtures/tracy_fake)
+target_compile_definitions(tracy_new_check PRIVATE X2W_TRACY=1 X2W_TRACY_HEAP="test C++ heap")
+add_test(NAME tracy_new COMMAND tracy_new_check)
+
 add_executable(xmem_committed_memory_check tests/xmem_committed_memory_check.cpp)
 target_compile_features(xmem_committed_memory_check PRIVATE cxx_std_17)
 target_link_libraries(xmem_committed_memory_check PRIVATE OneCore)
