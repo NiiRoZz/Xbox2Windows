@@ -209,6 +209,9 @@ static void* make_committed(void* device, D3D12_HEAP_TYPE type, const D3D12_RESO
 // word 3 zero), dispatch-input-past ends 16 bytes past the input buffer, dispatch-input-unplaced names memory between
 // the two buffers, dispatch-input-copied a third buffer placed there at an offset the desktop cannot alias, and
 // dispatch-input-token writes the token of a texture view where the input descriptor was.
+// For any mode, X2W_TEST_DISPATCH_IN names 1280 bytes that replace the input words, and X2W_TEST_DISPATCH_FIELDS
+// names six words that replace, for the input and then the output descriptor, the stride (word 1 bits 16-31), the
+// record count (word 2) and word 3, which are otherwise 4, 320 and 0.
 static int dispatch_slot67(void* device, const std::string& mode)
 {
     constexpr UINT words = 320;
@@ -219,6 +222,16 @@ static int dispatch_slot67(void* device, const std::string& mode)
         buffers[0][i] = 0x8b02a7f1u + i * 0x413b1u;
         buffers[1][i] = 0xc5c5c5c5u;
     }
+    UINT fields[2][3] = {{4, words, 0}, {4, words, 0}};
+    const auto from_file = [](const char* variable, void* data, std::streamsize bytes) {
+        char path[MAX_PATH];
+        const DWORD n = GetEnvironmentVariableA(variable, path, MAX_PATH);
+        return !n || (n < MAX_PATH && std::ifstream(path, std::ios::binary).read(static_cast<char*>(data), bytes).gcount() == bytes);
+    };
+    if (!from_file("X2W_TEST_DISPATCH_IN", buffers[0], words * sizeof(UINT)) ||
+        !from_file("X2W_TEST_DISPATCH_FIELDS", fields, sizeof(fields))) return 2;
+    UINT input[words];
+    std::memcpy(input, buffers[0], sizeof(input));
     const auto word = [](const void* value) { return reinterpret_cast<StreamWord>(value); };
     void* placed[2]{};
     UINT descriptors[2][4]{};
@@ -228,7 +241,7 @@ static int dispatch_slot67(void* device, const std::string& mode)
         if (FAILED(static_cast<HRESULT>(invoke(device, 133, word(buffers[i]), word(&desc), D3D12_RESOURCE_STATE_COMMON, 0,
                 word(&__uuidof(ID3D12Resource)), word(&placed[i]))))) return 71;
         const UINT64 address = reinterpret_cast<UINT64>(buffers[mode == "dispatch-same-buffer" ? 1 : i]);
-        const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | 4u << 16, words, 0};
+        const UINT view[4] = {static_cast<UINT>(address), static_cast<UINT>(address >> 32) | fields[i][0] << 16, fields[i][1], fields[i][2]};
         std::memcpy(descriptors[mode == "dispatch-swapped" ? 1 - i : i], view, sizeof(view));
     }
     const UINT64 between = reinterpret_cast<UINT64>(memory) + 0x8000;
@@ -336,7 +349,7 @@ static int dispatch_slot67(void* device, const std::string& mode)
         Sleep(1);
     }
     for (UINT i = 0; i < words; ++i)
-        if (buffers[0][i] != 0x8b02a7f1u + i * 0x413b1u) return 79;  // the input must stay as written
+        if (buffers[0][i] != input[i]) return 79;  // the input must stay as written
     x2w_d3d12_compute_census();
     char path[MAX_PATH];
     const DWORD n = GetEnvironmentVariableA("X2W_TEST_DISPATCH_OUT", path, MAX_PATH);

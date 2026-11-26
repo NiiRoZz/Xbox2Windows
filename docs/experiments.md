@@ -6006,7 +6006,7 @@ uses reproduces the ISA result bit-for-bit on the byte-addressed UAV:
 `outputData.InterlockedCompareExchange(offset, expected, next, observed)`.
 The operand stays 32-bit with `glc` clear, the address stays fixed, and
 the atomic remains the sole UAV operation; a missing, misspelled or
-unused domain, `_x2`, `glc`, `idxen`/`offen`, and every other reduction
+unused domain, `glc`, `idxen`/`offen`, and every other reduction
 binding violation is rejected with the family's diagnostics.
 
 Four source-built gfx1030 cases cover both operations with and without
@@ -6030,6 +6030,38 @@ CLI. The full binary suite and DXC/WARP/hardware runs were not run.
 ```powershell
 cmake --build --preset dev --target offscreen_check
 ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_float_' -V
+```
+
+### gfx1030 fixed-address MUBUF float compare-swap and x2
+
+The same non-returning raw `u0` profile accepts `buffer_atomic_fcmpswap`
+(opcode 62) and `buffer_atomic_fcmpswap_x2`, `buffer_atomic_fmin_x2`,
+`buffer_atomic_fmax_x2` (94–96). The address is a fixed aligned byte
+immediate; `_x2` uses eight-byte alignment and SM 6.6 raw UAV integer
+atomics. The caller declares finite-normal memory at the corresponding
+width, and both the replacement and compare operands (or the min/max
+operand) must be statically known finite normals. `glc`, dynamic addresses,
+non-normal values, and mixed UAV operations are outside this profile.
+
+On finite normals float equality is bit equality. AMD places replacement
+before compare in the VGPR tuple; the HLSL CAS takes compare first. The
+unsigned sign-adjusted minimum/maximum ordering extends to 64 bits, using
+one CAS over both little-endian DWORDs. The fixtures compare all 320 words
+at one and two 32-lane groups, including adjacent sentinel words and a
+compare miss triggered by changing only the low bit. An operand-order or
+min/max mutation is checked against the independent CPU model and the
+original expected readback. These cases contend on one address with the
+same literal operands, not distinct per-lane inputs.
+
+```sh
+python3 -B tests/compute_store_check.py binary-mubuf-float-extra llvm-mc-15 llvm-objcopy-15 libLLVM-15.so.1
+```
+
+```powershell
+python -B tests/compute_store_check.py compile-mubuf-float-cmpswap dxc
+python -B tests/compute_store_check.py compile-mubuf-float-x2 dxc
+cmake --build --preset dev --target offscreen_check
+ctest --preset dev --no-tests=error -R '^compute_store_aot_mubuf_float-(cmpswap|x2)_' -V
 ```
 
 ### Indexed gfx1030 raw vector reads
@@ -16642,7 +16674,7 @@ the field layouts rather than assembled.
 
 ## Translated compute Dispatch
 
-With a device slot 67 placeholder bound, command-list slot 14 looks up the translation of the pipeline's published request (`<key>.txt` with `stage cs`, and `<key>.cs.cso`) and records it on the desktop list. It binds, from the compute descriptor tables of slot 35: raw buffers named by 16-byte hardware buffer descriptors, and 2D textures named by the token of a view the caller created (device slot 18 for an input, slot 19 for an output the program stores `float4` to). `smp` manifest lines become static samplers, and entry values come from the compute root constants of slots 37 and 39. A buffer input must resolve to a complete GPU-backed range; a buffer output must be a placed buffer that aliases the caller's memory and allows unordered access; a texture view must be 2D, created on the desktop, and for an output have a float or normalized format that is not packed, on a texture that is not also an input of the call. Any other manifest line (other texture kinds, sampler heaps, comparison samplers, root views, `stride` and `descword3` entry values) leaves the pipeline untranslated, and a Dispatch that cannot be bound completely is refused with one logged reason: no Dispatch is recorded and nothing is bound (the upload of an input texture the caller filled in memory may already be recorded; it only syncs content). No view is ever bound null. The entry values live in the compute root-constant store of #1975: a word no slot 37 or 39 call wrote since the compute root was set (slot 33 with another root, or a list reset) has no value and is refused with `an entry value was not set since the compute root`; setting the same root again keeps the words, and the graphics words of slot 40 are separate.
+With a device slot 67 placeholder bound, command-list slot 14 looks up the translation of the pipeline's published request (`<key>.txt` with `stage cs`, and `<key>.cs.cso`) and records it on the desktop list. It binds, from the compute descriptor tables of slot 35: raw buffers named by 16-byte hardware buffer descriptors, and 2D textures named by the token of a view the caller created (device slot 18 for an input, slot 19 for an output the program stores `float4` to). `smp` manifest lines become static samplers, and entry values come from the compute root constants of slots 37 and 39. A buffer input must resolve to a complete GPU-backed range; a buffer output must be a placed buffer that aliases the caller's memory and allows unordered access; a texture view must be 2D, created on the desktop, and for an output have a float or normalized format that is not packed, on a texture that is not also an input of the call. Any other manifest line (other texture kinds, sampler heaps, comparison samplers, root views, entry values that are neither a root constant nor a buffer descriptor word) leaves the pipeline untranslated, and a Dispatch that cannot be bound completely is refused with one logged reason: no Dispatch is recorded and nothing is bound (the upload of an input texture the caller filled in memory may already be recorded; it only syncs content). No view is ever bound null. The entry values live in the compute root-constant store of #1975: a word no slot 37 or 39 call wrote since the compute root was set (slot 33 with another root, or a list reset) has no value and is refused with `an entry value was not set since the compute root`; setting the same root again keeps the words, and the graphics words of slot 40 are separate.
 
 `tests/startup_compute_dispatch_check.py` drives a source-built gfx1013 program through the stand-in's list on WARP and on a physical adapter (exit 77 without one) and reads the 320 output words back from the aliased memory. Controls in the same run: before the offline translation, without a Dispatch, and with the two descriptors exchanged, every output word must keep its sentinel. The two entry values arrive through slot 37 and slot 39, with other values written through slot 40 in between; `dispatch-same-root` must still give the expected words, and five refused modes must log their reason and keep the sentinels: a missing word, another compute root set and the first set again, a list reset, a compute root that is not the pipeline's, and one buffer named as input and output. `tests/startup_compute_dispatch_texture_check.py` does the same for a program that stores to a 32x8 RGBA16_FLOAT texture (1024 halves read back through CopyTextureRegion; controls: before translation, without a Dispatch, a texture without unordered access) and for the raw buffer program with a level-zero sample of a 1x1 texture XORed into each stored word (control: no view at the table entry). The texture output program is also bound under a manifest edited to declare no entry values.
 
@@ -16660,6 +16692,18 @@ Run the two backends with `ctest --preset release --no-tests=error -j 1 -R '^sta
 ```powershell
 cmake --build --preset dev --target startup_stream_consumer
 ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_" -V
+```
+
+### Entry values from a buffer descriptor
+
+A formatted buffer load passes the input's stride and word 3 as entry values (`udsrc <i> stride <srv>`, `udsrc <i> descword3 <srv>`), and a formatted buffer store (`buffer_store_format_d16_x`, and `buffer_store_format_xyzw` of #2530) passes the output's word 3, the upper half of word 1 and the record count (`uav_descword3`, `uav_stride`, `uav_numrecords`). At Dispatch the stand-in takes each from the descriptor words the same call binds the view from: the stride as the draw path takes it (from the hardware descriptor, or from the title's buffer view for a token), word 3 through the draw path's formatted-buffer check (a token's word is built from its view; a FORMAT the program does not decode refuses the dispatch with `a formatted input has no word 3 the program decodes`), and the output words unmasked, since the store helper checks the swizzle bits itself. A descriptor that is not bound refuses the dispatch as before; an entry value naming a texture slot leaves the pipeline untranslated, and so does any other source.
+
+`tests/startup_compute_dispatch_entry_check.py` dispatches two source-built programs on WARP and on a physical adapter (exit 77 without one) and reads the 320 output words back: the formatted load of `startup_gfx2hlsl_compute_check.py` with two word-3 values on one translation, and the `buffer_store_format_d16_x` program of `startup_compute_store_d16_x_check.py` with four output descriptors (two formats, another stride and record count, and SWIZZLE_ENABLE set in word 1, for which the translated program stores nothing). A FORMAT the program does not decode is refused with every output word at its sentinel. Returning a constant output stride and record count in the runtime, or masking the stride to 14 bits as the draw path does, makes a store run fail. The record count cannot be checked apart from the bound range, which is sized from the same word.
+
+Measured on two synthetic programs. In a local set of 29 compute programs whose first refusal was this manifest line (about 1.4 million calls in one run), 27 now pass the manifest (about 1.39 million calls; 17 of them, about 0.6 million calls, use the store of #2530) and 2 stop at a 1D or 3D texture input. Every formatted store in the 27 passes a zero `soffset`: a nonzero one in structured mode can store past `stride * records` bytes, outside the bound range, and is not checked here. Which bind-time reason the 27 meet next has not been measured.
+
+```powershell
+ctest --preset dev --no-tests=error -R "^startup_compute_dispatch_entry_" -V
 ```
 
 ### Static samplers with a LOD clamp

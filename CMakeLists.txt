@@ -4492,9 +4492,13 @@ if(EXISTS "${INTAKE_PYTHON}")
         add_test(NAME startup_compute_live_retry_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_live_retry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
             "${DXC_EXECUTABLE}" ${adapter})
+        add_test(NAME startup_compute_dispatch_entry_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+            "${CMAKE_CURRENT_SOURCE_DIR}/tests/startup_compute_dispatch_entry_check.py" "$<TARGET_FILE:startup_stream_consumer>"
+            "${DXC_EXECUTABLE}" ${adapter})
         set_tests_properties(startup_compute_dispatch_${adapter} startup_compute_dispatch_texture_${adapter}
             startup_compute_dispatch_heap_${adapter} startup_compute_dispatch_heap_word_${adapter}
-            startup_compute_live_retry_${adapter} startup_compute_dispatch_input_${adapter}
+            startup_compute_live_retry_${adapter} startup_compute_dispatch_entry_${adapter}
+            startup_compute_dispatch_input_${adapter}
             PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
     endforeach()
     add_test(NAME startup_stream_adapter_filter COMMAND "${INTAKE_PYTHON}" -B
@@ -10148,6 +10152,13 @@ if(EXISTS "${INTAKE_PYTHON}")
             "$<TARGET_FILE:offscreen_check>" ${adapter})
         set_tests_properties(compute_store_aot_mubuf_float_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
             ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_mubuf_float_${adapter}.txt")
+        foreach(float_extra IN ITEMS float-cmpswap float-x2)
+            add_test(NAME compute_store_aot_mubuf_${float_extra}_${adapter} COMMAND "${INTAKE_PYTHON}" -B
+                "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" "draw-mubuf-${float_extra}" "${DXC_EXECUTABLE}"
+                "$<TARGET_FILE:offscreen_check>" ${adapter})
+            set_tests_properties(compute_store_aot_mubuf_${float_extra}_${adapter} PROPERTIES TIMEOUT 45 SKIP_RETURN_CODE 77
+                ENVIRONMENT "FORM_COVERAGE_RECORD=${CMAKE_BINARY_DIR}/form_coverage/compute_store_aot_mubuf_${float_extra}_${adapter}.txt")
+        endforeach()
         add_test(NAME compute_store_aot_mubuf_vector_${adapter} COMMAND "${INTAKE_PYTHON}" -B
             "${CMAKE_SOURCE_DIR}/tests/compute_store_check.py" draw-mubuf-vector "${DXC_EXECUTABLE}"
             "$<TARGET_FILE:offscreen_check>" ${adapter})
