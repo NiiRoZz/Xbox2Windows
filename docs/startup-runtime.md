@@ -1258,7 +1258,8 @@ For a timeline instead of the counters, configure a separate build tree with `-D
 - **Client settings.** On-demand (nothing is recorded until a profiler connects), localhost only, no broadcast, no call stacks, no system tracing and no crash handler.
 - **Output.** One shared `TracyClient.dll` is linked into `d3d12_xs.dll`, `XCRDAPI.dll` and `xmem.dll`; copy it beside them.
 - **Zones.** `ExecuteCommandLists`, `Present` (with a frame mark), the frame-wait sleep, window present, desktop pipeline creation, `device_memory_srv` with its resource scans, each DirectStorage request, and the xmem page map and physical write. `src/startup_stubs/profile_zone.h` defines the macros.
-- **Off.** Without the option nothing is fetched, defined or linked, and the macros expand to nothing.
+- **Memory.** Three kinds of data for Tracy's Memory view, by name: the pool `XMemAlloc` (every block `XMemAlloc` returns until its `XMemFree`), one pool per instrumented DLL for its C++ heap (`<target> C++ heap`, `operator new`/`delete` replaced in `src/startup_stubs/tracy_new.cpp`), and the plot `XMemVirtualAlloc commits (bytes, cumulative)`. That last one is a plot because the title releases those ranges with Win32 calls the stand-in does not see. Memory the title takes straight from Win32 (`VirtualAlloc`, its own heaps) and what the graphics driver commits are not tracked; compare the pools with the `commit peak=` heartbeat to size that remainder. A profiler that connects late misses earlier allocations (on-demand client).
+- **Off.** Without the option nothing is fetched, defined or linked, and the macros expand to nothing or a no-op.
 
 To capture without a GUI, build Tracy's `capture` tool from the same checkout (`cmake -S <checkout>/capture -B <dir>`; that project fetches its own dependencies), start `capture -o run.tracy -a 127.0.0.1 -s <seconds>` and then the instrumented run. Open the file with the Tracy profiler, or export zone statistics with `csvexport`.
 
